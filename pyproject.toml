@@ -1,0 +1,87 @@
+[build-system]
+requires      = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name            = "thermophasepy"
+version         = "0.1.0"
+description     = "Sequential stability evaluation for solid-state electrolyte candidates: mechanical, vibrational (anharmonic), and thermodynamic gates."
+readme          = "README.md"
+license         = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors         = [
+    { name = "Claudio Zeni" },
+]
+keywords = [
+    "solid-state electrolytes",
+    "ionic conductors",
+    "thermodynamic stability",
+    "convex hull",
+    "phonons",
+    "machine learning interatomic potentials",
+    "MACE",
+    "active learning",
+    "materials science",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "matplotlib>=3.7",
+    "pymatgen>=2023.1",
+]
+
+[project.optional-dependencies]
+md = [
+    "ase>=3.22",
+    "mace-torch>=0.3",
+]
+generation = [
+    "pyxtal>=0.6",
+]
+dev = [
+    "pytest>=7",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+]
+all = [
+    "thermophasepy[md,generation,dev]",
+]
+
+[project.scripts]
+thermophasepy = "thermophasepy.__main__:main"
+
+[project.urls]
+Homepage      = "https://github.com/your-org/thermophasepy"
+Documentation = "https://thermophasepy.readthedocs.io"
+Repository    = "https://github.com/your-org/thermophasepy"
+Issues        = "https://github.com/your-org/thermophasepy/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["thermophasepy*"]
+
+[tool.pytest.ini_options]
+testpaths    = ["tests"]
+addopts      = "-v --tb=short"
+filterwarnings = ["ignore::UserWarning", "ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+select      = ["E", "F", "W", "I"]
+ignore      = ["E501"]
+
+[tool.mypy]
+python_version         = "3.10"
+ignore_missing_imports = true
