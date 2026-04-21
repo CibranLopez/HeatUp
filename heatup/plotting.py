@@ -1,4 +1,4 @@
-"""thermophasepy.plotting
+"""heatup.plotting
 ========================
 Dashboard figure for a complete stability report.
 
@@ -17,7 +17,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from thermophasepy import config
+from heatup import config
 
 # Colour palette (accessible, print-friendly).
 _COL = {
@@ -46,7 +46,7 @@ def plot_stability_report(
     """Generate the three-panel stability dashboard.
 
     Args:
-        report:    Dict returned by :func:`thermophasepy.pipeline.run_stability_pipeline`.
+        report:    Dict returned by :func:`heatup.pipeline.run_stability_pipeline`.
         save_path: Save the figure to this path if provided (PDF recommended).
         show:      Call ``plt.show()``; set ``False`` inside notebooks with
                    ``%matplotlib inline``.

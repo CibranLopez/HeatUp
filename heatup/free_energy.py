@@ -1,4 +1,4 @@
-"""thermophasepy.free_energy
+"""heatup.free_energy
 ============================
 Generalised Gibbs free energy G(T, P) assembler.
 
@@ -39,7 +39,7 @@ Each contribution reads a JSON file from the symmetry directory:
 
     relaxation/energy.json          → {"energy_eV_per_atom": float}
     phonons/dos.json                → {"energies_eV": [...], "weights": [...]}
-    aimd/<T>K/anharmonic_phonons/   → computed by thermophasepy.vibrational
+    aimd/<T>K/anharmonic_phonons/   → computed by heatup.vibrational
     electronic/edos.json            → {"energies_eV": [...], "dos_per_eV": [...],
                                         "fermi_energy_eV": float,
                                         "n_electrons_per_atom": float}
@@ -59,7 +59,7 @@ from typing import Callable, Sequence
 
 import numpy as np
 
-from thermophasepy import config
+from heatup import config
 
 # ---------------------------------------------------------------------------
 # Type alias
@@ -146,7 +146,7 @@ def anharmonic_f_vib(
     """Anharmonic vibrational free energy per atom from AIMD VACF/VDOS.
 
     Reads cached ``aimd/<T>K/anharmonic_phonons/vdos.json`` files (produced
-    by :mod:`thermophasepy.vibrational`) and averages the VDOS across all
+    by :mod:`heatup.vibrational`) and averages the VDOS across all
     available MD temperatures.  Falls back to harmonic if no AIMD data exist.
 
     Args:
@@ -571,7 +571,7 @@ class GibbsAssembler:
 
     Usage::
 
-        from thermophasepy.free_energy import GibbsAssembler, anharmonic_f_vib
+        from heatup.free_energy import GibbsAssembler, anharmonic_f_vib
 
         asm = GibbsAssembler()
         asm.register("vib_anh", anharmonic_f_vib, weight=1.0)

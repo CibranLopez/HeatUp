@@ -1,4 +1,4 @@
-"""thermophasepy.mechanical
+"""heatup.mechanical
 ==========================
 Gate 1: Born–Huang mechanical stability assessment.
 
@@ -39,7 +39,7 @@ import os
 
 import numpy as np
 
-from thermophasepy import config
+from heatup import config
 
 
 def assess_mechanical_stability(sym_dir: str) -> dict:

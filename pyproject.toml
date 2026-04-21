@@ -3,7 +3,7 @@ requires      = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.backends.legacy:build"
 
 [project]
-name            = "thermophasepy"
+name            = "heatup"
 version         = "0.1.0"
 description     = "Sequential stability evaluation for solid-state electrolyte candidates: mechanical, vibrational (anharmonic), and thermodynamic gates."
 readme          = "README.md"
@@ -56,21 +56,21 @@ dev = [
     "mypy",
 ]
 all = [
-    "thermophasepy[md,generation,dev]",
+    "heatup[md,generation,dev]",
 ]
 
 [project.scripts]
-thermophasepy = "thermophasepy.__main__:main"
+heatup = "heatup.__main__:main"
 
 [project.urls]
-Homepage      = "https://github.com/your-org/thermophasepy"
-Documentation = "https://thermophasepy.readthedocs.io"
-Repository    = "https://github.com/your-org/thermophasepy"
-Issues        = "https://github.com/your-org/thermophasepy/issues"
+Homepage      = "https://github.com/your-org/heatup"
+Documentation = "https://heatup.readthedocs.io"
+Repository    = "https://github.com/your-org/heatup"
+Issues        = "https://github.com/your-org/heatup/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["thermophasepy*"]
+include = ["heatup*"]
 
 [tool.pytest.ini_options]
 testpaths    = ["tests"]

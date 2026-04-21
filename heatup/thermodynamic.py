@@ -1,4 +1,4 @@
-"""thermophasepy.thermodynamic
+"""heatup.thermodynamic
 ==============================
 Gate 3: Temperature-dependent thermodynamic stability via the convex hull.
 
@@ -21,7 +21,7 @@ This module:
 
 4. **Computes F(T)** for all phases:
    - **Target**: anharmonic F(T) from AIMD VACF/VDOS (via
-     :mod:`thermophasepy.vdos`), with transparent fallback to harmonic
+     :mod:`heatup.vdos`), with transparent fallback to harmonic
      if no AIMD data are available.
    - **Competing phases**: harmonic F(T) from the stored DOS.  This
      asymmetric choice is intentional: competing phases rarely have AIMD
@@ -49,7 +49,7 @@ from itertools import chain, combinations
 
 import numpy as np
 
-from thermophasepy import config
+from heatup import config
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +145,7 @@ def _gibbs_free_energy(
         "F_eV_per_atom", or None if E0 is unavailable.
     """
     if assembler is None:
-        from thermophasepy.free_energy import build_default_assembler
+        from heatup.free_energy import build_default_assembler
         assembler = build_default_assembler(phonon_mode=phonon_mode, device=device)
     result = assembler.compute(sym_dir, temperatures)
     if result.get("E0_eV_per_atom") is None:

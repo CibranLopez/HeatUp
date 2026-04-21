@@ -1,10 +1,10 @@
-"""thermophasepy.pipeline
+"""heatup.pipeline
 ========================
 Top-level pipeline orchestrating the three sequential stability gates.
 
 Usage::
 
-    from thermophasepy import run_stability_pipeline
+    from heatup import run_stability_pipeline
 
     report = run_stability_pipeline(
         sym_dir     = "database/LiZrS2/R3m",
@@ -24,11 +24,11 @@ import traceback
 
 import matplotlib.pyplot as plt
 
-from thermophasepy import config
-from thermophasepy.mechanical    import assess_mechanical_stability
-from thermophasepy.vibrational   import assess_vibrational_stability
-from thermophasepy.thermodynamic import assess_thermodynamic_stability
-from thermophasepy.plotting      import plot_stability_report
+from heatup import config
+from heatup.mechanical    import assess_mechanical_stability
+from heatup.vibrational   import assess_vibrational_stability
+from heatup.thermodynamic import assess_thermodynamic_stability
+from heatup.plotting      import plot_stability_report
 
 
 def run_stability_pipeline(
@@ -112,7 +112,7 @@ def run_stability_pipeline(
             pass
 
     print(f"\n{'=' * 65}")
-    print(f"  ThermoPhase Pipeline: {tag}")
+    print(f"  HeatUp Pipeline: {tag}")
     print(f"  Operating temperature : {operating_T:.0f} K")
     print(f"{'=' * 65}")
 

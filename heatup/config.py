@@ -1,11 +1,11 @@
-"""thermophasepy.config
+"""heatup.config
 ======================
 Central configuration for all stability thresholds, file paths, and
 physical constants.  **All** tuneable parameters live here so that
 nothing is hardcoded deeper in the library.  Override any value before
 calling the pipeline functions, e.g.::
 
-    import thermophasepy.config as cfg
+    import heatup.config as cfg
     cfg.THERMO_HULL_WARN_EV = 0.05   # tighter metastability window
 """
 

@@ -1,4 +1,4 @@
-"""thermophasepy.vibrational
+"""heatup.vibrational
 ===========================
 Gate 2: Vibrational stability from the anharmonic vibrational density of
 states (VDOS).
@@ -26,7 +26,7 @@ on ω = 0.  Physically, this weight arises from:
 
 The VDOS is averaged across all AIMD temperatures available in
 ``aimd/<T>K/anharmonic_phonons/vdos.json``, which are expected to have
-been produced by :mod:`thermophasepy.vdos` or the companion
+been produced by :mod:`heatup.vdos` or the companion
 ``anharmonic_phonons.py`` module.
 
 Cache layout::
@@ -43,7 +43,7 @@ import os
 
 import numpy as np
 
-from thermophasepy import config
+from heatup import config
 
 
 def assess_vibrational_stability(sym_dir: str) -> dict:

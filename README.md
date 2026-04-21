@@ -1,12 +1,12 @@
-# thermophasepy
+# heatup
 
 **Sequential Stability Evaluation for Solid-State Electrolyte Candidates**
 
-[![CI](https://github.com/your-org/thermophasepy/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/thermophasepy/actions)
+[![CI](https://github.com/your-org/heatup/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/heatup/actions)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-`thermophasepy` implements a three-gate sequential stability pipeline for solid-state
+`heatup` implements a three-gate sequential stability pipeline for solid-state
 electrolyte (SSE) candidates discovered by machine-learning-guided active learning.
 Each gate must pass (or at least not fail) before the next one is evaluated, avoiding
 expensive computations on materials that are already ruled out by simpler criteria.
@@ -39,17 +39,17 @@ Candidate structure
 ## Installation
 
 ```bash
-pip install thermophasepy                        # core only
-pip install "thermophasepy[md]"                  # + MACE / ASE for MD triggering
-pip install "thermophasepy[generation]"          # + PyXtal for polymorph generation
-pip install "thermophasepy[all]"                 # everything
+pip install heatup                        # core only
+pip install "heatup[md]"                  # + MACE / ASE for MD triggering
+pip install "heatup[generation]"          # + PyXtal for polymorph generation
+pip install "heatup[all]"                 # everything
 ```
 
 For development:
 
 ```bash
-git clone https://github.com/your-org/thermophasepy
-cd thermophasepy
+git clone https://github.com/your-org/heatup
+cd heatup
 pip install -e ".[all]"
 pytest
 ```
@@ -59,7 +59,7 @@ pytest
 ### Python API
 
 ```python
-from thermophasepy import run_stability_pipeline
+from heatup import run_stability_pipeline
 
 report = run_stability_pipeline(
     sym_dir     = "database/LiZrS2/R3m",
@@ -76,16 +76,16 @@ for flag in report["flags"]:
 
 ```bash
 # Single material
-thermophasepy database/LiZrS2/R3m --operating-T 1200 --device cuda
+heatup database/LiZrS2/R3m --operating-T 1200 --device cuda
 
 # Entire database
-thermophasepy batch --database database --operating-T 1200
+heatup batch --database database --operating-T 1200
 
 # Skip PyXtal generation (faster)
-thermophasepy batch --no-generate
+heatup batch --no-generate
 
 # Force recompute
-thermophasepy database/LiZrS2/R3m --force
+heatup database/LiZrS2/R3m --force
 ```
 
 ### Integration with the active-learning pipeline
@@ -93,7 +93,7 @@ thermophasepy database/LiZrS2/R3m --force
 In `02_validate.ipynb` (or equivalent), replace the existing stability call with:
 
 ```python
-from thermophasepy import run_stability_pipeline
+from heatup import run_stability_pipeline
 
 for sym_dir in validated_dirs:
     report = run_stability_pipeline(
@@ -139,10 +139,10 @@ database/
 
 ## Configuration
 
-All thresholds live in `thermophasepy/config.py` and can be overridden at runtime:
+All thresholds live in `heatup/config.py` and can be overridden at runtime:
 
 ```python
-import thermophasepy.config as cfg
+import heatup.config as cfg
 
 cfg.THERMO_HULL_WARN_EV      = 0.05   # tighter metastability window (50 meV)
 cfg.VIB_ZERO_FRAC_FAIL       = 0.05   # stricter soft-mode threshold
@@ -181,7 +181,7 @@ evaluated at `operating_T`.
 pytest                        # all tests
 pytest -k mechanical          # Gate 1 only
 pytest -v --tb=long           # verbose
-pytest --cov=thermophasepy    # with coverage report
+pytest --cov=heatup    # with coverage report
 ```
 
 ## License
@@ -193,7 +193,7 @@ MIT — see [LICENSE](LICENSE).
 If you use this package in your research, please cite:
 
 ```bibtex
-@article{thermophasepy_2025,
+@article{heatup_2025,
   title   = {Sequential Stability Evaluation for Machine-Learning-Guided
              Discovery of Solid-State Electrolytes},
   author  = {Zeni, Claudio and others},

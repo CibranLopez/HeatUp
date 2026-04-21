@@ -1,17 +1,17 @@
-"""CLI entry point: python -m thermophasepy  or  thermophasepy."""
+"""CLI entry point: python -m heatup  or  heatup."""
 
 from __future__ import annotations
 
 import argparse
 import sys
 
-from thermophasepy import config
-from thermophasepy.pipeline import run_stability_pipeline, run_stability_pipeline_batch
+from heatup import config
+from heatup.pipeline import run_stability_pipeline, run_stability_pipeline_batch
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        prog="thermophasepy",
+        prog="heatup",
         description=(
             "Sequential stability analysis for solid-state electrolyte candidates.\n"
             "Pass a symmetry directory to analyse one material, or 'batch' to run "

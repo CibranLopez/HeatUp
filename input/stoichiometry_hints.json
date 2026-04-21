@@ -1,5 +1,5 @@
 {
-  "_comment": "Stoichiometry hints for ThermoPhase secondary-phase generation.",
+  "_comment": "Stoichiometry hints for HeatUp secondary-phase generation.",
   "_comment2": "Keys are element sets joined by '-' (order-independent).",
   "_comment3": "Values are lists of [n1, n2, ...] stoichiometry vectors matching the key element order.",
   "_format": "Element order in each vector follows alphabetical order of the key elements.",
