@@ -133,4 +133,24 @@ H_FS_MEV: float = 4.135667696   # meV·fs
 #: Minimum physical frequency (meV) below which VDOS modes are considered
 #: acoustic/numerical noise and excluded from thermodynamic integrals.
 OMEGA_MIN_MEV: float = 0.1
+
+# ---------------------------------------------------------------------------
+# MACE model
+# ---------------------------------------------------------------------------
+
+#: Path or name of the MACE-MP model file.
+#: The production SSE-AL pipeline imports MACE_MODEL from library.md_pipeline,
+#: which is the single source of truth.  This constant mirrors it so HeatUp
+#: can load the same model when triggering AIMD from the stability pipeline.
+#:
+#: Supported values:
+#:   "mace-mpa-0-medium"     — MACE-MP-0 medium (recommended, ~100 MB)
+#:   "mace-mpa-0-large"      — MACE-MP-0 large  (more accurate, ~300 MB)
+#:   "/abs/path/to/model.model"  — custom fine-tuned MACE model
+#:
+#: Set via environment variable MACE_MODEL_PATH to avoid editing source:
+#:   export MACE_MODEL_PATH=/path/to/your/mace.model
+import os as _os
+MACE_MODEL: str = _os.environ.get("MACE_MODEL_PATH", "mace-mpa-0-medium")
+
 HULL_PRESSURE_GPa: float = 0.0

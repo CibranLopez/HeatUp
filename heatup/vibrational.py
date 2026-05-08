@@ -108,7 +108,7 @@ def assess_vibrational_stability(sym_dir: str) -> dict:
                 d = json.load(fh)
             om = np.array(d["omega_mev"], dtype=float)
             g  = np.array(d["vdos"],      dtype=float)
-            norm = np.trapezoid(g, om)
+            norm = np.trapz(g, om)
             if norm > 0:
                 g /= norm
             vdos_list.append((om, g))
@@ -135,7 +135,7 @@ def assess_vibrational_stability(sym_dir: str) -> dict:
     g_avg /= len(vdos_list)
 
     # Re-normalise after averaging.
-    norm = np.trapezoid(g_avg, om_ref)
+    norm = np.trapz(g_avg, om_ref)
     if norm > 0:
         g_avg /= norm
 
@@ -144,7 +144,7 @@ def assess_vibrational_stability(sym_dir: str) -> dict:
     zero_mask = np.abs(om_ref) <= win
     zero_frac = 0.0
     if zero_mask.any():
-        zero_frac = float(np.trapezoid(g_avg[zero_mask], om_ref[zero_mask]))
+        zero_frac = float(np.trapz(g_avg[zero_mask], om_ref[zero_mask]))
     zero_frac = max(0.0, min(1.0, zero_frac))
 
     # ── Verdict ───────────────────────────────────────────────────────────

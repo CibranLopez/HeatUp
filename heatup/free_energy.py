@@ -127,14 +127,14 @@ def harmonic_f_vib(sym_dir: str, T_array: np.ndarray) -> np.ndarray:
     # Strip acoustic / numerical noise.
     mask = en > config.OMEGA_MIN_MEV * config.MEV_TO_EV
     en, wt = en[mask], wt[mask]
-    norm = np.trapezoid(wt, en)
+    norm = np.trapz(wt, en)
     if norm <= 0:
         return np.zeros_like(T_array)
     wt /= norm
 
     result = np.empty_like(T_array, dtype=float)
     for i, T in enumerate(T_array):
-        result[i] = float(np.trapezoid(wt * _helmholtz_integrand(en, T), en))
+        result[i] = float(np.trapz(wt * _helmholtz_integrand(en, T), en))
     return result
 
 
@@ -188,7 +188,7 @@ def anharmonic_f_vib(
                 om_eV = om_mev * config.MEV_TO_EV
                 mask  = om_eV > config.OMEGA_MIN_MEV * config.MEV_TO_EV
                 om_eV, g = om_eV[mask], g[mask]
-                norm = np.trapezoid(g, om_eV)
+                norm = np.trapz(g, om_eV)
                 if norm > 0:
                     g /= norm
                 vdos_list.append((om_eV, g))
@@ -205,13 +205,13 @@ def anharmonic_f_vib(
     for om_i, g_i in vdos_list[1:]:
         g_avg += np.interp(om_ref, om_i, g_i, left=0.0, right=0.0)
     g_avg /= len(vdos_list)
-    norm = np.trapezoid(g_avg, om_ref)
+    norm = np.trapz(g_avg, om_ref)
     if norm > 0:
         g_avg /= norm
 
     result = np.empty_like(T_array, dtype=float)
     for i, T in enumerate(T_array):
-        result[i] = float(np.trapezoid(g_avg * _helmholtz_integrand(om_ref, T), om_ref))
+        result[i] = float(np.trapz(g_avg * _helmholtz_integrand(om_ref, T), om_ref))
     return result
 
 
@@ -260,7 +260,7 @@ def electronic_f_el(sym_dir: str, T_array: np.ndarray) -> np.ndarray:
     n_el = float(d["n_electrons_per_atom"])
 
     # Reference electron energy at T=0 (μ = 0 by construction).
-    n_ref = float(np.trapezoid(g * _fermi_dirac(eps, 0.0, 0.0), eps))
+    n_ref = float(np.trapz(g * _fermi_dirac(eps, 0.0, 0.0), eps))
     if abs(n_ref - n_el) > 0.5:
         # DOS does not integrate to n_el at T=0 — data may be unnormalised.
         # Rescale g to correct electron number.
@@ -269,7 +269,7 @@ def electronic_f_el(sym_dir: str, T_array: np.ndarray) -> np.ndarray:
 
     # Ground-state band energy (T=0 reference, μ=0).
     f0       = _fermi_dirac(eps, 0.0, 0.0)
-    e_band_0 = float(np.trapezoid(eps * g * f0, eps))
+    e_band_0 = float(np.trapz(eps * g * f0, eps))
 
     result = np.empty_like(T_array, dtype=float)
     for i, T in enumerate(T_array):
@@ -281,9 +281,9 @@ def electronic_f_el(sym_dir: str, T_array: np.ndarray) -> np.ndarray:
         # Clip f away from 0 and 1 to avoid log(0).
         fc  = np.clip(f,  1e-300, 1.0 - 1e-300)
         fc2 = np.clip(1 - f, 1e-300, 1.0 - 1e-300)
-        U_el = float(np.trapezoid(eps * g * f, eps)) - e_band_0
+        U_el = float(np.trapz(eps * g * f, eps)) - e_band_0
         S_el = -config.KB_EV * float(
-            np.trapezoid(g * (fc * np.log(fc) + fc2 * np.log(fc2)), eps)
+            np.trapz(g * (fc * np.log(fc) + fc2 * np.log(fc2)), eps)
         )
         result[i] = U_el - T * S_el
 
@@ -310,7 +310,7 @@ def _solve_mu(
     mu_lo, mu_hi = float(eps.min()), float(eps.max())
     for _ in range(max_iter):
         mu_mid = 0.5 * (mu_lo + mu_hi)
-        n_mid  = float(np.trapezoid(g * _fermi_dirac(eps, mu_mid, T), eps))
+        n_mid  = float(np.trapz(g * _fermi_dirac(eps, mu_mid, T), eps))
         if n_mid < n_el:
             mu_lo = mu_mid
         else:

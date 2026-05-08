@@ -78,7 +78,7 @@ def _load_harmonic_dos(
     wt = np.array(d["weights"],     dtype=float)
     mask = en > config.OMEGA_MIN_MEV * config.MEV_TO_EV
     en, wt = en[mask], wt[mask]
-    norm = np.trapezoid(wt, en)
+    norm = np.trapz(wt, en)
     if norm > 0:
         wt /= norm
     return en, wt
@@ -91,7 +91,7 @@ def _harmonic_f_vib(
 ) -> float:
     """Harmonic vibrational Helmholtz free energy per atom in eV."""
     if T <= 0.0:
-        return float(np.trapezoid(0.5 * weights * energies, energies))
+        return float(np.trapz(0.5 * weights * energies, energies))
     kT = config.KB_EV * T
     x  = energies / (2.0 * kT)
     with warnings.catch_warnings():
@@ -99,7 +99,7 @@ def _harmonic_f_vib(
         integrand = weights * np.log(
             2.0 * np.sinh(np.clip(x, 1e-12, 500.0))
         )
-    return float(kT * np.trapezoid(integrand, energies))
+    return float(kT * np.trapz(integrand, energies))
 
 
 def _harmonic_free_energy(

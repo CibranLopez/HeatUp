@@ -1,0 +1,19 @@
+{
+    "mace_model": "mace-mpa-0-medium.model",
+    "device": "cuda",
+    "dispersion": false,
+    "supercell": [
+        3,
+        3,
+        3
+    ],
+    "delta": 0.05,
+    "npoints": 100,
+    "dos_kpts": [
+        20,
+        20,
+        20
+    ],
+    "dos_npts": 200,
+    "dos_width": 0.001
+}
