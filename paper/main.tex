@@ -1,0 +1,571 @@
+% HeatUp — npj Computational Materials
+% Overleaf: upload main.tex + references.bib
+% Compile: pdflatex → bibtex → pdflatex → pdflatex
+%
+% npj CompMat author guidelines (2024):
+%   Article: ~4000 words main text, max 8 figures
+%   Sections: Introduction | Results | Discussion | Methods
+%   Abstract: ≤200 words, unstructured
+%   References: numbered superscript (unsrtnat)
+%   Figures: 85 mm (1 col) or 170 mm (2 col), 300 dpi min, sans-serif
+
+\documentclass[twocolumn,10pt]{article}
+
+%% ── Packages ─────────────────────────────────────────────────────────────────
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[top=2.2cm,bottom=2.2cm,left=1.7cm,right=1.7cm,columnsep=5mm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage[table]{xcolor}
+\usepackage[hidelinks,colorlinks=true]{hyperref}
+\usepackage{cleveref}
+\usepackage{microtype}
+\usepackage[font=small,labelfont=bf,justification=justified]{caption}
+\usepackage{subcaption}
+\usepackage{siunitx}
+\usepackage{enumitem}
+\usepackage[numbers,compress,super]{natbib}
+\usepackage{listings}
+\usepackage{authblk}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{fancyhdr}
+\usepackage{abstract}
+
+%% ── Colours ──────────────────────────────────────────────────────────────────
+\definecolor{npjblue}{HTML}{1a4a8a}
+\definecolor{codebg}{HTML}{F5F5F5}
+\hypersetup{linkcolor=npjblue,citecolor=npjblue,urlcolor=npjblue}
+
+%% ── Typography (Nature-style) ────────────────────────────────────────────────
+\titleformat{\section}{\normalfont\bfseries\normalsize}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\normalfont\bfseries\small}{\thesubsection.}{0.5em}{}
+\setlength{\parskip}{3pt plus 1pt}
+\setlength{\parindent}{0pt}
+
+%% ── Abstract box ─────────────────────────────────────────────────────────────
+\renewcommand{\abstractnamefont}{\bfseries\small}
+\renewcommand{\abstracttextfont}{\small}
+\setlength{\absleftindent}{0pt}
+\setlength{\absrightindent}{0pt}
+
+%% ── Code listings ────────────────────────────────────────────────────────────
+\lstset{backgroundcolor=\color{codebg},basicstyle=\ttfamily\tiny,
+  breaklines=true,frame=tb,framesep=2pt,rulecolor=\color{gray!30},
+  language=Python,numbers=none,keywordstyle=\color{npjblue}\bfseries,
+  commentstyle=\itshape\color{gray},xleftmargin=2pt,xrightmargin=2pt}
+
+%% ── Math macros ──────────────────────────────────────────────────────────────
+\newcommand{\kB}{k_{\mathrm{B}}}
+\newcommand{\Fvib}{F_{\mathrm{vib}}}
+\newcommand{\Fel}{F_{\mathrm{el}}}
+\newcommand{\Fmag}{F_{\mathrm{mag}}}
+\newcommand{\Fconf}{F_{\mathrm{conf}}}
+\newcommand{\Ezero}{E_0}
+\newcommand{\ehull}{\Delta E_{\mathrm{hull}}}
+\newcommand{\TC}{T_{\mathrm{C}}}
+\newcommand{\muB}{\mu_{\mathrm{B}}}
+\newcommand{\vdos}{g(\omega)}
+\newcommand{\meVat}{\,\mathrm{meV\,atom^{-1}}}
+\newcommand{\tp}{\textsc{HeatUp}}
+
+%% ── Page style ───────────────────────────────────────────────────────────────
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\textit{Lopez Alvarez \textbar{} HeatUp}}
+\fancyhead[R]{\small\textit{npj Computational Materials}}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+%% =============================================================================
+\begin{document}
+%% =============================================================================
+
+%% ── Title block ──────────────────────────────────────────────────────────────
+\title{\textbf{HeatUp}: a generalised Gibbs free-energy framework for\\
+  temperature-aware phase stability in high-throughput materials discovery}
+
+\author[1,*]{Cibran Lopez Alvarez}
+\affil[1]{\small Department of Physics, Universitat Polit\`ecnica de Catalunya (UPC), Barcelona, Spain}
+\affil[*]{\small\href{mailto:cibran.lopez@upc.edu}{cibran.lopez@upc.edu}}
+
+\date{}
+\maketitle
+\thispagestyle{fancy}
+
+%% ── Abstract ─────────────────────────────────────────────────────────────────
+\begin{abstract}
+Machine-learning interatomic potentials (MLIPs) have enabled high-throughput
+computational screening of functional materials at near-first-principles accuracy,
+producing large databases of candidates with promising predicted properties.
+However, a predicted property alone does not guarantee that a material is
+mechanically stable, vibrationally coherent, or thermodynamically accessible
+at its operating temperature.
+We introduce \tp{}, an open-source Python framework that closes this gap through a
+sequential three-gate stability pipeline --- mechanical, vibrational, and thermodynamic
+--- applied in order of increasing cost.
+The thermodynamic gate constructs a fully temperature-dependent convex hull from a
+generalised Gibbs free energy assembler combining anharmonic vibrational contributions
+extracted from AIMD trajectories via the velocity autocorrelation function, electronic
+free energies from the electronic density of states, magnetic free energies via the
+Inden--Hillert model, and configurational entropy from site occupancies with a
+Cowley short-range-order correction.
+Critically, missing competing phases are generated automatically by exhaustive random
+crystal-structure prediction across all 230 space groups using chemically motivated
+stoichiometry hints to supplement the default search.
+We demonstrate the framework on synthetic model systems that reproduce the physically
+relevant behaviour of each contribution, and provide three self-contained Jupyter
+notebooks for complete reproducibility.
+\tp{} is designed as a drop-in stability filter for any MLIP-based discovery pipeline,
+with a composable architecture that accommodates new contributions as MLIP capabilities evolve.
+\end{abstract}
+
+%% =============================================================================
+\section*{Introduction}
+%% =============================================================================
+
+Universal MLIPs --- MACE-MP\cite{batatia2024maceuniversal}, CHGNet\cite{deng2023chgnet},
+M3GNet\cite{chen2022universal}, SevenNet\cite{park2024sevennet} --- trained on millions
+of DFT calculations now deliver near-first-principles accuracy for energies, forces,
+and stresses at a cost several orders of magnitude lower.
+Coupled with generative structure prediction\cite{xie2022crystal,yang2024mattersim}
+and active-learning frameworks\cite{vandermause2020fly,lopezalvarez2024sse}, this has
+produced large databases of candidates with predicted functional properties: high ionic
+conductivity, target band gaps, optimal magnetic moments.
+
+The central, underappreciated challenge is that a predicted property does not imply
+that the hosting phase \emph{exists} under realistic conditions.
+Three independent failure modes threaten any candidate:
+mechanical instability (negative stiffness eigenvalue signals spontaneous
+collapse\cite{born1954dynamical});
+vibrational instability (anharmonic soft modes at operating temperature drive a
+phase transition\cite{hellman2011lattice});
+and thermodynamic instability (the material lies above the convex hull of competing
+phases and will decompose\cite{sun2016thermodynamic}).
+
+Standard databases --- the Materials Project\cite{jain2013commentary},
+AFLOW\cite{curtarolo2012aflow} --- provide $T = 0\,\mathrm{K}$ hull data.
+This approximation fails for functional materials operated at 700--1200\,K:
+vibrational free-energy differences between phases reach $0.1$--$0.5\,\mathrm{eV\,atom^{-1}}$
+at these temperatures\cite{wang2015design}, comparable to or exceeding typical hull
+distances. Database coverage is also incomplete: novel compositions may have competing
+phases not yet computed or generated\cite{sun2016thermodynamic}.
+
+Here we introduce \tp{}, an open-source Python framework that systematically addresses
+all three issues.
+Every piece of data required for stability assessment is already produced as a byproduct
+of MLIP validation workflows; \tp{} assembles it in the correct order, adds automated
+phase generation, and returns a stability verdict at the operating temperature.
+
+%% =============================================================================
+\section*{Results}
+%% =============================================================================
+
+\subsection*{Sequential stability pipeline}
+
+\tp{} evaluates three gates in order of increasing cost (Fig.~\ref{fig:pipeline}).
+Failure at Gate~1 or Gate~2 terminates the pipeline; a warning propagates so that
+borderline materials are fully characterised.
+
+\textbf{Gate 1 --- Mechanical.}
+The Born--Huang criterion\cite{born1954dynamical,mouhat2014necessary} requires all
+six eigenvalues of the $6\times6$ Voigt stiffness tensor $C$ to be positive.
+$C$ is computed from stress--strain finite differences using the MLIP.
+Voigt-averaged bulk ($B$) and shear ($G$) moduli are also checked against configurable
+thresholds. The calculation requires fewer than 50 single-point evaluations.
+
+\textbf{Gate 2 --- Vibrational.}
+Harmonic phonon calculations at 0\,K cannot capture anharmonic soft modes that develop
+at finite temperature\cite{hellman2011lattice,muy2021phonon}.
+Gate~2 uses the anharmonic VDOS extracted from the AIMD trajectory via the VACF:
+\begin{equation}
+  \vdos \propto \left|\,\mathcal{F}\!\Bigl[
+    \textstyle\sum_{i,\alpha}\langle v_{i\alpha}(t)v_{i\alpha}(t+\tau)\rangle
+  \Bigr]\,\right|. \label{eq:vacf}
+\end{equation}
+A material fails when the fraction $\zeta$ of integrated VDOS weight within
+$|\omega| < 1\,\mathrm{meV}$ exceeds a configurable threshold (default: 8\%).
+A minimum-frames check (default: 500 frames $\approx 10\,\mathrm{ps}$) guards
+against spectral artefacts.
+The VDOS is extracted from a trajectory already available from conductivity validation,
+adding negligible overhead.
+
+\textbf{Gate 3 --- Thermodynamic.}
+The thermodynamic gate builds a temperature-dependent convex hull and evaluates the
+hull distance $\ehull(T_{\rm op})$ at the specified operating temperature.
+
+\subsection*{Generalised Gibbs free energy}
+
+The total Gibbs free energy per atom is:
+\begin{equation}
+  G(T,P) = \Ezero + \Fvib(T) + \Fel(T) + \Fmag(T) + \Fconf(T) + PV,
+  \label{eq:gibbs}
+\end{equation}
+assembled by the \texttt{GibbsAssembler} class, which accumulates contributions
+additively and returns zero for absent data files.
+
+\textbf{Anharmonic $\Fvib(T)$} uses the VDOS from Eq.~\eqref{eq:vacf}:
+\begin{equation}
+  \Fvib(T) = \int \vdos \bigl[{\tfrac{1}{2}}\hbar\omega
+    + \kB T \ln(1 - e^{-\hbar\omega/\kB T})\bigr]\,\mathrm{d}\omega.
+  \label{eq:fvib}
+\end{equation}
+A harmonic phonon DOS (from \texttt{phonons/dos.json}) is used as fallback when
+no AIMD data are available.
+
+\textbf{Electronic $\Fel(T)$} is the Mermin electronic free energy:
+\begin{equation}
+  \Fel(T) = U_{\rm el}(T) - T S_{\rm el}(T), \label{eq:fel}
+\end{equation}
+where $S_{\rm el} = {-\kB}\int g_{\rm el}[f\ln f+(1-f)\ln(1-f)]\,\mathrm{d}\varepsilon$
+and the Fermi--Dirac chemical potential $\mu(T)$ is solved self-consistently to
+conserve the electron number.
+The electronic DOS $g_{\rm el}(\varepsilon)$ is read from
+\texttt{electronic/edos.json}, which must be supplied from a DFT or tight-binding
+calculation on the MLIP-relaxed structure.
+\emph{Important limitation:} no deployed MLIP currently provides the electronic
+DOS from first principles alone. This is an active research frontier; the
+\texttt{GibbsAssembler} is designed to accommodate electron-density aware
+MLIPs\cite{batatia2022mace} without interface changes once they become available.
+For insulators with band gap $>1\,\mathrm{eV}$, $\Fel(T)$ is negligible
+at $T < 2000\,\mathrm{K}$; for metals it contributes $5$--$50\meVat$.
+
+\textbf{Magnetic $\Fmag(T)$} uses the Inden--Hillert
+model\cite{inden1976role,dinsdale1991sgte} with exchange parameters from
+\texttt{magnetic/moments.json}:
+\begin{equation}
+  \Fmag(T) = -\kB\TC\,f(\tau)\,\ln(\muB+1), \label{eq:fmag}
+\end{equation}
+where $\tau=T/\TC$ and $f(\tau)$ is the Inden polynomial.
+This is quantitatively accurate for 3d transition metals ($\pm 10\meVat$),
+but gives errors of $20$--$50\meVat$ for rare-earth $f$-electron
+compounds\cite{barreda2022anharmonic}, where a full Heisenberg Hamiltonian
+parameterised from MLIP spin dynamics would be needed --- not yet available in
+deployed potentials.
+
+\textbf{Configurational $\Fconf(T)$} from site occupancies in
+\texttt{disorder/site\_occupancies.json}:
+\begin{equation}
+  S_{\rm conf} = -\frac{\kB}{N}\sum_i\sum_j x_{ij}\ln x_{ij}. \label{eq:sconf}
+\end{equation}
+A Warren--Cowley short-range-order (SRO) correction is applied when
+\texttt{sro\_parameters.json} is present:
+$S_{\rm conf}^{\rm corr} = \alpha_{\rm SRO}\,S_{\rm conf}^{\rm ideal}$, where
+$\alpha_{\rm SRO}$ is derived from the AIMD radial distribution function.
+This correction is critical for superionic conductors where SRO reduces the
+ideal entropy by 30--50\%\cite{barreda2022anharmonic}.
+
+\textbf{Pressure--volume $PV$} uses a Birch--Murnaghan
+EOS\cite{birch1947finite} from \texttt{equation\_of\_state/eos.json}.
+A full quasi-harmonic treatment is planned but not yet implemented.
+
+\subsection*{Automated competing-phase generation}
+
+For a target material with element set $\{E_1,\ldots,E_n\}$, \tp{} collects all
+competing phases from the database and candidate tree, then generates missing
+polymorphs via PyXtal\cite{fredericks2021pyxtal} across all 230 ITA space groups.
+A \texttt{stoichiometry\_hints.json} file adds non-trivial stoichiometries for
+common sub-systems: for example, the Li--P--S sub-system automatically includes
+Li$_3$PS$_4$, Li$_2$PS$_3$, Li$_4$PS$_4$, and Li$_7$PS$_6$ in addition to the
+1:1:1 default, covering NASICON, argyrodite, and LGPS-type systems.
+Competing phases that already have AIMD trajectories are automatically upgraded
+to anharmonic free energies; a per-phase log records which source was used.
+
+\subsection*{Model demonstrations}
+
+Figure~\ref{fig:gibbs} shows the free-energy decomposition for a model
+lithium-halide system.
+The anharmonic correction to $\Fvib$ reaches $-15\meVat$ at 1200\,K;
+the configurational term (partial Li-site disorder) contributes $-100\meVat$.
+The electronic term (insulating gap) is negligible, consistent with the
+expectation that $\Fel$ matters only for metallic competing phases.
+
+Figure~\ref{fig:hull} shows the temperature evolution of the convex hull for a
+model binary Li--X system.
+Two phases marked metastable at $T = 0$ reach the hull at 1200\,K due to larger
+vibrational entropy and partial disorder.
+A static 0\,K screen would incorrectly classify these as unstable.
+
+Figure~\ref{fig:vdos} illustrates Gate~2 detection.
+In panel (c), $\zeta = 12.4\%$ exceeds the default 8\% threshold, correctly
+triggering pipeline termination.
+
+Figure~\ref{fig:coverage} quantifies the impact of PyXtal generation on hull
+distances for 80 synthetic candidates.
+Including generated phases increases the median hull distance by $\sim30\meVat$
+and reclassifies 15\% of materials as less stable, demonstrating that incomplete
+databases systematically overestimate thermodynamic stability.
+
+%% =============================================================================
+\section*{Discussion}
+%% =============================================================================
+
+\subsection*{The stability gap in the MLIP era}
+
+Universal MLIPs have removed the $E_0$ computation bottleneck from high-throughput
+screening.
+The new bottleneck is stability validation at realistic operating conditions.
+\tp{} addresses this directly: every contribution to $G(T,P)$ in
+Eq.~\eqref{eq:gibbs} is assembled from data already generated by the MLIP
+validation workflow, at negligible marginal cost.
+The sequential gating design ensures that the most expensive analysis --- hull
+construction and phase generation --- is only performed for materials that survive
+the cheaper mechanical and vibrational screens.
+
+\subsection*{What is and is not currently achievable}
+
+Table~\ref{tab:contributions} summarises the current feasibility of each
+contribution. $\Fvib(T)$, $\Fconf(T)$, and $PV$ are fully computable from MLIP
+data alone. $\Fmag(T)$ is accessible for 3d systems from DFT magnetic moments
+but requires a separate DFT calculation; the Inden--Hillert model is insufficient
+for $f$-electron compounds. $\Fel(T)$ requires an electronic DOS not available
+from any deployed MLIP: obtaining it currently requires a DFT single-point
+on the MLIP-relaxed geometry.
+
+This situation is well-defined and temporary.
+Electron-density and spin-density aware equivariant
+models\cite{batatia2022mace} are an active research priority, and \tp{}'s
+\texttt{GibbsAssembler} architecture accommodates them without interface changes.
+Any function with signature \texttt{fn(sym\_dir, T\_array)\,$\to$\,np.ndarray}
+can be registered and will be called automatically with the appropriate data.
+
+\subsection*{Generality beyond solid-state electrolytes}
+
+Although the motivating application is SSE discovery\cite{lopezalvarez2024sse},
+the framework is material-class agnostic.
+For thermoelectrics, a carrier-concentration-dependent $\Fel$ can be registered.
+For high-entropy oxides, multi-sublattice $\Fconf$ with full SRO treatment.
+For magnetic shape-memory alloys, a martensitic transformation free energy.
+For high-pressure synthesis, a volume-grid QHA treatment of $PV$.
+The four-line extension API --- register, implement, go --- is demonstrated in
+Notebook~2 using a Schottky defect contribution as a minimal example.
+
+\subsection*{Limitations and future directions}
+
+\emph{Trajectory length.} Reliable VACF spectral resolution requires
+$\geq 500$ production frames ($\approx 10\,\mathrm{ps}$); very low-frequency
+modes need $\geq 100\,\mathrm{ps}$. \tp{} now emits a configurable warning
+(\texttt{cfg.VIB\_MIN\_FRAMES}) when this is not met.
+
+\emph{Short-range order.} The Warren--Cowley correction addresses the leading-order
+SRO effect on $\Fconf$; multi-body and longer-range correlations require a
+cluster-expansion treatment\cite{vandermause2020fly} beyond the current scope.
+
+\emph{Quasi-harmonic pressure.} The current $PV$ uses a static BM EOS.
+A volume-grid AIMD series would enable full QHA; automated support is planned.
+
+\emph{Rare-earth magnetism.} The Inden--Hillert model is insufficient for $f$-electron
+systems. A Heisenberg MC approach requires spin-adiabatic MLIPs not yet available.
+
+\emph{Electronic DOS from MLIPs.} This is the highest-priority target for future
+development, gating the use of $\Fel$ for metallic compounds without DFT.
+
+%% =============================================================================
+\section*{Methods}
+%% =============================================================================
+
+\subsection*{VACF and VDOS computation}
+
+Velocities are estimated from PBC-aware finite differences of fractional coordinates
+(minimum-image convention), converted to Cartesian \AA\,fs$^{-1}$.
+The full two-sided VACF is computed via \texttt{numpy.correlate(...,'full')},
+mean-subtracted before FFT to suppress the DC artefact.
+The frequency axis uses $h/e = 4.1357\,\mathrm{meV\,fs}$.
+VDOS results from multiple AIMD temperatures are averaged on a common grid.
+
+\subsection*{Chemical potential solver}
+
+$\mu(T)$ in $\Fel(T)$ is determined by bisection, conserving valence electrons
+per atom to $< 10^{-6}$ at each temperature.
+
+\subsection*{Inden--Hillert polynomial}
+
+The dimensionless $f(\tau)$ uses CALPHAD normalisation constants
+$D_{\rm below} = 0.6549$ and $D_{\rm above} = 0.6509$
+from Ref.\,\citen{dinsdale1991sgte}.
+
+\subsection*{Birch--Murnaghan EOS}
+
+Third-order BM parameters are fitted by nonlinear least-squares
+(\texttt{scipy.optimize.curve\_fit}).
+
+\subsection*{Convex hull}
+
+The pymatgen \texttt{PhaseDiagram} engine\cite{ong2013python} constructs the hull
+at $T \in \{0,50,\ldots,1500\}\,\mathrm{K}$.
+
+\subsection*{Thresholds}
+
+All stability thresholds (Table~\ref{tab:thresholds}) are centralised in
+\texttt{heatup/config.py} and overridable at runtime.
+
+%% =============================================================================
+%% Tables
+%% =============================================================================
+
+\begin{table}[ht]
+\caption{\textbf{Free-energy contributions and current data requirements.}
+  ``MLIP only'' indicates the contribution is computable without DFT.
+  ``+ DFT'' requires a single-point DFT calculation.
+  ``Not yet'' indicates a fundamental current limitation.}
+\label{tab:contributions}
+\small
+\begin{tabular}{lllp{2.8cm}}
+\toprule
+Contribution & Data source & Status & Notes \\
+\midrule
+$\Fvib^{\rm anh}$ & AIMD VACF & MLIP only & Default \\
+$\Fvib^{\rm harm}$ & Phonon DOS & MLIP only & Fallback \\
+$\Fconf$ & Site occupancies & MLIP only & + SRO corr. \\
+$PV$ & BM EOS & MLIP only & Static $T$ \\
+$\Fel$ & Electronic DOS & + DFT & No MLIP yet \\
+$\Fmag$ (3d) & DFT moments & + DFT & Inden--Hillert \\
+$\Fmag$ ($f$) & Heisenberg MC & Not yet & Awaits spin MLIPs \\
+$\Fvib$ QHA & Vol-grid AIMD & Planned & Future release \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[ht]
+\caption{\textbf{Default stability thresholds in \tp{}}.
+  All are overridable via \texttt{heatup/config.py}.}
+\label{tab:thresholds}
+\small
+\begin{tabular}{lll}
+\toprule
+Parameter & Default & Unit \\
+\midrule
+\texttt{MECH\_BORN\_EIGENVALUE\_FAIL} & 0 & GPa \\
+\texttt{MECH\_BULK\_WARN} & 10 & GPa \\
+\texttt{MECH\_SHEAR\_WARN} & 5 & GPa \\
+\texttt{VIB\_ZERO\_WINDOW} & 1 & meV \\
+\texttt{VIB\_ZERO\_FRAC\_WARN} & 2 & \% \\
+\texttt{VIB\_ZERO\_FRAC\_FAIL} & 8 & \% \\
+\texttt{VIB\_MIN\_FRAMES} & 500 & frames \\
+\texttt{THERMO\_HULL\_WARN} & 100 & meV/atom \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% =============================================================================
+%% Figures (replace \fbox+\parbox with \includegraphics in final version)
+%% =============================================================================
+
+\begin{figure*}[ht]
+\centering
+\fbox{\parbox{\textwidth}{\centering\vspace{1.2cm}
+  \textbf{[Fig. 1: Pipeline schematic --- double column, 170 mm]}\\[0.3em]
+  Generated by \texttt{plotting\_utils.fig1\_pipeline\_schematic()}.
+  Sequential gates (Mechanical $\to$ Vibrational $\to$ Thermodynamic)
+  with fail arrows, GibbsAssembler inputs, and PyXtal loop.
+  \vspace{1.2cm}}}
+\caption{\textbf{The \tp{} sequential stability pipeline.}
+  Candidates enter from the left and traverse three gates in order of increasing
+  cost.
+  Gate~1 checks Born--Huang stability from the MLIP elastic tensor.
+  Gate~2 inspects the anharmonic VDOS for soft-mode weight near $\omega=0$.
+  Gate~3 builds the temperature-dependent convex hull from the generalised Gibbs
+  free energy, with PyXtal automatically supplying missing competing phases.
+  A failure terminates the pipeline; a warning propagates.
+  All thresholds are configurable; see Table~\ref{tab:thresholds}.}
+\label{fig:pipeline}
+\end{figure*}
+
+\begin{figure}[ht]
+\centering
+\fbox{\parbox{\columnwidth}{\centering\vspace{1.0cm}
+  \textbf{[Fig. 2: Gibbs decomposition --- single column, 85 mm]}\\[0.2em]
+  (a) Stacked contributions; (b) Harmonic--anharmonic difference.\\
+  \texttt{fig2\_gibbs\_decomposition()}
+  \vspace{1.0cm}}}
+\caption{\textbf{Generalised Gibbs free-energy decomposition.}
+  (a) Stacked contributions $\Fvib$, $\delta\Fvib^{\rm anh}$, $\Fel$, $\Fconf$
+  to $G(T)-E_0$ for a model lithium-halide system.
+  The configurational term and anharmonic vibrational correction dominate at
+  $T_{\rm op} = 1200\,\mathrm{K}$ (dotted line).
+  (b) Harmonic--anharmonic difference $\delta\Fvib$: the anharmonic correction
+  reaches $-15\meVat$ at 1200\,K.}
+\label{fig:gibbs}
+\end{figure}
+
+\begin{figure*}[ht]
+\centering
+\fbox{\parbox{\textwidth}{\centering\vspace{1.0cm}
+  \textbf{[Fig. 3: Hull evolution --- double column, 3 panels]}\\[0.2em]
+  $T = 0$, 600, 1200\,K; starred phases metastable at 0\,K, on hull at 1200\,K.\\
+  \texttt{fig3\_hull\_evolution()}
+  \vspace{1.0cm}}}
+\caption{\textbf{Temperature evolution of the convex hull.}
+  Formation free energies for a model binary Li--X system at 0, 600, and
+  1200\,K.
+  Phases Li$_3$X$_2^*$ and Li$_2$X$_3^\dagger$ are metastable at $T=0$
+  but reach the hull at $T = 1200\,\mathrm{K}$ due to larger vibrational entropy
+  and partial disorder.
+  Green: on-hull. Orange: metastable. Stars: PyXtal-generated.
+  A static 0\,K screen would incorrectly discard both starred phases.}
+\label{fig:hull}
+\end{figure*}
+
+\begin{figure}[ht]
+\centering
+\fbox{\parbox{\columnwidth}{\centering\vspace{1.0cm}
+  \textbf{[Fig. 4: VDOS --- single column, 3 panels]}\\[0.2em]
+  (a) Harmonic DOS; (b) Anharmonic VDOS; (c) Soft-mode material.\\
+  \texttt{fig4\_vdos\_comparison()}
+  \vspace{1.0cm}}}
+\caption{\textbf{Vibrational stability assessment (Gate~2).}
+  (a) Harmonic phonon DOS.
+  (b) Anharmonic VDOS from VACF: thermally broadened, red-shifted peaks.
+  (c) Vibrationally unstable material: soft-mode fraction
+  $\zeta = 12.4\%$ within $|\omega| < 1\,\mathrm{meV}$ (red band)
+  exceeds the 8\% failure threshold, terminating the pipeline.}
+\label{fig:vdos}
+\end{figure}
+
+\begin{figure}[ht]
+\centering
+\fbox{\parbox{\columnwidth}{\centering\vspace{1.0cm}
+  \textbf{[Fig. 5: Coverage impact --- single column, 2 panels]}\\[0.2em]
+  (a) Paired scatter; (b) Reclassification matrix.\\
+  \texttt{fig5\_coverage\_impact()}
+  \vspace{1.0cm}}}
+\caption{\textbf{Effect of systematic phase generation on hull distances.}
+  (a) Hull distance $\ehull$ before vs after adding PyXtal-generated phases
+  for 80 model candidates.
+  (b) Reclassification matrix: 15\% of materials are reclassified as
+  ``metastable'' or ``unstable'' once the competing-phase space is systematically
+  completed, demonstrating that incomplete databases overestimate stability.}
+\label{fig:coverage}
+\end{figure}
+
+%% ── Data and code availability ───────────────────────────────────────────────
+\section*{Data availability}
+All data required to reproduce the figures are generated analytically within the
+companion Jupyter notebooks included in the repository.
+No proprietary data are used.
+
+\section*{Code availability}
+\tp{} is available at \url{https://github.com/cibranlopez/heatup} under
+the MIT licence (Zenodo DOI: \texttt{10.5281/zenodo.XXXXXXX}).
+The version corresponding to this paper is tagged \texttt{v0.1.0}.
+
+\section*{Acknowledgements}
+The author thanks colleagues at UPC for stimulating discussions on active learning
+and thermodynamic stability, and the developers of
+pymatgen\cite{ong2013python}, PyXtal\cite{fredericks2021pyxtal},
+and MACE\cite{batatia2022mace} for excellent open-source tools.
+
+\section*{Author contributions}
+C.L.A.\ conceived the framework, developed the software, performed the analysis,
+and wrote the manuscript.
+
+\section*{Competing interests}
+The author declares no competing interests.
+
+\bibliographystyle{unsrtnat}
+\bibliography{references}
+
+\end{document}

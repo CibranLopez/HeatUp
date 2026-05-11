@@ -1,8 +1,0 @@
-{
-    "mace_model": "mace-mpa-0-medium.model",
-    "device": "cuda",
-    "dispersion": false,
-    "fmax": 0.05,
-    "relax_cell": true,
-    "constant_volume": false
-}

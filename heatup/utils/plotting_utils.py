@@ -307,7 +307,7 @@ def _debye_integral(x: np.ndarray) -> np.ndarray:
     for i in np.where(mid)[0]:
         t = np.linspace(1e-6, x[i], 200)
         integrand = t**3 / (np.expm1(t) + 1e-300)
-        result[i] = 3.0 * np.trapz(integrand, t) / x[i]**3
+        result[i] = 3.0 * np.trapezoid(integrand, t) / x[i]**3
     return result
 
 
@@ -478,17 +478,17 @@ def fig4_vdos_comparison(save_path: str | None = None) -> plt.Figure:
     harm_centres = [12, 28, 45, 62, 75, 88]
     harm_amp     = [0.6, 1.0, 0.9, 0.7, 0.5, 0.3]
     g_harm = _gauss_dos(harm_centres, 2.5, harm_amp, omega)
-    g_harm /= np.trapz(g_harm, omega) + 1e-12
+    g_harm /= np.trapezoid(g_harm, omega) + 1e-12
 
     # (b) Anharmonic VDOS — broader, peaks red-shifted, no artefacts at ω=0
     anh_centres = [10, 25, 42, 58, 70, 82]
     anh_amp     = [0.5, 0.9, 0.95, 0.65, 0.45, 0.25]
     g_anh = _gauss_dos(anh_centres, 5.0, anh_amp, omega)
-    g_anh /= np.trapz(g_anh, omega) + 1e-12
+    g_anh /= np.trapezoid(g_anh, omega) + 1e-12
 
     # (c) Unstable material — large soft-mode peak at ω ≈ 0
     g_soft  = _gauss_dos([2, 20, 50], 1.5, [3.0, 0.8, 0.5], omega)
-    g_soft /= np.trapz(g_soft, omega) + 1e-12
+    g_soft /= np.trapezoid(g_soft, omega) + 1e-12
 
     fig, axes = plt.subplots(1, 3, figsize=(W2, H_UNIT), sharey=False)
     window = 1.0  # meV
@@ -502,7 +502,7 @@ def fig4_vdos_comparison(save_path: str | None = None) -> plt.Figure:
         if show_win:
             ax.axvspan(0, window, color=C["red"], alpha=0.3,
                        label=f"|ω| < {window} meV")
-            frac = np.trapz(g[omega <= window], omega[omega <= window]) * 100
+            frac = np.trapezoid(g[omega <= window], omega[omega <= window]) * 100
             ax.text(window + 2, g.max() * 0.85,
                     f"ζ = {frac:.1f}%", fontsize=6, color=C["red"])
         ax.set_xlabel("ω (meV)")

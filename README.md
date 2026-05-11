@@ -2,10 +2,6 @@
 
 **Sequential Stability Evaluation for Solid-State Electrolyte Candidates**
 
-[![CI](https://github.com/your-org/heatup/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/heatup/actions)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-
 `heatup` implements a three-gate sequential stability pipeline for solid-state
 electrolyte (SSE) candidates discovered by machine-learning-guided active learning.
 Each gate must pass (or at least not fail) before the next one is evaluated, avoiding
@@ -48,9 +44,9 @@ pip install "heatup[all]"                 # everything
 For development:
 
 ```bash
-git clone https://github.com/your-org/heatup
+git clone https://github.com/CibranLopez/HeatUp
 cd heatup
-pip install -e ".[all]"
+pip install -r requirements.txt
 pytest
 ```
 
@@ -184,21 +180,17 @@ pytest -v --tb=long           # verbose
 pytest --cov=heatup    # with coverage report
 ```
 
-## License
-
-MIT — see [LICENSE](LICENSE).
-
 ## Citation
 
 If you use this package in your research, please cite:
 
 ```bibtex
 @article{heatup_2025,
-  title   = {Sequential Stability Evaluation for Machine-Learning-Guided
+  title   = {HeatUp: Sequential Stability Evaluation for Machine-Learning-Guided
              Discovery of Solid-State Electrolytes},
-  author  = {Zeni, Claudio and others},
-  journal = {npj Computational Materials},
-  year    = {2025},
+  author  = {López, C. et al.},
+  journal = {---},
+  year    = {2026},
   note    = {preprint}
 }
 ```
