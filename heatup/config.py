@@ -410,3 +410,105 @@ QHA_EOS: str = "vinet"
 # The manifest is written automatically by heatup.manifest.write_manifest().
 # Set WRITE_MANIFEST = False to disable (not recommended).
 WRITE_MANIFEST: bool = True
+
+
+# ---------------------------------------------------------------------------
+# Subprocess config propagation
+# ---------------------------------------------------------------------------
+# When the pipeline spawns child processes (for GPU memory isolation), all
+# in-memory config overrides must be forwarded via environment variables,
+# because the child process re-imports config.py with its default values.
+#
+# Usage (inside _cuda_env() of each pipeline module):
+#   env.update(config_to_env())
+#
+# Usage (at the top of each __main__ entry point):
+#   import heatup.config as _cfg; _cfg.config_from_env()
+
+#: Prefix used for every config env-var forwarded to child processes.
+_ENV_PREFIX = "HEATUP_CFG_"
+
+#: Names of module-level config variables that are forwarded to subprocesses.
+#: Extend this list if you add new parameters that subprocesses need.
+_FORWARDED_VARS: list[str] = [
+    # Calculator
+    "CALC_BACKEND", "MACE_MODEL", "MACE_DISPERSION", "MACE_DEFAULT_DTYPE",
+    # MD
+    "MD_ENSEMBLE", "MD_TIMESTEP_FS", "MD_N_STEPS", "MD_NBLOCK",
+    "MD_STEP_EQUIV", "MD_STEP_SKIP", "MD_TTIME_FS", "MD_PTIME_FS",
+    "MD_PRESSURE_GPA",
+    # Relaxation
+    "RELAX_FMAX", "RELAX_MAX_STEPS", "RELAX_CELL", "RELAX_CONSTANT_VOLUME",
+    # Phonons
+    "PHONON_MODE", "PHONON_BACKEND", "FORCE_CONSTANT_ORDER",
+    "PHONON_SUPERCELL", "PHONON_DELTA", "PHONON_NPOINTS",
+    "PHONON_DOS_NPTS", "PHONON_DOS_WIDTH",
+    # QHA
+    "QHA_N_VOLUMES", "QHA_VOLUME_RANGE", "QHA_EOS",
+    # AIMD / elastic
+    "AIMD_MIN_CELL_ANG", "ELASTIC_DELTA",
+    # Paths
+    "DATABASE_ROOT", "CANDIDATES_ROOT", "DEFAULT_DEVICE",
+    # Manifests
+    "WRITE_MANIFEST",
+]
+
+
+def config_to_env() -> dict[str, str]:
+    """Serialise live config values to a flat dict of ``HEATUP_CFG_*`` env vars.
+
+    Called by the subprocess helpers in :mod:`heatup.structure_pipeline` and
+    :mod:`heatup.md_pipeline` to propagate any in-process overrides (e.g. set
+    via ``cfg.CALC_BACKEND = 'chgnet'`` in a notebook) to the child process.
+
+    Returns:
+        Dict mapping ``HEATUP_CFG_<NAME>`` → str(value) for every variable
+        listed in :data:`_FORWARDED_VARS`.
+    """
+    import sys as _sys
+    this_module = _sys.modules[__name__]
+    env: dict[str, str] = {}
+    for name in _FORWARDED_VARS:
+        val = getattr(this_module, name, None)
+        if val is not None:
+            env[_ENV_PREFIX + name] = str(val)
+    return env
+
+
+def config_from_env() -> None:
+    """Apply ``HEATUP_CFG_*`` environment variables to the live config module.
+
+    Called at the start of each subprocess ``__main__`` entry point so that
+    parent-process overrides are honoured inside the child.
+
+    Type coercion is performed using the type of the current default value so
+    that, e.g., ``HEATUP_CFG_MD_N_STEPS=5000`` sets an ``int``, not a string.
+    Tuple values (e.g. ``PHONON_SUPERCELL``) are parsed from their ``str()``
+    representation (e.g. ``"(3, 3, 3)"``).
+    """
+    import sys as _sys
+    import ast as _ast
+    this_module = _sys.modules[__name__]
+    for name in _FORWARDED_VARS:
+        env_key = _ENV_PREFIX + name
+        raw = _os.environ.get(env_key)
+        if raw is None:
+            continue
+        current = getattr(this_module, name, None)
+        try:
+            if isinstance(current, bool):
+                coerced = raw.lower() in ("1", "true", "yes")
+            elif isinstance(current, int):
+                coerced = int(raw)
+            elif isinstance(current, float):
+                coerced = float(raw)
+            elif isinstance(current, tuple):
+                coerced = tuple(_ast.literal_eval(raw))
+            elif isinstance(current, list):
+                coerced = list(_ast.literal_eval(raw))
+            else:
+                coerced = raw  # str — use as-is
+            setattr(this_module, name, coerced)
+        except Exception:
+            # If parsing fails, keep the default rather than crashing.
+            pass

@@ -1,0 +1,22 @@
+{
+    "symmetry": "mp-1008283",
+    "material": "Ba",
+    "repetitions": [
+        4,
+        4,
+        7
+    ],
+    "min_cell_ang": 25.0,
+    "unit_cell_lengths": [
+        6.9846901755525455,
+        6.984690175552549,
+        3.997598744664239
+    ],
+    "supercell_lengths": [
+        27.938760702210182,
+        27.938760702210196,
+        27.983191212649675
+    ],
+    "n_atoms_unit": 2,
+    "n_atoms_supercell": 224
+}

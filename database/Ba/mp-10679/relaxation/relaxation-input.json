@@ -1,0 +1,8 @@
+{
+    "calculator": "mace-mp:mace-mpa-0-medium",
+    "device": "cuda",
+    "fmax": 0.05,
+    "max_steps": 500,
+    "relax_cell": true,
+    "constant_volume": false
+}
