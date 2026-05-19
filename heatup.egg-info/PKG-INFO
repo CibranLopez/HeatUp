@@ -1,0 +1,258 @@
+Metadata-Version: 2.4
+Name: heatup
+Version: 0.1.0
+Summary: Sequential stability evaluation for solid-state electrolyte candidates: mechanical, vibrational (anharmonic), and thermodynamic gates.
+Author: Claudio Zeni
+License: MIT License
+        
+        Copyright (c) 2026 Cibrán López
+        
+        Permission is hereby granted, free of charge, to any person obtaining a copy
+        of this software and associated documentation files (the "Software"), to deal
+        in the Software without restriction, including without limitation the rights
+        to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+        copies of the Software, and to permit persons to whom the Software is
+        furnished to do so, subject to the following conditions:
+        
+        The above copyright notice and this permission notice shall be included in all
+        copies or substantial portions of the Software.
+        
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+        IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+        FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+        AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+        OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+        SOFTWARE.
+        
+Project-URL: Homepage, https://github.com/your-org/heatup
+Project-URL: Documentation, https://heatup.readthedocs.io
+Project-URL: Repository, https://github.com/your-org/heatup
+Project-URL: Issues, https://github.com/your-org/heatup/issues
+Keywords: solid-state electrolytes,ionic conductors,thermodynamic stability,convex hull,phonons,machine learning interatomic potentials,MACE,active learning,materials science
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Science/Research
+Classifier: Topic :: Scientific/Engineering :: Chemistry
+Classifier: Topic :: Scientific/Engineering :: Physics
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy>=1.24
+Requires-Dist: scipy>=1.10
+Requires-Dist: matplotlib>=3.7
+Requires-Dist: pymatgen>=2023.1
+Provides-Extra: md
+Requires-Dist: ase>=3.22; extra == "md"
+Requires-Dist: mace-torch>=0.3; extra == "md"
+Provides-Extra: generation
+Requires-Dist: pyxtal>=0.6; extra == "generation"
+Provides-Extra: dev
+Requires-Dist: pytest>=7; extra == "dev"
+Requires-Dist: pytest-cov; extra == "dev"
+Requires-Dist: ruff; extra == "dev"
+Requires-Dist: mypy; extra == "dev"
+Provides-Extra: all
+Requires-Dist: heatup[dev,generation,md]; extra == "all"
+Dynamic: license-file
+
+# heatup
+
+**Sequential Stability Evaluation for Solid-State Electrolyte Candidates**
+
+`heatup` implements a three-gate sequential stability pipeline for solid-state
+electrolyte (SSE) candidates discovered by machine-learning-guided active learning.
+Each gate must pass (or at least not fail) before the next one is evaluated, avoiding
+expensive computations on materials that are already ruled out by simpler criteria.
+
+```
+Candidate structure
+       │
+       ▼
+┌──────────────────┐
+│  Gate 1          │  Born–Huang criterion (elastic tensor eigenvalues)
+│  Mechanical      │  Bulk modulus B, Shear modulus G
+└────────┬─────────┘
+         │ pass / warn
+         ▼
+┌──────────────────┐
+│  Gate 2          │  Anharmonic VDOS from AIMD (VACF method)
+│  Vibrational     │  Soft-mode weight at ω ≈ 0
+└────────┬─────────┘
+         │ pass / warn
+         ▼
+┌──────────────────┐
+│  Gate 3          │  Temperature-dependent convex hull
+│  Thermodynamic   │  F(T) = E₀ + F_vib(T),  anharmonic for target
+└──────────────────┘
+         │
+         ▼
+    stability_report.json  +  stability_report.pdf
+```
+
+## Installation
+
+```bash
+pip install heatup                        # core only
+pip install "heatup[md]"                  # + MACE / ASE for MD triggering
+pip install "heatup[generation]"          # + PyXtal for polymorph generation
+pip install "heatup[all]"                 # everything
+```
+
+For development:
+
+```bash
+git clone https://github.com/CibranLopez/HeatUp
+cd heatup
+pip install -r requirements.txt
+pytest
+```
+
+## Quick start
+
+### Python API
+
+```python
+from heatup import run_stability_pipeline
+
+report = run_stability_pipeline(
+    sym_dir     = "database/LiZrS2/R3m",
+    operating_T = 1200.0,          # K
+    device      = "cuda",
+)
+
+print(report["overall"])           # "ok" | "warn" | "fail" | "missing"
+for flag in report["flags"]:
+    print(flag)
+```
+
+### Command line
+
+```bash
+# Single material
+heatup database/LiZrS2/R3m --operating-T 1200 --device cuda
+
+# Entire database
+heatup batch --database database --operating-T 1200
+
+# Skip PyXtal generation (faster)
+heatup batch --no-generate
+
+# Force recompute
+heatup database/LiZrS2/R3m --force
+```
+
+### Integration with the active-learning pipeline
+
+In `02_validate.ipynb` (or equivalent), replace the existing stability call with:
+
+```python
+from heatup import run_stability_pipeline
+
+for sym_dir in validated_dirs:
+    report = run_stability_pipeline(
+        sym_dir                 = sym_dir,
+        operating_T             = OPERATING_TEMPERATURE,
+        device                  = DEVICE,
+        generate_missing_phases = True,
+    )
+    if report["overall"] == "ok":
+        retraining_candidates.append(sym_dir)
+    elif report["overall"] == "warn":
+        # borderline — human review
+        flagged.append((sym_dir, report["flags"]))
+    # "fail" → excluded automatically
+```
+
+## Directory layout
+
+```
+database/
+  <material>/<symmetry>/
+    POSCAR
+    relaxation/
+      energy.json           ← MACE ground-state energy per atom
+    elastic/
+      elastic_tensor.json   ← 6×6 stiffness tensor + derived moduli
+    phonons/
+      dos.json              ← harmonic DOS (fallback for Gate 3)
+    aimd/
+      <T>K/
+        output.traj
+        simulation-input.json
+        anharmonic_phonons/
+          vdos.json         ← cached VACF→VDOS (written by this package)
+          thermo.json
+          free_energy.json
+    stability/
+      secondary_phases.json
+      hull_vs_T.json
+      stability_report.json ← gate results + overall verdict
+      stability_report.pdf  ← three-panel dashboard
+```
+
+## Configuration
+
+All thresholds live in `heatup/config.py` and can be overridden at runtime:
+
+```python
+import heatup.config as cfg
+
+cfg.THERMO_HULL_WARN_EV      = 0.05   # tighter metastability window (50 meV)
+cfg.VIB_ZERO_FRAC_FAIL       = 0.05   # stricter soft-mode threshold
+cfg.MECH_BULK_WARN_GPa       = 20.0   # demand stiffer electrolytes
+cfg.PYXTAL_MAX_ATOMS         = 60     # allow larger unit cells
+```
+
+## Gate details
+
+### Gate 1 — Mechanical (Born–Huang)
+
+Reads `elastic/elastic_tensor.json`.  All six eigenvalues of the 6×6 Voigt
+stiffness tensor C must be positive (Born–Huang criterion).  The Voigt-averaged
+bulk modulus B and shear modulus G are checked against configurable thresholds.
+
+### Gate 2 — Vibrational (anharmonic VDOS)
+
+Reads `aimd/<T>K/anharmonic_phonons/vdos.json`.  The VDOS is extracted from
+AIMD trajectories via the velocity autocorrelation function (VACF), averaged
+across all available MD temperatures, and the fraction of spectral weight within
+a narrow window around ω = 0 is computed.  Significant weight there indicates
+soft modes surviving at finite temperature — a signature of structural instability
+or pre-transitional dynamics.
+
+### Gate 3 — Thermodynamic (convex hull with T)
+
+Constructs F(T) = E₀ + F_vib(T) for the target material (using the anharmonic
+VDOS) and for all secondary phases (harmonic approximation).  Missing polymorphs
+are generated automatically with PyXtal.  The pymatgen `PhaseDiagram` engine
+builds the convex hull at each temperature and the distance above the hull is
+evaluated at `operating_T`.
+
+## Running the tests
+
+```bash
+pytest                        # all tests
+pytest -k mechanical          # Gate 1 only
+pytest -v --tb=long           # verbose
+pytest --cov=heatup    # with coverage report
+```
+
+## Citation
+
+If you use this package in your research, please cite:
+
+```bibtex
+@article{heatup_2025,
+  title   = {HeatUp: Sequential Stability Evaluation for Machine-Learning-Guided
+             Discovery of Solid-State Electrolytes},
+  author  = {López, C. et al.},
+  journal = {---},
+  year    = {2026},
+  note    = {preprint}
+}
+```
