@@ -28,7 +28,7 @@ jobs:
 
       - name: Run tests with coverage
         run: |
-          pytest tests/ --cov=thermophasepy --cov-report=xml --cov-report=term-missing
+          pytest tests/ --cov=heatup --cov-report=xml --cov-report=term-missing
 
       - name: Upload coverage
         uses: codecov/codecov-action@v4
@@ -44,4 +44,4 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install ruff
-      - run: ruff check thermophasepy/ tests/
+      - run: ruff check heatup/ tests/
