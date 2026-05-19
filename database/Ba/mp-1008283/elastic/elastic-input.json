@@ -1,0 +1,5 @@
+{
+    "calculator": "mace-mp:mace-mpa-0-medium.model",
+    "device": "cuda",
+    "delta": 0.0001
+}

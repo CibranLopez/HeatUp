@@ -1,0 +1,16 @@
+{
+    "material": "Ba",
+    "symmetry": "mp-1008283",
+    "temperature_K": 600.0,
+    "calculator": "mace-mp:mace-mpa-0-medium.model",
+    "device": "cuda",
+    "ensemble": "NPT",
+    "timestep_fs": 1.0,
+    "n_steps": 30000,
+    "ttime_fs": 50.0,
+    "ptime_fs": 500.0,
+    "pressure_GPa": 0.0,
+    "nblock": 20,
+    "step_skip": 1,
+    "step_equiv": 100
+}

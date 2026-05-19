@@ -1,0 +1,20 @@
+{
+    "phonon_mode": "HA",
+    "force_constant_order": 2,
+    "phonon_backend": "ase",
+    "calculator": "mace-mp:mace-mpa-0-medium.model",
+    "device": "cuda",
+    "supercell": [
+        3,
+        3,
+        3
+    ],
+    "delta_A": 0.05,
+    "dos_kpts": [
+        20,
+        20,
+        20
+    ],
+    "dos_npts": 200,
+    "dos_width_eV": 0.001
+}

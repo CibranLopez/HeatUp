@@ -70,6 +70,18 @@ import subprocess
 import sys
 import traceback
 
+# ---------------------------------------------------------------------------
+# Standalone / subprocess bootstrap
+# ---------------------------------------------------------------------------
+# When this module is run as a subprocess script (python .../md_pipeline.py
+# --_run ...) it executes as a plain file, not as part of an installed package.
+# Insert the project root (the directory that *contains* the heatup/ folder)
+# into sys.path so "from heatup import ..." works without any pip install.
+_pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _pkg_root not in sys.path:
+    sys.path.insert(0, _pkg_root)
+# ---------------------------------------------------------------------------
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -108,9 +120,109 @@ def _tag(sym_dir: str, temperature: float | None = None) -> str:
     return tag
 
 
+def _find_python() -> str:
+    """Return the Python interpreter to use for CUDA-isolated subprocesses.
+
+    ``heatup`` is used as a local (non-installed) package, so the subprocess
+    always needs ``PYTHONPATH`` set (done in :func:`_cuda_env`).  The only job
+    of this function is to find a Python that has **mace** available.
+
+    Search order (first interpreter where ``import mace`` succeeds wins):
+
+    1. ``sys.executable`` — correct in a properly activated venv/conda env.
+    2. ``$CONDA_PREFIX/bin/python{3}`` — active conda env when Jupyter has
+       overridden sys.executable.
+    3. ``$VIRTUAL_ENV/bin/python{3}`` — same for plain venvs.
+    4. Every ``python*`` binary found on ``$PATH`` via ``shutil.which``.
+    5. Common conda/mamba root locations scanned for any env that has mace:
+       ``~/miniconda3``, ``~/anaconda3``, ``~/mambaforge``, ``/opt/conda``,
+       ``/usr/local/conda``.
+
+    If none of the above has mace, ``sys.executable`` is returned unchanged
+    (the error will surface with a clear traceback inside the subprocess).
+    """
+    import shutil as _shutil
+    import glob as _glob
+
+    candidates: list[str] = [sys.executable]
+
+    for var in ("CONDA_PREFIX", "VIRTUAL_ENV"):
+        base = os.environ.get(var, "")
+        if base:
+            candidates += [
+                os.path.join(base, "bin", "python"),
+                os.path.join(base, "bin", "python3"),
+            ]
+
+    for name in ("python", "python3"):
+        found = _shutil.which(name)
+        if found:
+            candidates.append(found)
+
+    conda_roots = [
+        os.path.expanduser("~/miniconda3"),
+        os.path.expanduser("~/anaconda3"),
+        os.path.expanduser("~/mambaforge"),
+        os.path.expanduser("~/miniforge3"),
+        "/opt/conda",
+        "/usr/local/conda",
+    ]
+    for var in ("CONDA_ROOT", "MAMBA_ROOT_PREFIX"):
+        val = os.environ.get(var, "")
+        if val:
+            conda_roots.insert(0, val)
+
+    for root in conda_roots:
+        if not os.path.isdir(root):
+            continue
+        for name in ("bin/python", "bin/python3"):
+            candidates.append(os.path.join(root, name))
+        for py in _glob.glob(os.path.join(root, "envs", "*", "bin", "python*")):
+            candidates.append(py)
+
+    seen: list[str] = []
+    for c in candidates:
+        if c and c not in seen and os.path.isfile(c):
+            seen.append(c)
+
+    for py in seen:
+        try:
+            result = subprocess.run(
+                [py, "-c", "import mace"],
+                capture_output=True, timeout=20,
+            )
+            if result.returncode == 0:
+                return py
+        except Exception:
+            continue
+
+    return sys.executable
+
+
 def _cuda_env() -> dict[str, str]:
+    """Return a copy of the environment with CUDA allocator options set.
+
+    * Always injects the ``heatup`` package parent into ``PYTHONPATH`` because
+      ``heatup`` is a local (non-installed) package that is never on
+      ``sys.path`` by default in subprocess invocations.
+    * Forwards all live :mod:`heatup.config` overrides as ``HEATUP_CFG_*``
+      env-vars so the child process inherits any in-process changes made in a
+      notebook (e.g. ``cfg.MD_N_STEPS = ...``).
+    """
     env = os.environ.copy()
     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+    # heatup is never pip-installed — always add its parent to PYTHONPATH.
+    # This file lives at  <project_root>/heatup/md_pipeline.py
+    # so pkg_parent == <project_root>  (the dir that *contains* heatup/).
+    pkg_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        pkg_parent if not existing
+        else f"{pkg_parent}{os.pathsep}{existing}"
+    )
+
+    env.update(config.config_to_env())
     return env
 
 
@@ -642,7 +754,7 @@ def run_md_subprocess(
         ``True`` if the subprocess exits with code 0.
     """
     cmd = [
-        sys.executable, _self_path(),
+        _find_python(), _self_path(),
         "--_run",
         "--sym_dir",     sym_dir,
         "--temperature", str(int(temperature)),
@@ -753,6 +865,9 @@ def print_database_summary(database_root: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _main_subprocess() -> int:
+    # Apply any config overrides forwarded from the parent process via env vars.
+    config.config_from_env()
+
     import argparse
     parser = argparse.ArgumentParser(description="HeatUp MD runner.")
     parser.add_argument("--_run",        action="store_true")

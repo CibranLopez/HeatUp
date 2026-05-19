@@ -1,0 +1,6 @@
+{
+    "energy_eV": -2.4308350568964108,
+    "energy_eV_per_atom": -1.2154175284482054,
+    "n_atoms": 2,
+    "calculator": "mace-mp:mace-mpa-0-medium.model"
+}

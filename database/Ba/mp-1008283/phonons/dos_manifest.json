@@ -1,0 +1,59 @@
+{
+  "heatup_version": "0.2.0",
+  "timestamp_utc": "2026-05-15T08:55:23.683177+00:00",
+  "step": "phonons_ha",
+  "output_path": "/home/claudio/cibran/Work/UPC/HeatUp/database/Ba/mp-1008283/phonons/dos.json",
+  "calculator": "mace-mp:mace-mpa-0-medium.model",
+  "calc_backend": "mace-mp",
+  "mace_model": "mace-mpa-0-medium.model",
+  "phonon_mode": "HA",
+  "force_constant_order": 2,
+  "phonon_backend": "ase",
+  "phonon_supercell": [
+    3,
+    3,
+    3
+  ],
+  "phonon_delta": 0.05,
+  "qha_n_volumes": 7,
+  "qha_volume_range": 0.06,
+  "qha_eos": "vinet",
+  "md_ensemble": "NPT",
+  "md_timestep_fs": 1.0,
+  "md_n_steps": 30000,
+  "md_nblock": 20,
+  "md_step_equiv": 100,
+  "md_ttime_fs": 50.0,
+  "md_ptime_fs": 500.0,
+  "md_pressure_GPa": 0.0,
+  "relax_fmax": 0.05,
+  "relax_cell": true,
+  "relax_constant_volume": false,
+  "vib_zero_window_mev": 1.0,
+  "vib_zero_frac_warn": 0.02,
+  "vib_zero_frac_fail": 0.08,
+  "vib_min_frames": 500,
+  "thermo_hull_warn_eV": 0.1,
+  "thermo_hull_stable_eV": 0.0,
+  "thermo_fe_consistency_thresh": 0.05,
+  "competing_phase_sources": [
+    "mp-api",
+    "database",
+    "candidates",
+    "pyxtal"
+  ],
+  "device": "cuda",
+  "supercell": [
+    3,
+    3,
+    3
+  ],
+  "delta_A": 0.05,
+  "dos_kpts": [
+    20,
+    20,
+    20
+  ],
+  "dos_npts": 200,
+  "dos_width_eV": 0.001
+}
