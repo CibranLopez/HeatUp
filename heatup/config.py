@@ -206,6 +206,25 @@ AIMD_MIN_CELL_ANG: float = 25.0
 ELASTIC_DELTA: float = 1e-4
 
 # ---------------------------------------------------------------------------
+# Gate 0 — Structural-transition detection (DACF)
+# ---------------------------------------------------------------------------
+
+#: Fraction of the DACF lag range used to estimate the long-time plateau C_∞.
+#: The mean of C(τ) over the last ``DACF_LONG_TIME_FRAC`` of the computed lag
+#: range (0 … T//2) is taken as C_∞.  A value of 0.20 means the last 20 %.
+DACF_LONG_TIME_FRAC: float = 0.20
+
+#: Long-time displacement autocorrelation C_∞ (Å²) above which a structural
+#: phase transition is declared.
+#:
+#: For a thermally vibrating solid, atoms oscillate around their initial
+#: positions so the DACF decays to zero: C_∞ ≈ 0.  After a structural
+#: transition, atoms settle at new equilibrium sites: C_∞ ≈ ⟨|Δr|²⟩, the
+#: mean-square displacement from the starting structure, which is typically
+#: ≫ 0.1 Å².
+DACF_THRESHOLD_ANG2: float = 0.10   # Å²
+
+# ---------------------------------------------------------------------------
 # Gate 1 — Mechanical stability thresholds
 # ---------------------------------------------------------------------------
 

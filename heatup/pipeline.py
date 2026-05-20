@@ -25,10 +25,11 @@ import traceback
 import matplotlib.pyplot as plt
 
 from heatup import config
-from heatup.mechanical    import assess_mechanical_stability
-from heatup.vibrational   import assess_vibrational_stability
-from heatup.thermodynamic import assess_thermodynamic_stability
-from heatup.plotting      import plot_stability_report
+from heatup.mechanical             import assess_mechanical_stability
+from heatup.vibrational            import assess_vibrational_stability
+from heatup.thermodynamic          import assess_thermodynamic_stability
+from heatup.structural_transition  import assess_structural_transition
+from heatup.plotting               import plot_stability_report
 
 
 def run_stability_pipeline(
@@ -117,17 +118,40 @@ def run_stability_pipeline(
     print(f"{'=' * 65}")
 
     report: dict = {
-        "material"      : material,
-        "symmetry"      : symmetry,
-        "sym_dir"       : sym_dir,
-        "operating_T_K" : operating_T,
-        "mechanical"    : {},
-        "vibrational"   : {},
-        "thermodynamic" : {},
-        "overall"       : config.STATUS_MISSING,
-        "flags"         : [],
-        "stopped_at"    : None,
+        "material"              : material,
+        "symmetry"              : symmetry,
+        "sym_dir"               : sym_dir,
+        "operating_T_K"         : operating_T,
+        "structural_transition" : {},
+        "mechanical"            : {},
+        "vibrational"           : {},
+        "thermodynamic"         : {},
+        "overall"               : config.STATUS_MISSING,
+        "flags"                 : [],
+        "stopped_at"            : None,
     }
+
+    # ── Gate 0: Structural transition ─────────────────────────────────────
+    print(f"\n  [Gate 0] Structural transition check (DACF)...")
+    struct_trans = assess_structural_transition(
+        sym_dir, force_recompute=force_rerun
+    )
+    report["structural_transition"] = struct_trans
+    print(f"    {struct_trans['status'].upper()} — {struct_trans['message']}")
+
+    if struct_trans["status"] == config.STATUS_FAIL:
+        report["stopped_at"] = "structural_transition"
+        report["flags"].append(
+            f"[FAIL] Structural transition: {struct_trans['message']}"
+        )
+        _finalise(report)
+        _persist(report, stab_dir, save_figure, figure_fmt)
+        return report
+
+    if struct_trans["status"] == config.STATUS_MISSING:
+        report["flags"].append(
+            f"[MISSING] Structural transition: {struct_trans['message']}"
+        )
 
     # ── Gate 1: Mechanical ────────────────────────────────────────────────
     print(f"\n  [Gate 1] Mechanical stability...")
@@ -192,9 +216,10 @@ def run_stability_pipeline(
 
 def _finalise(report: dict) -> None:
     statuses = [
-        report["mechanical"].get("status",    config.STATUS_MISSING),
-        report["vibrational"].get("status",   config.STATUS_MISSING),
-        report["thermodynamic"].get("status", config.STATUS_MISSING),
+        report["structural_transition"].get("status", config.STATUS_MISSING),
+        report["mechanical"].get("status",             config.STATUS_MISSING),
+        report["vibrational"].get("status",            config.STATUS_MISSING),
+        report["thermodynamic"].get("status",          config.STATUS_MISSING),
     ]
     if config.STATUS_FAIL in statuses:
         report["overall"] = config.STATUS_FAIL
@@ -212,12 +237,14 @@ def _persist(
 ) -> None:
     os.makedirs(stab_dir, exist_ok=True)
 
-    # Slim down the JSON: strip large VDOS arrays (stored in anharmonic_phonons/).
+    # Slim down the JSON: strip large arrays (stored in anharmonic_phonons/ files).
     slim = {k: v for k, v in report.items() if k != "vibrational"}
     slim["vibrational"] = {
         k: v for k, v in report.get("vibrational", {}).items()
         if k not in ("omega_mev", "vdos")
     }
+    # structural_transition large arrays are already stripped in
+    # assess_structural_transition(); the full DACF is in dacf.json per sim.
     with open(os.path.join(stab_dir, "stability_report.json"), "w") as fh:
         json.dump(slim, fh, indent=4)
 
