@@ -322,9 +322,9 @@ def _extract_thermo(frames: list, traj_timestep_fs: float,
     """
     times = np.array([i * traj_timestep_fs / 1000.0 + time_offset
                       for i in range(len(frames))])
-    T_K   = np.array([a.get_temperature()       for a in frames])
-    P_GPa = np.array([-np.trace(a.get_stress()) / 3.0 * 160.21766208
-                      for a in frames])   # eV/Å³ → GPa, isotropic component
+    T_K   = np.array([a.get_temperature()          for a in frames])
+    P_GPa = np.array([-a.get_stress()[:3].sum() / 3.0 * 160.21766208
+                      for a in frames])   # eV/Å³ → GPa, isotropic component (Voigt)
     V_A3  = np.array([a.get_volume()            for a in frames])
     return times, T_K, P_GPa, V_A3
 

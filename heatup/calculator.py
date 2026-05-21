@@ -159,6 +159,42 @@ def release_calculator(calc: Any | None) -> None:
         pass
 
 
+def _mace_forward_schema(model: Any) -> str:
+    """Return the TorchScript forward schema string for a MACE model, or ''."""
+    try:
+        return str(model._get_method("forward").schema)
+    except Exception:
+        pass
+    try:
+        return str(model.forward.schema)
+    except Exception:
+        pass
+    return ""
+
+
+class _LegacyMaceWrapper:
+    """Callable wrapper that strips unsupported kwargs from TorchScript model calls.
+
+    Older TorchScript MACE models (compiled before ``compute_edge_forces`` was
+    added to the schema) raise a ``RuntimeError`` when newer ``MACECalculator``
+    versions pass that kwarg.  This wrapper detects the mismatch at construction
+    time and silently drops the unsupported argument on every forward call.
+    """
+
+    def __init__(self, model: Any) -> None:
+        self._model = model
+        schema = _mace_forward_schema(model)
+        self._strip_edge_forces = "compute_edge_forces" not in schema
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if self._strip_edge_forces:
+            kwargs.pop("compute_edge_forces", None)
+        return self._model(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._model, name)
+
+
 # ---------------------------------------------------------------------------
 # Private backend constructors
 # ---------------------------------------------------------------------------
@@ -183,12 +219,34 @@ def _build_mace_mp(device: str) -> Any:
             "Install it with:  pip install mace-torch"
         ) from exc
 
-    return mace_mp(
+    calc = mace_mp(
         model        = config.MACE_MODEL,
         device       = device,
         dispersion   = config.MACE_DISPERSION,
         default_dtype= config.MACE_DEFAULT_DTYPE,
     )
+    return _wrap_mace_models(calc)
+
+
+def _wrap_mace_models(calc: Any) -> Any:
+    """Wrap models in a MACE calculator for legacy TorchScript compatibility.
+
+    Replaces each entry in ``calc.models`` with a :class:`_LegacyMaceWrapper`
+    when the underlying model's TorchScript schema does not include
+    ``compute_edge_forces`` (added in newer MACE releases).  Models that
+    already support the argument are returned unwrapped.
+
+    Args:
+        calc: A ``MACECalculator`` instance.
+
+    Returns:
+        The same calculator with ``calc.models`` patched in-place.
+    """
+    try:
+        calc.models = [_LegacyMaceWrapper(m) for m in calc.models]
+    except Exception:
+        pass  # If models aren't accessible, leave calculator unchanged
+    return calc
 
 
 def _build_chgnet(device: str) -> Any:
