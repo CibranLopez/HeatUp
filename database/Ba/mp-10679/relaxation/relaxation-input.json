@@ -1,5 +1,5 @@
 {
-    "calculator": "mace-mp:mace-mpa-0-medium",
+    "calculator": "mace-mp:BTO_MACE.model",
     "device": "cuda",
     "fmax": 0.05,
     "max_steps": 500,

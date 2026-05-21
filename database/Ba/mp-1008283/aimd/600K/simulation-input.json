@@ -2,7 +2,7 @@
     "material": "Ba",
     "symmetry": "mp-1008283",
     "temperature_K": 600.0,
-    "calculator": "mace-mp:mace-mpa-0-medium.model",
+    "calculator": "mace-mp:BTO_MACE.model",
     "device": "cuda",
     "ensemble": "NPT",
     "timestep_fs": 1.0,
