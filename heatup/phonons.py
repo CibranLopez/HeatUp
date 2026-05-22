@@ -263,6 +263,10 @@ def run_ha(
             raise ValueError(f"Unknown PHONON_BACKEND: {backend!r}. "
                              "Supported: 'ase', 'phonopy'.")
     except Exception as exc:
+        msg = str(exc)
+        if str(device).lower().startswith("cuda") and "Global alloc not supported yet" in msg:
+            print("  [warn] CUDA TorchScript backend failed for phonons; retrying on CPU.")
+            return run_ha(sym_dir, device="cpu", force_rerun=True)
         print(f"  [error] {tag}/phonons: {exc}")
         traceback.print_exc()
         return False
@@ -289,8 +293,19 @@ def _run_ha_ase(sym_dir: str, poscar: str, ph_dir: str, device: str) -> bool:
                      supercell = config.PHONON_SUPERCELL,
                      delta     = config.PHONON_DELTA,
                      name      = os.path.join(ph_dir, "phonon"))
+        # Remove stale/incomplete displacement cache from interrupted runs.
+        ph.clean()
         ph.run()
-        ph.read(acoustic=True)
+        try:
+            ph.read(acoustic=True)
+        except TypeError as exc:
+            if "NoneType" not in str(exc):
+                raise
+            # Some ASE cache entries can be left as null after interrupted
+            # runs; rebuild once from a clean cache.
+            ph.clean()
+            ph.run()
+            ph.read(acoustic=True)
 
         path = atoms.cell.bandpath(npoints=config.PHONON_NPOINTS)
         bs   = ph.get_band_structure(path)

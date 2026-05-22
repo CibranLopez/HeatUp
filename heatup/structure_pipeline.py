@@ -458,9 +458,30 @@ def run_relaxation(
               f"(fmax={config.RELAX_FMAX} eV/Å, "
               f"relax_cell={config.RELAX_CELL}, "
               f"backend={calculator_label()}) ...")
-        dyn.run(fmax=config.RELAX_FMAX, steps=config.RELAX_MAX_STEPS)
+        try:
+            dyn.run(fmax=config.RELAX_FMAX, steps=config.RELAX_MAX_STEPS)
+        except Exception as exc:
+            msg = str(exc)
+            stress_related = (
+                "compute_atomic_stresses" in msg
+                or "get_stress" in msg
+                or "too many indices for tensor" in msg
+            )
+            if config.RELAX_CELL and stress_related:
+                print(
+                    "  [warn] Cell relaxation requires stress, but this model "
+                    "backend failed stress evaluation. Retrying with "
+                    "relax_cell=False (positions only)."
+                )
+                atoms = read_vasp(file=dest)
+                atoms.calc = calc
+                dyn = BFGS(atoms, trajectory=traj_path, logfile=None)
+                dyn.run(fmax=config.RELAX_FMAX, steps=config.RELAX_MAX_STEPS)
+                filter_atoms = atoms
+            else:
+                raise
 
-        relaxed = filter_atoms.atoms if config.RELAX_CELL else filter_atoms
+        relaxed = filter_atoms.atoms if hasattr(filter_atoms, "atoms") else filter_atoms
         write_vasp(contcar, relaxed, direct=True, sort=True)
 
         e0_total    = float(relaxed.get_potential_energy())
@@ -765,6 +786,10 @@ def run_elastic(
         return True
 
     except Exception as exc:
+        msg = str(exc)
+        if str(device).lower().startswith("cuda") and "Global alloc not supported yet" in msg:
+            print("  [warn] CUDA TorchScript backend failed for elastic tensor; retrying on CPU.")
+            return run_elastic(sym_dir, device="cpu", force_rerun=True)
         print(f"  [error] {tag}/elastic: {exc}")
         traceback.print_exc()
         return False

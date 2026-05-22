@@ -53,6 +53,7 @@ exit the child process and let the OS reclaim CUDA context entirely.
 from __future__ import annotations
 
 import gc
+import types
 from typing import Any
 
 from heatup import config
@@ -185,10 +186,13 @@ class _LegacyMaceWrapper:
         self._model = model
         schema = _mace_forward_schema(model)
         self._strip_edge_forces = "compute_edge_forces" not in schema
+        self._strip_atomic_stresses = "compute_atomic_stresses" not in schema
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         if self._strip_edge_forces:
             kwargs.pop("compute_edge_forces", None)
+        if self._strip_atomic_stresses:
+            kwargs.pop("compute_atomic_stresses", None)
         return self._model(*args, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
@@ -219,6 +223,20 @@ def _build_mace_mp(device: str) -> Any:
             "Install it with:  pip install mace-torch"
         ) from exc
 
+    if str(device).lower().startswith("cuda"):
+        # PyTorch 2.10+ NNC/TensorExpressions kernel fuser tries to compile
+        # fused CUDA kernels after a few warmup calls.  When the TorchScript
+        # graph contains torch.autograd.grad (used by MACE to compute forces
+        # from energy), the fuser's CUDA codegen fails with
+        # "Global alloc not supported yet" because it cannot handle dynamic
+        # allocations inside the fused region.
+        # Disabling GPU fusion globally fixes this with no accuracy impact.
+        try:
+            import torch
+            torch._C._jit_override_can_fuse_on_gpu(False)
+        except Exception:
+            pass
+
     calc = mace_mp(
         model        = config.MACE_MODEL,
         device       = device,
@@ -243,10 +261,68 @@ def _wrap_mace_models(calc: Any) -> Any:
         The same calculator with ``calc.models`` patched in-place.
     """
     try:
+        # Switch to eval mode so the TorchScript forward pass uses
+        # create_graph=False inside torch.autograd.grad.  In training mode
+        # (the default after torch.jit.load) create_graph=True is passed,
+        # which triggers "Global alloc not supported yet" on CUDA with
+        # PyTorch >= 2.10.
+        for m in calc.models:
+            try:
+                m.eval()
+            except Exception:
+                pass
         calc.models = [_LegacyMaceWrapper(m) for m in calc.models]
     except Exception:
         pass  # If models aren't accessible, leave calculator unchanged
+    _patch_mace_result_tensors(calc)
     return calc
+
+
+def _patch_mace_result_tensors(calc: Any) -> None:
+    """Patch MACE result tensor assembly for legacy/single-head model outputs.
+
+    Some model + calculator version combinations return a 1D tensor from
+    ``atomic_energies_fn`` while the calculator indexes it as if it were 2D,
+    which triggers ``IndexError: too many indices for tensor of dimension 1``.
+    """
+    orig = getattr(calc, "_create_result_tensors", None)
+    if orig is None:
+        return
+
+    def _patched(self, num_models: int, num_atoms: int, batch: Any, out: dict):
+        try:
+            return orig(num_models, num_atoms, batch, out)
+        except IndexError as exc:
+            if "too many indices for tensor of dimension 1" not in str(exc):
+                raise
+
+            # Rebuild tensors without node_energy path, then compute node_e0
+            # with a shape-aware fallback for single-head models.
+            out_fallback = dict(out)
+            out_fallback.pop("node_energy", None)
+            ret_tensors, node_e0 = orig(num_models, num_atoms, batch, out_fallback)
+
+            try:
+                import torch
+
+                if out.get("node_energy") is not None:
+                    node_attrs = batch["node_attrs"][:num_atoms]
+                    ae = self.models[0].atomic_energies_fn(node_attrs)
+                    if getattr(ae, "ndim", 0) == 1:
+                        node_e0 = ae.detach().cpu().numpy()
+                    else:
+                        node_heads = batch["head"][batch["batch"]][:num_atoms]
+                        idx = torch.arange(num_atoms, device=node_heads.device)
+                        node_e0 = ae[idx, node_heads].detach().cpu().numpy()
+            except Exception:
+                node_e0 = None
+
+            return ret_tensors, node_e0
+
+    try:
+        calc._create_result_tensors = types.MethodType(_patched, calc)
+    except Exception:
+        pass
 
 
 def _build_chgnet(device: str) -> Any:

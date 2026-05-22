@@ -63,6 +63,7 @@ Typical usage::
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -97,6 +98,34 @@ from pymatgen.io.ase import AseAtomsAdaptor
 
 from heatup import config
 from heatup.calculator import build_calculator, release_calculator, calculator_label
+
+
+def _upper_triangular_cell_from_metric(cell: np.ndarray) -> np.ndarray:
+    """Build an upper-triangular cell matrix with the same metric tensor."""
+    G = cell @ cell.T
+    f = np.sqrt(G[2, 2])
+    e = G[1, 2] / f
+    d = np.sqrt(np.maximum(G[1, 1] - e**2, 0.0))
+    c = G[0, 2] / f
+    b = (G[0, 1] - c * e) / (d if d > 0 else 1.0)
+    a = np.sqrt(np.maximum(G[0, 0] - b**2 - c**2, 0.0))
+    return np.array([[a, b, c], [0.0, d, e], [0.0, 0.0, f]])
+
+
+def _is_triangular_cell(cell: np.ndarray, tol: float = 1e-10) -> bool:
+    """Return True when the cell is upper-triangular in ASE's NPT convention."""
+    return (
+        abs(cell[1, 0]) < tol and abs(cell[2, 0]) < tol and abs(cell[2, 1]) < tol
+    )
+
+
+def _ensure_npt_compatible_cell(atoms) -> None:
+    """In-place conversion to an upper-triangular cell for ASE NPT."""
+    cell = atoms.cell.array
+    if _is_triangular_cell(cell):
+        return
+    new_cell = _upper_triangular_cell_from_metric(cell)
+    atoms.set_cell(new_cell, scale_atoms=True)
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +608,9 @@ def _run_npt(atoms, temperature: float, traj_path: str, log_path: str) -> None:
     stress   = config.MD_PRESSURE_GPA / 160.21766208  # GPa → eV/Å³
     pfactor  = units.GPa * ptime**2
 
+    # ASE NPT requires a triangular box matrix; convert if needed.
+    _ensure_npt_compatible_cell(atoms)
+
     MaxwellBoltzmannDistribution(atoms, temperature_K=temperature)
     dyn = NPT(atoms,
               timestep       = dt,
@@ -610,6 +642,10 @@ def _run_nvt(atoms, temperature: float, traj_path: str, log_path: str) -> None:
 
     dt    = config.MD_TIMESTEP_FS * units.fs
     ttime = config.MD_TTIME_FS   * units.fs
+
+    # NVT is implemented via ASE NPT with pfactor=None, so the same
+    # triangular-cell requirement applies.
+    _ensure_npt_compatible_cell(atoms)
 
     MaxwellBoltzmannDistribution(atoms, temperature_K=temperature)
     dyn = NPT(atoms,
@@ -683,8 +719,32 @@ def run_md_simulation(
     calc  = None
     atoms = None
     if os.path.exists(traj_path) and not force_rerun:
-        print(f"  [skip MD] trajectory already exists: {traj_path}")
-    else:
+        if os.path.getsize(traj_path) == 0:
+            print(
+                f"  [warn] trajectory is empty (interrupted run) — deleting and rerunning: {traj_path}"
+            )
+            os.remove(traj_path)
+        else:
+            try:
+                _, _, n_prod, _ = _load_trajectory(
+                    sim,
+                    step_skip=params["step_skip"],
+                    step_equiv=params["step_equiv"],
+                    traj_timestep_fs=params["timestep_fs"] * params["nblock"] * params["step_skip"],
+                )
+                if n_prod < 10:
+                    print(
+                        f"  [warn] trajectory has only {n_prod} production frames — deleting and rerunning: {traj_path}"
+                    )
+                    os.remove(traj_path)
+                else:
+                    print(f"  [skip MD] trajectory already exists: {traj_path}")
+            except Exception as exc:
+                print(f"  [warn] existing trajectory invalid ({exc}) — deleting and rerunning.")
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(traj_path)
+
+    if not os.path.exists(traj_path) or force_rerun:
         total_ps = config.MD_N_STEPS * config.MD_TIMESTEP_FS / 1000.0
         eff_fs   = config.MD_TIMESTEP_FS * config.MD_NBLOCK
         print(f"Running {config.MD_ENSEMBLE} MD: {tag}  "
@@ -692,11 +752,15 @@ def run_md_simulation(
               f"writing every {eff_fs:.0f} fs, "
               f"backend={calculator_label()}) ...")
 
-        try:
+        def _run_md_with_device(dev: str) -> None:
+            """Inner helper: build calculator on *dev* and run MD ensemble."""
+            nonlocal atoms, calc
+            if atoms is not None:
+                atoms.calc = None
+            release_calculator(calc)
             atoms      = read_vasp(file=os.path.join(sim, "POSCAR"))
-            calc       = build_calculator(device=device)
+            calc       = build_calculator(device=dev)
             atoms.calc = calc
-
             if config.MD_ENSEMBLE.upper() == "NPT":
                 _run_npt(atoms, temperature, traj_path, log_path)
             elif config.MD_ENSEMBLE.upper() == "NVT":
@@ -706,6 +770,25 @@ def run_md_simulation(
                     f"Unknown MD_ENSEMBLE: {config.MD_ENSEMBLE!r}.  "
                     f"Supported: 'NPT', 'NVT'."
                 )
+
+        try:
+            atoms = read_vasp(file=os.path.join(sim, "POSCAR"))
+            calc  = None
+            try:
+                _run_md_with_device(device)
+            except RuntimeError as exc:
+                if (device.lower().startswith("cuda")
+                        and "Global alloc not supported yet" in str(exc)):
+                    print(
+                        "  [warn] CUDA TorchScript backend failed for MD; retrying on CPU."
+                    )
+                    # Remove partial empty trajectory before retry.
+                    with contextlib.suppress(FileNotFoundError):
+                        if os.path.exists(traj_path) and os.path.getsize(traj_path) == 0:
+                            os.remove(traj_path)
+                    _run_md_with_device("cpu")
+                else:
+                    raise
 
             write_vasp(contcar, atoms, direct=True, sort=True)
             print(f"  MD finished → {traj_path}")
