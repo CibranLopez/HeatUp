@@ -1,5 +1,5 @@
 {
-    "calculator": "mace-mp:BTO_MACE.model",
+    "calculator": "mace-mp:/home/claudio/cibran/Work/UPC/SSE-AL/mace-mpa-0-medium.model",
     "device": "cuda",
     "fmax": 0.05,
     "max_steps": 500,

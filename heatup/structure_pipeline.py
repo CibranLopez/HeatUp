@@ -220,7 +220,8 @@ def _cuda_env() -> dict[str, str]:
       notebook (e.g. ``cfg.MACE_MODEL = ...``).
     """
     env = os.environ.copy()
-    env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    # Keep allocator behavior consistent with sibling projects: do not force
+    # allocator mode here; pass through user environment as-is.
 
     # heatup is never pip-installed — always add its parent to PYTHONPATH.
     # This file lives at  <project_root>/heatup/structure_pipeline.py
@@ -917,10 +918,23 @@ def _run_isolated(
         cmd.append("--force")
 
     proc = subprocess.run(cmd, env=_cuda_env(), check=False)
-    if proc.returncode != 0:
-        print(f"  [error] {step} subprocess exited with code {proc.returncode}")
-        return False
-    return True
+    if proc.returncode == 0:
+        return True
+
+    if str(device).lower().startswith("cuda"):
+        print(
+            f"  [warn] {step} CUDA subprocess exited with code {proc.returncode}; "
+            "retrying on CPU."
+        )
+        cpu_cmd = cmd.copy()
+        dev_idx = cpu_cmd.index("--device") + 1
+        cpu_cmd[dev_idx] = "cpu"
+        proc = subprocess.run(cpu_cmd, env=_cuda_env(), check=False)
+        if proc.returncode == 0:
+            return True
+
+    print(f"  [error] {step} subprocess exited with code {proc.returncode}")
+    return False
 
 
 def run_relaxation_subprocess(

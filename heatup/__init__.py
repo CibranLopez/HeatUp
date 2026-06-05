@@ -37,6 +37,13 @@ Public API
 ----------
 """
 
+import numpy as np
+
+# NumPy compatibility: some environments expose trapezoidal integration only
+# as `np.trapezoid`.
+if not hasattr(np, "trapz"):
+    np.trapz = np.trapezoid
+
 from heatup.pipeline    import run_stability_pipeline, run_stability_pipeline_batch
 from heatup.mechanical  import assess_mechanical_stability
 from heatup.vibrational import assess_vibrational_stability

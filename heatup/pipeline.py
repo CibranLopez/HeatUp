@@ -216,11 +216,15 @@ def run_stability_pipeline(
 
 def _finalise(report: dict) -> None:
     statuses = [
-        report["structural_transition"].get("status", config.STATUS_MISSING),
-        report["mechanical"].get("status",             config.STATUS_MISSING),
-        report["vibrational"].get("status",            config.STATUS_MISSING),
-        report["thermodynamic"].get("status",          config.STATUS_MISSING),
+        report.get("mechanical", {}).get("status",    config.STATUS_MISSING),
+        report.get("vibrational", {}).get("status",   config.STATUS_MISSING),
+        report.get("thermodynamic", {}).get("status", config.STATUS_MISSING),
     ]
+    if "structural_transition" in report:
+        statuses.insert(
+            0,
+            report.get("structural_transition", {}).get("status", config.STATUS_MISSING),
+        )
     if config.STATUS_FAIL in statuses:
         report["overall"] = config.STATUS_FAIL
     elif config.STATUS_WARN in statuses or config.STATUS_MISSING in statuses:

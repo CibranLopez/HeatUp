@@ -2,7 +2,7 @@
     "material": "Ba",
     "symmetry": "mp-1008283",
     "temperature_K": 600.0,
-    "calculator": "mace-mp:BTO_MACE.model",
+    "calculator": "mace-mp:/home/claudio/cibran/Work/UPC/SSE-AL/mace-mpa-0-medium.model",
     "device": "cuda",
     "ensemble": "NPT",
     "timestep_fs": 1.0,
@@ -12,5 +12,6 @@
     "pressure_GPa": 0.0,
     "nblock": 20,
     "step_skip": 1,
-    "step_equiv": 100
+    "step_equiv": 100,
+    "barostat_bulk_modulus_GPa": 100.0
 }

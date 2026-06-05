@@ -239,7 +239,8 @@ def _cuda_env() -> dict[str, str]:
       notebook (e.g. ``cfg.MD_N_STEPS = ...``).
     """
     env = os.environ.copy()
-    env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    # Keep allocator behavior consistent with sibling projects: do not force
+    # allocator mode here; pass through user environment as-is.
 
     # heatup is never pip-installed — always add its parent to PYTHONPATH.
     # This file lives at  <project_root>/heatup/md_pipeline.py
@@ -260,9 +261,10 @@ def _build_md_params(
         symmetry: str,
         temperature: float,
         device: str,
+        bulk_modulus_gpa: float | None = None,
 ) -> dict:
     """Assemble the parameter record written to ``simulation-input.json``."""
-    return {
+    params = {
         "material"     : material,
         "symmetry"     : symmetry,
         "temperature_K": float(temperature),
@@ -278,6 +280,64 @@ def _build_md_params(
         "step_skip"    : config.MD_STEP_SKIP,
         "step_equiv"   : config.MD_STEP_EQUIV,
     }
+    if bulk_modulus_gpa is not None:
+        params["barostat_bulk_modulus_GPa"] = float(bulk_modulus_gpa)
+    return params
+
+
+def _is_retryable_cuda_runtime_error(exc: Exception) -> bool:
+    """Return True for known CUDA runtime failures where CPU retry is safe."""
+    msg = str(exc).lower()
+    exc_type = type(exc).__name__.lower()
+    return (
+        "global alloc not supported yet" in msg
+        or "nvml_success == driverapi::get()->nvmlinit_v2_()" in msg
+        or "cudacachingallocator.cpp" in msg
+        or ("cuda" in msg and "out of memory" in msg)
+        or "cudaerrormemoryallocation" in msg
+        or ("acceleratorerror" in exc_type and "cuda" in msg)
+    )
+
+
+def _preflight_md_cuda(atoms) -> None:
+    """Probe the exact CUDA property needed by the selected MD ensemble.
+
+    NPT requires stress evaluation during thermostat/barostat initialisation,
+    while NVT needs forces. Running this once before the full MD start makes
+    CUDA capability checks local to the actual workload instead of relying on
+    a generic torch allocation probe.
+    """
+    ensemble = config.MD_ENSEMBLE.upper()
+    if ensemble == "NPT":
+        atoms.get_stress()
+        return
+    atoms.get_forces()
+
+
+def _npt_bulk_modulus_gpa(sym_dir: str) -> float:
+    """Return a stable bulk modulus estimate for ASE's NPT barostat.
+
+    Preference order:
+
+    1. ``elastic/elastic_tensor.json`` if it contains a finite positive
+       Voigt bulk modulus.
+    2. A conservative built-in fallback of 100 GPa.
+
+    ASE's NPT implementation expects the barostat mass scale to be
+    proportional to a bulk modulus.  Feeding it only 1 GPa makes the
+    barostat too soft and can destabilize long runs.
+    """
+    fallback = 100.0
+    et_path = os.path.join(sym_dir, "elastic", "elastic_tensor.json")
+    try:
+        with open(et_path) as fh:
+            data = json.load(fh)
+        bulk = float(data["derived_moduli"]["bulk_modulus_voigt_GPa"])
+        if np.isfinite(bulk) and bulk > 0.0:
+            return max(bulk, fallback)
+    except Exception:
+        pass
+    return fallback
 
 
 # ---------------------------------------------------------------------------
@@ -506,7 +566,21 @@ def analyse_simulation(sim_dir: str, force: bool = False) -> dict | None:
 
         if n_prod < 10:
             print(f"  [skip] {sim_dir}: only {n_prod} production frames (need ≥ 10).")
-            return None
+            output = {
+                "sim_dir": sim_dir,
+                "temperature_K": temperature_dir,
+                "traj_timestep_fs": traj_timestep_fs,
+                "n_production_frames": n_prod,
+                "status": "skipped_insufficient_frames",
+                "skip_reason": "not_enough_production_frames",
+                "required_minimum_frames": 10,
+                "thermo": {},
+                "diffusion": {},
+            }
+            with open(analysis_path, "w") as fh:
+                json.dump(output, fh, indent=4)
+            print(f"  Analysis (skipped) → {analysis_path}")
+            return output
 
         # --- Thermodynamic convergence ---
         equil_times, equil_T, equil_P, equil_V = _extract_thermo(
@@ -587,7 +661,13 @@ def analyse_simulation(sim_dir: str, force: bool = False) -> dict | None:
 # MD simulation runner
 # ---------------------------------------------------------------------------
 
-def _run_npt(atoms, temperature: float, traj_path: str, log_path: str) -> None:
+def _run_npt(
+    atoms,
+    temperature: float,
+    traj_path: str,
+    log_path: str,
+    bulk_modulus_gpa: float,
+) -> None:
     """Run ASE NPT (Martyna-Tobias-Klein) MD.
 
     Cell shape and volume fluctuate.  Uses the Parrinello-Rahman barostat
@@ -606,7 +686,7 @@ def _run_npt(atoms, temperature: float, traj_path: str, log_path: str) -> None:
     ttime    = config.MD_TTIME_FS   * units.fs
     ptime    = config.MD_PTIME_FS   * units.fs
     stress   = config.MD_PRESSURE_GPA / 160.21766208  # GPa → eV/Å³
-    pfactor  = units.GPa * ptime**2
+    pfactor  = bulk_modulus_gpa * units.GPa * ptime**2
 
     # ASE NPT requires a triangular box matrix; convert if needed.
     _ensure_npt_compatible_cell(atoms)
@@ -708,6 +788,10 @@ def run_md_simulation(
     shutil.copy2(source_poscar, os.path.join(sim, "POSCAR"))
 
     params = _build_md_params(material, symmetry, temperature, device)
+    bulk_modulus_gpa = None
+    if config.MD_ENSEMBLE.upper() == "NPT":
+        bulk_modulus_gpa = _npt_bulk_modulus_gpa(sym_dir)
+        params["barostat_bulk_modulus_GPa"] = float(bulk_modulus_gpa)
     with open(os.path.join(sim, "simulation-input.json"), "w") as fh:
         json.dump(params, fh, indent=4)
     print(f"Parameters → {sim}/simulation-input.json")
@@ -747,10 +831,11 @@ def run_md_simulation(
     if not os.path.exists(traj_path) or force_rerun:
         total_ps = config.MD_N_STEPS * config.MD_TIMESTEP_FS / 1000.0
         eff_fs   = config.MD_TIMESTEP_FS * config.MD_NBLOCK
+        barostat = f", bulk={bulk_modulus_gpa:.1f} GPa" if bulk_modulus_gpa is not None else ""
         print(f"Running {config.MD_ENSEMBLE} MD: {tag}  "
               f"({config.MD_N_STEPS} steps × {config.MD_TIMESTEP_FS} fs = {total_ps:.1f} ps, "
               f"writing every {eff_fs:.0f} fs, "
-              f"backend={calculator_label()}) ...")
+              f"backend={calculator_label()}{barostat}) ...")
 
         def _run_md_with_device(dev: str) -> None:
             """Inner helper: build calculator on *dev* and run MD ensemble."""
@@ -761,8 +846,10 @@ def run_md_simulation(
             atoms      = read_vasp(file=os.path.join(sim, "POSCAR"))
             calc       = build_calculator(device=dev)
             atoms.calc = calc
+            if str(dev).lower().startswith("cuda"):
+                _preflight_md_cuda(atoms)
             if config.MD_ENSEMBLE.upper() == "NPT":
-                _run_npt(atoms, temperature, traj_path, log_path)
+                _run_npt(atoms, temperature, traj_path, log_path, bulk_modulus_gpa)
             elif config.MD_ENSEMBLE.upper() == "NVT":
                 _run_nvt(atoms, temperature, traj_path, log_path)
             else:
@@ -776,11 +863,19 @@ def run_md_simulation(
             calc  = None
             try:
                 _run_md_with_device(device)
-            except RuntimeError as exc:
-                if (device.lower().startswith("cuda")
-                        and "Global alloc not supported yet" in str(exc)):
+            except Exception as exc:
+                if (
+                    device.lower().startswith("cuda")
+                    and _is_retryable_cuda_runtime_error(exc)
+                ):
+                    msg = str(exc)
+                    oom_hint = (
+                        " Possible GPU memory pressure from other processes/kernels."
+                        if ("out of memory" in msg.lower() or "memoryallocation" in msg.lower())
+                        else ""
+                    )
                     print(
-                        "  [warn] CUDA TorchScript backend failed for MD; retrying on CPU."
+                        f"  [warn] CUDA backend failed for MD ({msg}); retrying on CPU.{oom_hint}"
                     )
                     # Remove partial empty trajectory before retry.
                     with contextlib.suppress(FileNotFoundError):
@@ -847,10 +942,23 @@ def run_md_subprocess(
         cmd.append("--force")
 
     proc = subprocess.run(cmd, env=_cuda_env(), check=False)
-    if proc.returncode != 0:
-        print(f"  [error] MD subprocess exited with code {proc.returncode}")
-        return False
-    return True
+    if proc.returncode == 0:
+        return True
+
+    if str(device).lower().startswith("cuda"):
+        print(
+            f"  [warn] MD CUDA subprocess exited with code {proc.returncode}; "
+            "retrying on CPU."
+        )
+        cpu_cmd = cmd.copy()
+        dev_idx = cpu_cmd.index("--device") + 1
+        cpu_cmd[dev_idx] = "cpu"
+        proc = subprocess.run(cpu_cmd, env=_cuda_env(), check=False)
+        if proc.returncode == 0:
+            return True
+
+    print(f"  [error] MD subprocess exited with code {proc.returncode}")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -927,8 +1035,53 @@ def print_database_summary(database_root: str) -> None:
         database_root: Root of the materials database.
     """
     records = scan_database(database_root)
+
+    # Build a lightweight status overview so output is not misleading when
+    # AIMD folders exist but diffusion analysis is missing/incomplete.
+    total_aimd_folders = 0
+    with_traj = 0
+    with_analysis = 0
+    with_diffusion = 0
+
+    if os.path.isdir(database_root):
+        for material in sorted(os.listdir(database_root)):
+            mat_dir = os.path.join(database_root, material)
+            if not os.path.isdir(mat_dir):
+                continue
+            for symmetry in sorted(os.listdir(mat_dir)):
+                sym_dir = os.path.join(mat_dir, symmetry)
+                aimd_dir = os.path.join(sym_dir, "aimd")
+                if not os.path.isdir(aimd_dir):
+                    continue
+                for temp_folder in sorted(os.listdir(aimd_dir)):
+                    if not temp_folder.endswith("K"):
+                        continue
+                    sim_dir = os.path.join(aimd_dir, temp_folder)
+                    total_aimd_folders += 1
+
+                    traj_path = os.path.join(sim_dir, "output.traj")
+                    if os.path.exists(traj_path) and os.path.getsize(traj_path) > 0:
+                        with_traj += 1
+
+                    data = load_analysis(sim_dir)
+                    if data is not None:
+                        with_analysis += 1
+                        if data.get("diffusion"):
+                            with_diffusion += 1
+
+    print(
+        "AIMD status: "
+        f"{total_aimd_folders} temperature folders, "
+        f"{with_traj} with output.traj, "
+        f"{with_analysis} with analysis.json, "
+        f"{with_diffusion} with diffusion metrics."
+    )
+
     if not records:
-        print(f"No completed simulations in {database_root}")
+        print(
+            "No completed simulations with diffusion metrics yet. "
+            "Folders may exist but still be incomplete, skipped, or missing analysis."
+        )
         return
 
     hdr = (f'{"Material":<18} {"Symmetry":<16} {"T (K)":>7}'

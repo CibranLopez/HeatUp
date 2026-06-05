@@ -421,7 +421,9 @@ def compute_anharmonic_phonons_for_sim(
     nblock           = int(params['nblock'])
     step_skip        = int(params.get('step_skip', 1))
     step_equiv       = int(params.get('step_equiv', 100))
-    temperature_K    = float(params['temperature'])
+    # Backward/forward compatible key: older runs used `temperature`,
+    # current inputs use `temperature_K`.
+    temperature_K    = float(params.get('temperature_K', params.get('temperature')))
     traj_timestep_fs = timestep_fs * nblock * step_skip
 
     # ── Load E0 from relaxation ───────────────────────────────────────────
