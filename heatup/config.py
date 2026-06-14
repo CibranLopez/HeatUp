@@ -89,6 +89,17 @@ CALC_BACKEND: str = "mace-mp"
 #:   export MACE_MODEL_PATH=mace-mpa-0-medium
 MACE_MODEL: str = _os.environ.get("MACE_MODEL_PATH", "mace-mpa-0-medium")
 
+#: Per-material MACE model overrides.  Maps material folder name → model path.
+#: The matching model is used instead of :data:`MACE_MODEL` for that material.
+#: Example::
+#:
+#:     cfg.MACE_MODEL      = 'mace-mpa-0-medium'   # default (competing phases)
+#:     cfg.MODEL_OVERRIDES = {'BaTiO3': 'BTO_MACE.model'}  # target material
+#:
+#: Not forwarded to subprocesses as a dict; the pipeline resolves the
+#: effective model per material before spawning each subprocess.
+MODEL_OVERRIDES: dict = {}
+
 #: Enable the D3 dispersion correction (MACE only; ignored by other backends).
 MACE_DISPERSION: bool = False
 
@@ -531,3 +542,21 @@ def config_from_env() -> None:
         except Exception:
             # If parsing fails, keep the default rather than crashing.
             pass
+
+
+def effective_mace_model(material: str) -> str:
+    """Return the MACE model path for *material*, applying :data:`MODEL_OVERRIDES`.
+
+    If *material* has an entry in ``MODEL_OVERRIDES`` that value is returned;
+    otherwise :data:`MACE_MODEL` is returned.
+
+    Args:
+        material: Material folder name (e.g. ``'BaTiO3'``, ``'Ba'``).
+
+    Returns:
+        Resolved model path string.
+    """
+    import sys as _sys
+    m = _sys.modules[__name__]
+    overrides = getattr(m, "MODEL_OVERRIDES", {})
+    return overrides.get(material, getattr(m, "MACE_MODEL", "mace-mpa-0-medium"))

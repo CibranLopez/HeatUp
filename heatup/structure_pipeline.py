@@ -238,6 +238,23 @@ def _cuda_env() -> dict[str, str]:
     return env
 
 
+@contextlib.contextmanager
+def _material_model(sym_dir: str):
+    """Context manager: temporarily set config.MACE_MODEL to the per-material
+    override from :data:`config.MODEL_OVERRIDES`, restoring the original on exit.
+
+    Must wrap any call to :func:`_cuda_env` so the resolved model is forwarded
+    to the child process via ``HEATUP_CFG_MACE_MODEL``.
+    """
+    material = os.path.basename(os.path.dirname(os.path.abspath(sym_dir)))
+    original = config.MACE_MODEL
+    config.MACE_MODEL = config.effective_mace_model(material)
+    try:
+        yield
+    finally:
+        config.MACE_MODEL = original
+
+
 def _make_cell_upper_triangular(atoms):
     """Return a copy of *atoms* with an upper-triangular simulation cell.
 
@@ -917,7 +934,9 @@ def _run_isolated(
     if force_rerun:
         cmd.append("--force")
 
-    proc = subprocess.run(cmd, env=_cuda_env(), check=False)
+    with _material_model(sym_dir):
+        env = _cuda_env()
+    proc = subprocess.run(cmd, env=env, check=False)
     if proc.returncode == 0:
         return True
 
@@ -929,7 +948,7 @@ def _run_isolated(
         cpu_cmd = cmd.copy()
         dev_idx = cpu_cmd.index("--device") + 1
         cpu_cmd[dev_idx] = "cpu"
-        proc = subprocess.run(cpu_cmd, env=_cuda_env(), check=False)
+        proc = subprocess.run(cpu_cmd, env=env, check=False)
         if proc.returncode == 0:
             return True
 

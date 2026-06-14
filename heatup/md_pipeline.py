@@ -314,30 +314,21 @@ def _preflight_md_cuda(atoms) -> None:
     atoms.get_forces()
 
 
-def _npt_bulk_modulus_gpa(sym_dir: str) -> float:
-    """Return a stable bulk modulus estimate for ASE's NPT barostat.
+@contextlib.contextmanager
+def _material_model(sym_dir: str):
+    """Context manager: temporarily set config.MACE_MODEL to the per-material
+    override from :data:`config.MODEL_OVERRIDES`, restoring the original on exit.
 
-    Preference order:
-
-    1. ``elastic/elastic_tensor.json`` if it contains a finite positive
-       Voigt bulk modulus.
-    2. A conservative built-in fallback of 100 GPa.
-
-    ASE's NPT implementation expects the barostat mass scale to be
-    proportional to a bulk modulus.  Feeding it only 1 GPa makes the
-    barostat too soft and can destabilize long runs.
+    Must wrap any call to :func:`_cuda_env` so the resolved model is forwarded
+    to the child process via ``HEATUP_CFG_MACE_MODEL``.
     """
-    fallback = 100.0
-    et_path = os.path.join(sym_dir, "elastic", "elastic_tensor.json")
+    material = os.path.basename(os.path.dirname(os.path.abspath(sym_dir)))
+    original = config.MACE_MODEL
+    config.MACE_MODEL = config.effective_mace_model(material)
     try:
-        with open(et_path) as fh:
-            data = json.load(fh)
-        bulk = float(data["derived_moduli"]["bulk_modulus_voigt_GPa"])
-        if np.isfinite(bulk) and bulk > 0.0:
-            return max(bulk, fallback)
-    except Exception:
-        pass
-    return fallback
+        yield
+    finally:
+        config.MACE_MODEL = original
 
 
 # ---------------------------------------------------------------------------
@@ -666,7 +657,6 @@ def _run_npt(
     temperature: float,
     traj_path: str,
     log_path: str,
-    bulk_modulus_gpa: float,
 ) -> None:
     """Run ASE NPT (Martyna-Tobias-Klein) MD.
 
@@ -686,10 +676,16 @@ def _run_npt(
     ttime    = config.MD_TTIME_FS   * units.fs
     ptime    = config.MD_PTIME_FS   * units.fs
     stress   = config.MD_PRESSURE_GPA / 160.21766208  # GPa → eV/Å³
-    pfactor  = bulk_modulus_gpa * units.GPa * ptime**2
+    pfactor  = units.GPa * ptime**2
 
     # ASE NPT requires a triangular box matrix; convert if needed.
     _ensure_npt_compatible_cell(atoms)
+    volume = float(atoms.get_volume())
+    if (not np.isfinite(volume)) or volume <= 0.0:
+        raise RuntimeError(
+            f"Invalid simulation-cell volume for NPT: {volume}. "
+            "Check the input structure before running MD."
+        )
 
     MaxwellBoltzmannDistribution(atoms, temperature_K=temperature)
     dyn = NPT(atoms,
@@ -702,7 +698,18 @@ def _run_npt(
 
     traj = Trajectory(traj_path, "w", atoms)
     dyn.attach(traj.write, interval=config.MD_NBLOCK)
-    dyn.run(config.MD_N_STEPS)
+    try:
+        dyn.run(config.MD_N_STEPS)
+    except TypeError as exc:
+        # ASE's melchionna integrator can surface barostat blow-ups as
+        # a late TypeError (bool * NoneType) after NaN propagation.
+        if "bool" in str(exc) and "NoneType" in str(exc):
+            raise RuntimeError(
+                "ASE NPT barostat became unstable (cell determinant approached zero). "
+                "This usually indicates NPT is not suitable for the current structure "
+                "(e.g. sparse/molecular cell) or pressure/barostat settings."
+            ) from exc
+        raise
     traj.close()
 
 
@@ -788,10 +795,6 @@ def run_md_simulation(
     shutil.copy2(source_poscar, os.path.join(sim, "POSCAR"))
 
     params = _build_md_params(material, symmetry, temperature, device)
-    bulk_modulus_gpa = None
-    if config.MD_ENSEMBLE.upper() == "NPT":
-        bulk_modulus_gpa = _npt_bulk_modulus_gpa(sym_dir)
-        params["barostat_bulk_modulus_GPa"] = float(bulk_modulus_gpa)
     with open(os.path.join(sim, "simulation-input.json"), "w") as fh:
         json.dump(params, fh, indent=4)
     print(f"Parameters → {sim}/simulation-input.json")
@@ -831,11 +834,10 @@ def run_md_simulation(
     if not os.path.exists(traj_path) or force_rerun:
         total_ps = config.MD_N_STEPS * config.MD_TIMESTEP_FS / 1000.0
         eff_fs   = config.MD_TIMESTEP_FS * config.MD_NBLOCK
-        barostat = f", bulk={bulk_modulus_gpa:.1f} GPa" if bulk_modulus_gpa is not None else ""
         print(f"Running {config.MD_ENSEMBLE} MD: {tag}  "
               f"({config.MD_N_STEPS} steps × {config.MD_TIMESTEP_FS} fs = {total_ps:.1f} ps, "
               f"writing every {eff_fs:.0f} fs, "
-              f"backend={calculator_label()}{barostat}) ...")
+              f"backend={calculator_label()}) ...")
 
         def _run_md_with_device(dev: str) -> None:
             """Inner helper: build calculator on *dev* and run MD ensemble."""
@@ -846,10 +848,11 @@ def run_md_simulation(
             atoms      = read_vasp(file=os.path.join(sim, "POSCAR"))
             calc       = build_calculator(device=dev)
             atoms.calc = calc
+            print(f"  MD device: {dev}")
             if str(dev).lower().startswith("cuda"):
                 _preflight_md_cuda(atoms)
             if config.MD_ENSEMBLE.upper() == "NPT":
-                _run_npt(atoms, temperature, traj_path, log_path, bulk_modulus_gpa)
+                _run_npt(atoms, temperature, traj_path, log_path)
             elif config.MD_ENSEMBLE.upper() == "NVT":
                 _run_nvt(atoms, temperature, traj_path, log_path)
             else:
@@ -941,21 +944,11 @@ def run_md_subprocess(
     if force_rerun:
         cmd.append("--force")
 
-    proc = subprocess.run(cmd, env=_cuda_env(), check=False)
+    with _material_model(sym_dir):
+        env = _cuda_env()
+    proc = subprocess.run(cmd, env=env, check=False)
     if proc.returncode == 0:
         return True
-
-    if str(device).lower().startswith("cuda"):
-        print(
-            f"  [warn] MD CUDA subprocess exited with code {proc.returncode}; "
-            "retrying on CPU."
-        )
-        cpu_cmd = cmd.copy()
-        dev_idx = cpu_cmd.index("--device") + 1
-        cpu_cmd[dev_idx] = "cpu"
-        proc = subprocess.run(cpu_cmd, env=_cuda_env(), check=False)
-        if proc.returncode == 0:
-            return True
 
     print(f"  [error] MD subprocess exited with code {proc.returncode}")
     return False
