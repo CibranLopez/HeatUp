@@ -555,7 +555,11 @@ def _build_hull_at_T(
 
     Returns:
         Dict with keys ``T``, ``e_above_hull_eV_atom``, ``stable``,
-        ``hull_phases``, ``n_entries``.
+        ``hull_phases``, ``n_entries``, ``decomposition`` (competing-phase
+        name → fraction the target decomposes into), ``competing_phases``
+        (every candidate considered, as ``{"name", "energy_eV_atom"}``), and
+        ``target_energy_eV_atom``.  On failure: ``T``, ``e_above_hull_eV_atom``
+        (None), ``stable`` (None), ``error``.
     """
     from pymatgen.core import Composition
     from pymatgen.analysis.phase_diagram import PDEntry, PhaseDiagram
@@ -567,7 +571,8 @@ def _build_hull_at_T(
             continue
         F_at_T = float(np.interp(T, fe["temperatures"], fe["F_eV_per_atom"]))
         comp   = Composition(ph["formula"])
-        entries.append(PDEntry(comp, F_at_T * comp.num_atoms, name=ph["formula"]))
+        label  = f'{ph["formula"]} ({os.path.basename(ph["sym_dir"])})'
+        entries.append(PDEntry(comp, F_at_T * comp.num_atoms, name=label))
 
     if not entries:
         return {"T": T, "e_above_hull_eV_atom": None, "stable": None}
@@ -578,13 +583,23 @@ def _build_hull_at_T(
         F_tgt   = float(np.interp(T, tgt_fe["temperatures"], tgt_fe["F_eV_per_atom"]))
         tgt_comp = Composition(target_phase["formula"])
         tgt_entry = PDEntry(tgt_comp, F_tgt * tgt_comp.num_atoms, name="TARGET")
-        e_hull  = pd.get_e_above_hull(tgt_entry)
+        decomp, e_hull = pd.get_decomp_and_e_above_hull(tgt_entry, allow_negative=True)
         return {
-            "T"                    : T,
-            "e_above_hull_eV_atom" : float(e_hull),
-            "stable"               : bool(e_hull < 1e-4),
-            "hull_phases"          : [e.name for e in pd.stable_entries],
-            "n_entries"            : len(entries),
+            "T"                     : T,
+            "e_above_hull_eV_atom"  : float(e_hull),
+            "stable"                : bool(e_hull < 1e-4),
+            "hull_phases"           : [e.name for e in pd.stable_entries],
+            "n_entries"             : len(entries),
+            # Full energetic landscape at this T: every competing phase considered,
+            # which one(s) the target decomposes into (and in what fraction), and
+            # the target's own energy — enough to plot "who is competing with whom"
+            # at a single temperature, not just the resulting scalar e_above_hull.
+            "decomposition"         : {e.name: float(frac) for e, frac in decomp.items()},
+            "competing_phases"      : [
+                {"name": e.name, "energy_eV_atom": float(e.energy_per_atom)}
+                for e in entries
+            ],
+            "target_energy_eV_atom" : float(tgt_entry.energy_per_atom),
         }
     except Exception as exc:
         return {"T": T, "e_above_hull_eV_atom": None, "stable": None,
@@ -743,8 +758,16 @@ def assess_thermodynamic_stability(
         e_at_T = float(np.interp(operating_T, Ts_arr, Es_arr))
 
     if e_at_T is None:
-        status  = config.STATUS_MISSING
-        message = "Could not evaluate hull (insufficient competing phases)."
+        status = config.STATUS_MISSING
+        errs = [r["error"] for r in hull_results if r.get("error")]
+        if errs:
+            message = (
+                f"Hull decomposition failed at all {len(temperatures)} temperatures "
+                f"despite {len(usable)} competing phase(s) — not a data-availability "
+                f"issue. First error: {errs[0]}"
+            )
+        else:
+            message = "Could not evaluate hull (insufficient competing phases)."
     elif e_at_T > config.THERMO_HULL_WARN_EV:
         status  = config.STATUS_FAIL
         message = (f"E_above_hull = {e_at_T * 1000:.1f} meV/atom at {operating_T:.0f} K "

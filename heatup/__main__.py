@@ -5,6 +5,16 @@ from __future__ import annotations
 import argparse
 import sys
 
+# Headless-safe: this entry point (`python -m heatup`) may run on a machine
+# with no display (e.g. an HPC batch job). Must run before anything imports
+# matplotlib.pyplot — heatup/__init__.py -> pipeline -> plotting does exactly
+# that, so this has to come before the `heatup` import below, not inside
+# heatup.plotting itself (that module is also imported by interactive
+# sessions such as Jupyter, where forcing Agg would silently disable
+# plt.show() for the user's own plots).
+import matplotlib
+matplotlib.use("Agg")
+
 from heatup import config
 from heatup.pipeline import run_stability_pipeline, run_stability_pipeline_batch
 
