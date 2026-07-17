@@ -539,6 +539,43 @@ def _ensure_phase_prepared(ph: dict, device: str) -> bool:
 # Convex hull
 # ---------------------------------------------------------------------------
 
+def _competing_entries_at_T(
+        competing_phases: list[dict],
+        free_energies: dict[str, dict],
+        T: float,
+) -> list:
+    """Build a pymatgen PDEntry for every competing phase at temperature T.
+
+    Shared by :func:`_build_hull_at_T` (JSON-safe scalar hull results) and
+    :func:`build_phase_diagram_at_T` (the live PhaseDiagram, for plotting) —
+    both need exactly the same entries, just do different things with them.
+    """
+    from pymatgen.core import Composition
+    from pymatgen.analysis.phase_diagram import PDEntry
+
+    entries = []
+    for ph in competing_phases:
+        fe = free_energies.get(ph["sym_dir"])
+        if fe is None:
+            continue
+        F_at_T = float(np.interp(T, fe["temperatures"], fe["F_eV_per_atom"]))
+        comp   = Composition(ph["formula"])
+        label  = f'{ph["formula"]} ({os.path.basename(ph["sym_dir"])})'
+        entries.append(PDEntry(comp, F_at_T * comp.num_atoms, name=label))
+    return entries
+
+
+def _target_entry_at_T(target_phase: dict, free_energies: dict[str, dict], T: float):
+    """Build the target's own PDEntry at temperature T. See _competing_entries_at_T."""
+    from pymatgen.core import Composition
+    from pymatgen.analysis.phase_diagram import PDEntry
+
+    tgt_fe   = free_energies[target_phase["sym_dir"]]
+    F_tgt    = float(np.interp(T, tgt_fe["temperatures"], tgt_fe["F_eV_per_atom"]))
+    tgt_comp = Composition(target_phase["formula"])
+    return PDEntry(tgt_comp, F_tgt * tgt_comp.num_atoms, name="TARGET")
+
+
 def _build_hull_at_T(
         target_phase: dict,
         competing_phases: list[dict],
@@ -561,28 +598,15 @@ def _build_hull_at_T(
         ``target_energy_eV_atom``.  On failure: ``T``, ``e_above_hull_eV_atom``
         (None), ``stable`` (None), ``error``.
     """
-    from pymatgen.core import Composition
-    from pymatgen.analysis.phase_diagram import PDEntry, PhaseDiagram
+    from pymatgen.analysis.phase_diagram import PhaseDiagram
 
-    entries = []
-    for ph in competing_phases:
-        fe = free_energies.get(ph["sym_dir"])
-        if fe is None:
-            continue
-        F_at_T = float(np.interp(T, fe["temperatures"], fe["F_eV_per_atom"]))
-        comp   = Composition(ph["formula"])
-        label  = f'{ph["formula"]} ({os.path.basename(ph["sym_dir"])})'
-        entries.append(PDEntry(comp, F_at_T * comp.num_atoms, name=label))
-
+    entries = _competing_entries_at_T(competing_phases, free_energies, T)
     if not entries:
         return {"T": T, "e_above_hull_eV_atom": None, "stable": None}
 
     try:
-        pd      = PhaseDiagram(entries)
-        tgt_fe  = free_energies[target_phase["sym_dir"]]
-        F_tgt   = float(np.interp(T, tgt_fe["temperatures"], tgt_fe["F_eV_per_atom"]))
-        tgt_comp = Composition(target_phase["formula"])
-        tgt_entry = PDEntry(tgt_comp, F_tgt * tgt_comp.num_atoms, name="TARGET")
+        pd = PhaseDiagram(entries)
+        tgt_entry = _target_entry_at_T(target_phase, free_energies, T)
         decomp, e_hull = pd.get_decomp_and_e_above_hull(tgt_entry, allow_negative=True)
         return {
             "T"                     : T,
@@ -790,4 +814,132 @@ def assess_thermodynamic_stability(
         "n_generated"          : n_generated,
         "status"               : status,
         "message"              : message,
+    }
+
+
+def build_phase_diagram_at_T(
+        sym_dir: str,
+        T: float,
+        candidates_root: str = config.CANDIDATES_ROOT,
+        database_root: str = config.DATABASE_ROOT,
+        temperatures: list[float] | None = None,
+        device: str = config.DEFAULT_DEVICE,
+        generate_missing: bool = False,
+) -> dict:
+    """Build the live pymatgen ``PhaseDiagram`` for *sym_dir* at temperature *T*.
+
+    Plotting counterpart to :func:`assess_thermodynamic_stability`: that
+    function reduces the hull down to JSON-safe scalars for every T in a
+    whole grid; this returns the actual pymatgen objects for one T, ready to
+    hand to a standard convex-hull plot (e.g. ``PDPlotter``) instead of
+    re-deriving them from cached numbers. Uses the identical discovery,
+    preparation, and free-energy machinery, so results match
+    ``assess_thermodynamic_stability`` exactly — this is not a second,
+    parallel implementation.
+
+    Because ``find_secondary_phases`` only excludes *sym_dir* itself (not
+    sibling symmetries of the same material — see ``_discover_from_local``),
+    calling this with any one polymorph of a multi-polymorph material pulls
+    in the rest of that material's polymorphs too, alongside the elemental/
+    binary competitors: one call is enough to see the whole family on one
+    diagram, not just the one target passed in.
+
+    Args:
+        sym_dir:          Target symmetry directory.
+        T:                Temperature (K) at which to build the diagram.
+        candidates_root:  Root of the candidates tree.
+        database_root:    Root of the simulation database.
+        temperatures:     Grid used to compute each phase's F(T) before
+                          interpolating to *T*. Defaults to
+                          ``config.HULL_TEMPERATURES`` — matching this to
+                          the pipeline's own grid means the entries built
+                          here are numerically identical to what's already
+                          cached in ``hull_vs_T.json`` for the same T.
+        device:           Compute device for MACE if calculations are needed.
+        generate_missing: Allow new PyXtal/MP-API phase discovery. Default
+                          False, unlike the batch pipeline — a plotting call
+                          shouldn't silently kick off new structure
+                          generation; run the pipeline first if you need
+                          more competing phases on the diagram.
+
+    Returns:
+        Dict with keys ``phase_diagram`` (pymatgen ``PhaseDiagram``),
+        ``target_entry`` (the target's own ``PDEntry``, already inside
+        ``phase_diagram``'s own entries too — kept separately only so the
+        caller can find/highlight it), ``entries`` (all competing-phase
+        ``PDEntry`` objects), ``target_phase`` (phase dict), ``T``.
+
+    Raises:
+        FileNotFoundError: Target POSCAR missing.
+        RuntimeError: No free energy available for the target, or no
+                      competing phase has a usable free energy at *T*
+                      (mirrors the ``available: False`` cases of
+                      ``assess_thermodynamic_stability``, but raises instead
+                      of returning a status dict — this is a plotting
+                      helper, not a pipeline gate).
+    """
+    from pymatgen.analysis.phase_diagram import PhaseDiagram, PDEntry
+
+    if temperatures is None:
+        temperatures = [float(t) for t in config.HULL_TEMPERATURES]
+
+    target_poscar = os.path.join(sym_dir, "POSCAR")
+    if not os.path.exists(target_poscar):
+        raise FileNotFoundError(f"Target POSCAR not found: {target_poscar}")
+    tgt_formula, tgt_comp = _formula_from_poscar(target_poscar)
+    target_elements = _elements_of_poscar(target_poscar)
+    target_phase = {
+        "sym_dir"    : sym_dir,
+        "poscar_path": target_poscar,
+        "formula"    : tgt_formula,
+        "composition": tgt_comp,
+        "elements"   : sorted(target_elements),
+        "source"     : "target",
+    }
+
+    _orig_sources = config.COMPETING_PHASE_SOURCES
+    if not generate_missing:
+        config.COMPETING_PHASE_SOURCES = [s for s in _orig_sources
+                                          if s not in ("mp-api", "pyxtal")]
+    try:
+        competing = find_secondary_phases(sym_dir, candidates_root, database_root)
+    finally:
+        config.COMPETING_PHASE_SOURCES = _orig_sources
+
+    usable = [ph for ph in competing if _ensure_phase_prepared(ph, device)]
+
+    free_energies: dict[str, dict] = {}
+    tgt_fe = _anharmonic_free_energy(sym_dir, temperatures, device)
+    if tgt_fe is None:
+        raise RuntimeError(f"Cannot compute free energy for target: {sym_dir}")
+    free_energies[sym_dir] = tgt_fe
+
+    for ph in usable:
+        aimd_d   = os.path.join(ph["sym_dir"], "aimd")
+        has_vdos = (
+            os.path.isdir(aimd_d) and any(
+                os.path.exists(os.path.join(aimd_d, tf, "anharmonic_phonons", "vdos.json"))
+                for tf in os.listdir(aimd_d) if tf.endswith("K")
+            )
+        )
+        fe = (_anharmonic_free_energy(ph["sym_dir"], temperatures, device)
+              if has_vdos
+              else _harmonic_free_energy(ph["sym_dir"], temperatures))
+        if fe is not None:
+            free_energies[ph["sym_dir"]] = fe
+
+    entries = _competing_entries_at_T(usable, free_energies, T)
+    if not entries:
+        raise RuntimeError(
+            f"No competing phase has a usable free energy at T={T:.0f} K "
+            f"for {sym_dir} — nothing to build a diagram from."
+        )
+    tgt_entry: PDEntry = _target_entry_at_T(target_phase, free_energies, T)
+
+    return {
+        "phase_diagram": PhaseDiagram(entries + [tgt_entry]),
+        "target_entry" : tgt_entry,
+        "entries"      : entries,
+        "target_phase" : target_phase,
+        "T"            : T,
     }

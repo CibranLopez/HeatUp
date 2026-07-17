@@ -47,7 +47,7 @@ if not hasattr(np, "trapz"):
 from heatup.pipeline    import run_stability_pipeline, run_stability_pipeline_batch
 from heatup.mechanical  import assess_mechanical_stability
 from heatup.vibrational import assess_vibrational_stability
-from heatup.thermodynamic import assess_thermodynamic_stability
+from heatup.thermodynamic import assess_thermodynamic_stability, build_phase_diagram_at_T
 from heatup.plotting    import plot_stability_report
 from heatup.phonons     import run_phonons, get_free_energy, run_vdos_for_sim
 from heatup.calculator  import build_calculator, release_calculator, calculator_label
@@ -64,6 +64,7 @@ __all__ = [
     "assess_mechanical_stability",
     "assess_vibrational_stability",
     "assess_thermodynamic_stability",
+    "build_phase_diagram_at_T",
     # Plotting
     "plot_stability_report",
     # Phonons (mode-agnostic)

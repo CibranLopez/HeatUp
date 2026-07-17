@@ -1,7 +1,7 @@
 {
   "manifest": {
     "heatup_version": "0.2.0",
-    "timestamp_utc": "2026-07-14T21:49:58.755147+00:00",
+    "timestamp_utc": "2026-07-17T08:09:40.696936+00:00",
     "step": "analysis",
     "output_path": "/home/claudio/cibran/Work/UPC/HeatUp/stability_results.json",
     "calculator": "mace-mp:mace-mpa-0-medium",
