@@ -112,3 +112,21 @@ def test_immiscible_agcu_sits_above_the_hull_and_decomposes(ag_au_cu, tmp_path):
     assert r["status"] == "warn" and 0.010 < r["e_hull_at_T_eV"] < 0.050   # EMT Ag-Cu mixing is endothermic
     assert set(r["decomposition"]) == {"Ag/Fm-3m", "Cu/Fm-3m"}
     assert sum(r["decomposition"].values()) == pytest.approx(1.0)
+
+
+def test_fc_order_3_adds_anharmonic_diagnostics_without_touching_gates(ag_au_cu):
+    root, _ = ag_au_cu
+    d = put(root, "Cu", "Fm-3m", bulk("Cu", "fcc", a=3.61, cubic=True))
+    cfg.phonon.fc_order = 3
+    cfg.fc3.supercell = (2, 2, 2)
+    cfg.fc3.kappa_mesh_length_A = 25.0
+    cfg.fc3.temperatures = [100.0, 300.0]
+    cfg.fc3.ratio_warn = 1e-6                                              # force the flag
+    r = run_pipeline(d, operating_T=300.0, device="cpu", gates=["mechanical", "vibrational"])
+    assert r["anharmonic"]["T_K"] == 300.0 and r["anharmonic"]["kappa_W_mK"] > 0
+    assert any("anharmonic" in f for f in r["flags"])
+    assert r["mechanical"]["status"] == "ok" and r["vibrational"]["status"] == "ok"   # verdicts unaffected
+    assert os.path.exists(os.path.join(d, "phonons", "fc3.json"))
+    cfg.phonon.fc_order = 2
+    r2 = run_pipeline(d, operating_T=300.0, device="cpu", gates=["mechanical", "vibrational"], compute=False)
+    assert r2["anharmonic"]["T_K"] == 300.0                               # cached fc3 stays in the report

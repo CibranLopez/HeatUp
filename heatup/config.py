@@ -121,6 +121,32 @@ class PhononCfg(_Frozen):
     symprec: float = 1e-4
     #: Imaginary modes shallower than this (meV, absolute) are treated as numerical noise
     imag_tol_meV: float = 0.5
+    #: 2 = harmonic only; 3 = also compute third-order force constants (phono3py, step ``fc3``): kappa(T)
+    #: and phonon linewidths for the target, see ``cfg.fc3``.  Needs ``pip install phono3py``.
+    fc_order: int = 2
+
+
+@dc.dataclass
+class FC3Cfg(_Frozen):
+    """Third-order force constants (phono3py) - used when ``phonon.fc_order == 3``."""
+    #: explicit (nx, ny, nz) of the fc3 supercell, or None -> from ``min_length_A``
+    supercell: tuple | None = None
+    min_length_A: float = 8.0
+    max_atoms: int = 400
+    #: displacement amplitude (phono3py default 0.03 A: larger than for fc2 to beat numerical noise)
+    delta_A: float = 0.03
+    #: ignore atom pairs farther apart than this (A) -> far fewer displaced cells; None = no cutoff
+    cutoff_pair_A: float | None = None
+    #: compute fc2 on the harmonic supercell (``cfg.phonon``) instead of the small fc3 supercell
+    separate_fc2: bool = True
+    #: q-mesh density for kappa: n_i = ceil(kappa_mesh_length_A / |a_i|)
+    kappa_mesh_length_A: float = 30.0
+    temperatures: list = dc.field(default_factory=lambda: [100.0, 200.0, 300.0, 400.0, 600.0, 800.0, 1000.0])
+    symprec: float = 1e-5
+    #: modes below this frequency (THz) are excluded from the gamma/nu statistics
+    min_freq_THz: float = 0.5
+    #: a flag is added to the report when <gamma/nu> at the operating T exceeds this
+    ratio_warn: float = 0.05
 
 
 @dc.dataclass
@@ -168,13 +194,13 @@ class MDCfg(_Frozen):
 
 
 GATES = ("mechanical", "structural_transition", "vibrational", "thermodynamic")
-STEPS = ("relax", "elastic", "phonons", "qha", "md", "analysis")
+STEPS = ("relax", "elastic", "phonons", "qha", "fc3", "md", "analysis")
 
 
 @dc.dataclass
 class RunCfg(_Frozen):
     """Execution control."""
-    #: Steps to recompute even if cached: any of ``"relax" "elastic" "phonons" "qha" "md" "analysis"``
+    #: Steps to recompute even if cached: any of ``"relax" "elastic" "phonons" "qha" "fc3" "md" "analysis"``
     #: (``analysis`` = VDOS + Gate-0 results derived from the MD) or ``"all"``.  Applies to the target
     #: *and* to the competing phases.  Downstream steps follow automatically: they are invalidated
     #: when the input they consume changes (manifest hashes).
@@ -297,6 +323,7 @@ class Config(_Frozen):
     relax: RelaxCfg = dc.field(default_factory=RelaxCfg)
     phonon: PhononCfg = dc.field(default_factory=PhononCfg)
     qha: QHACfg = dc.field(default_factory=QHACfg)
+    fc3: FC3Cfg = dc.field(default_factory=FC3Cfg)
     elastic: ElasticCfg = dc.field(default_factory=ElasticCfg)
     md: MDCfg = dc.field(default_factory=MDCfg)
     gates: GateCfg = dc.field(default_factory=GateCfg)

@@ -23,6 +23,7 @@ r = screen(sym_dir, stage="pre_md" | "post_md", options=ScreenOptions(...))
 | `gates` | `{name: GateResult(status, message)}` - `mechanical`, `hull_0K` (pre_md) / `mechanical`, `structural_transition`, `vibrational`, `thermodynamic` (post_md) |
 | `decomposition` | competing phases the target would decompose into (when above the hull) |
 | `complete` | every gate of the stage had its evidence |
+| `anharmonic` (post_md report only) | with `phonon.fc_order = 3`: kappa_RTA and phonon linewidth ratio gamma/nu at the operating T from the cached `fc3` step (`None` if absent); a diagnostic, never changes the verdict |
 | `flags`, `model`, `operating_T_K`, `report_file`, `result_file`, `phase` | diagnostics / provenance |
 
 ### Stages and verdict rules
@@ -58,7 +59,7 @@ and `config={"md.n_steps": 20000, "phonon.delta_A": 0.02}` for anything else (`s
 **Gates are independent and selected by config:** `gates=["mechanical", "thermodynamic"]` (or `cfg.gates.enabled`)
 runs only those; every enabled gate is evaluated whatever the others say, and a disabled one is reported as
 `skipped` and never influences the verdict. **Force rerun:** `force=True` (all steps), `force="md"` or
-`force=["relax", "elastic"]` (any of `relax elastic phonons qha md analysis`) recompute those steps even if their
+`force=["relax", "elastic"]` (any of `relax elastic phonons qha fc3 md analysis`) recompute those steps even if their
 manifest is fresh; default `None` follows `cfg.run.force` (empty = use the cache).
 They apply for the duration of the call and are restored afterwards - the caller's process-wide `cfg` is not
 modified. Calls hold a lock (the config is process-global); parallelise with processes, not threads.

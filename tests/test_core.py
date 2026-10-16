@@ -197,3 +197,34 @@ def test_layout_lists_steps_and_sizes(tmp_path):
     txt = layout(str(tmp_path), max_files=3)
     assert "relaxation/" in txt and "CONTCAR  (2.0 kB)" in txt and "more file(s)" in txt
     assert "does not exist" in layout(str(tmp_path / "nope"))
+
+
+def test_fc3_config_and_manifest_isolation(tmp_path):
+    from heatup import manifest
+    assert cfg.phonon.fc_order == 2 and cfg.fc3.delta_A == 0.03
+    f = tmp_path / "CONTCAR"; f.write_text("x")
+    manifest.write_manifest(str(tmp_path), "phonons", None, [str(f)])
+    manifest.write_manifest(str(tmp_path), "qha", None, [str(f)])
+    manifest.write_manifest(str(tmp_path), "fc3", None, [str(f)])
+    # qha / fc3 used to overwrite phonons/manifest.json and invalidate each other
+    assert all(manifest.is_fresh(str(tmp_path), s, None, [str(f)]) for s in ("phonons", "qha", "fc3"))
+    cfg.fc3.delta_A = 0.05
+    assert manifest.is_fresh(str(tmp_path), "phonons", None, [str(f)])        # fc3 option: harmonic cache untouched
+    assert not manifest.is_fresh(str(tmp_path), "fc3", None, [str(f)])
+
+
+def test_linewidth_statistics_and_summary():
+    import numpy as np
+    from heatup.fc3 import anharmonic_summary, linewidth_statistics
+    freq = np.array([[0.0, 4.0, 8.0], [2.0, 4.0, 8.0]])
+    gamma = np.array([[0.0, 0.4, 0.8], [0.2, 0.4, 0.8]])                 # gamma/nu = 0.1 everywhere (except the Gamma modes)
+    s = linewidth_statistics(freq, gamma, np.array([1.0, 3.0]), min_freq_THz=0.5)
+    assert s["gamma_over_nu_mean"] == pytest.approx(0.1) and s["frac_ioffe_regel"] == 0.0
+    assert s["tau_median_ps"] == pytest.approx(1 / (4 * np.pi * 0.4), rel=0.3)
+    gamma[1] = [1.5, 3.0, 5.0]                                             # second point: gamma/nu = 0.75 -> beyond Ioffe-Regel
+    s = linewidth_statistics(freq, gamma, np.array([1.0, 1.0]), 0.5)
+    assert s["frac_ioffe_regel"] > 0.4
+    res = {"temperatures_K": [100.0, 300.0], "kappa_W_mK": [30.0, 10.0], "gamma_over_nu_mean": [0.01, 0.08],
+           "frac_ioffe_regel": [0.0, 0.0], "tau_median_ps": [5.0, 1.0]}
+    assert anharmonic_summary(res, 120)["flag"] is None
+    assert "anharmonic" in anharmonic_summary(res, 290)["flag"] and anharmonic_summary(None, 300) is None

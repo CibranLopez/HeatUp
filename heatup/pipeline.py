@@ -66,7 +66,7 @@ def run_pipeline(phase_dir, operating_T: float | None = None, device: str | None
       only a missing relaxation makes every gate ``missing``.  Disabled gates are listed in
       ``report["skipped"]``.
     * ``force``: ``None`` -> ``cfg.run.force``; ``True`` (all steps), a step name or a list of step
-      names (``"relax" "elastic" "phonons" "qha" "md" "analysis"``) recompute those steps.
+      names (``"relax" "elastic" "phonons" "qha" "fc3" "md" "analysis"``) recompute those steps.
     * Steps are only run for the enabled gates (mechanical: elastic; structural_transition: md;
       vibrational: phonons + md; thermodynamic: its own competitor/phonon steps).
     """
@@ -94,7 +94,7 @@ def _run(phase_dir, operating_T, device, md_temperatures, compute, gates, save_f
                     "phase_dir": phase.path, "operating_T_K": T_op, "md_temperatures_K": temps,
                     "calculator": cfg.calc.model_for(phase.material), "config": cfg.snapshot(),
                     "structural_transition": None, "mechanical": None, "vibrational": None,
-                    "thermodynamic": None, "skipped": [g for g in GATES if g not in enabled],
+                    "thermodynamic": None, "anharmonic": None, "skipped": [g for g in GATES if g not in enabled],
                     "enabled": enabled, "flags": [], "overall": STATUS_MISSING}
     log.info("=== %s  (T = %g K, gates: %s) ===", phase.tag, T_op, ", ".join(enabled))
     if not enabled:
@@ -128,6 +128,9 @@ def _run(phase_dir, operating_T, device, md_temperatures, compute, gates, save_f
     needs_md = "structural_transition" in enabled or "vibrational" in enabled
     if "vibrational" in enabled:
         step("phonons")
+    if cfg.phonon.fc_order == 3 and ("vibrational" in enabled or "thermodynamic" in enabled):
+        if not step("fc3"):                                  # a diagnostic: its failure never blocks a gate
+            report["flags"].append("[note] fc3 step failed - no anharmonic diagnostics (see log)")
     if needs_md:
         for T in temps:
             step("md", temperature=T)
@@ -138,6 +141,10 @@ def _run(phase_dir, operating_T, device, md_temperatures, compute, gates, save_f
     if "thermodynamic" in enabled:
         gate("thermodynamic", assess_thermodynamic_stability, phase, operating_T=T_op, device=device,
              prepare=compute, mp_docs=mp_docs)
+    from heatup.fc3 import anharmonic_summary, load_fc3          # whatever fc3 result is cached is reported
+    report["anharmonic"] = anharmonic_summary(load_fc3(phase), T_op)
+    if report["anharmonic"] and report["anharmonic"]["flag"]:
+        report["flags"].append(report["anharmonic"]["flag"])
     return _finish(report, phase, save_figure, figure_fmt)
 
 
@@ -218,6 +225,7 @@ def database_status(root: str | None = None) -> list[dict]:
                     "elastic": os.path.exists(p.elastic_json),
                     "HA": os.path.exists(os.path.join(p.phonon_dir, "ha.json")),
                     "QHA": os.path.exists(os.path.join(p.phonon_dir, "qha.json")),
+                    "FC3": os.path.exists(os.path.join(p.phonon_dir, "fc3.json")),
                     "MD_T_K": p.md_temperatures(),
                     "reports": sorted(f[7:-5] for f in (os.listdir(p.stability_dir) if os.path.isdir(p.stability_dir) else [])
                                           if f.startswith("report_") and f.endswith(".json"))})

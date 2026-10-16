@@ -41,6 +41,7 @@ STEPS: dict[str, str] = {
     "relax":    "heatup.relax:run_relaxation",
     "phonons":  "heatup.phonons:run_ha",
     "qha":      "heatup.phonons:run_qha",
+    "fc3":      "heatup.fc3:run_fc3",
     "elastic":  "heatup.elastic:run_elastic",
     "md":       "heatup.md:run_md",
 }

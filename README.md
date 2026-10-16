@@ -47,6 +47,7 @@ cfg.hull.operating_T = 600
 cfg.gates.mobile_species = []                               # ["Li"] for a superionic conductor
 
 cfg.gates.enabled = ["mechanical", "vibrational", "thermodynamic"]     # gates are independent: pick any subset
+cfg.phonon.fc_order = 3                                    # optional: third-order constants (pip install phono3py) -> kappa(T), linewidths
 cfg.run.force = ["md"]                                      # recompute these steps (or "all"); [] = use the cache
 
 report = run_pipeline("database/BaTiO3/P4mm", md_temperatures=[600])   # one phase, the enabled gates
@@ -78,7 +79,7 @@ rows = generate_and_screen({"Ba": 1, "Ti": 1, "O": 3}, n=50, method="pyxtal", ou
 
 `config` `constants` `paths` `structure` `calculator` `manifest` `runtime` - infrastructure ·
 `relax` `elastic` `phonons` `md` `md_analysis` `vdos` `vibthermo` - computations ·
-`mechanical` `structural_transition` `vibrational` `thermodynamic` - gates ·
+`fc3` (anharmonic diagnostics) · `mechanical` `structural_transition` `vibrational` `thermodynamic` - gates ·
 `free_energy` `phases` `generation` - thermodynamic inputs ·
 `api` (stable entry point) `pipeline` `workflow` `plotting` - orchestration ·
 `builders` `report` `validation` - notebook helpers.

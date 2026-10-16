@@ -93,7 +93,7 @@ class ScreenOptions:
     mp_api_key: str | None = None
     # run control
     compute: bool = True                             # False: evaluate cached results only
-    force: bool | str | list[str] | None = None      # True/"all", or step names ("relax" "elastic" "phonons" "qha" "md" "analysis")
+    force: bool | str | list[str] | None = None      # True/"all", or step names ("relax" "elastic" "phonons" "qha" "fc3" "md" "analysis")
     save_figure: bool = False
     #: any other option as ``{"md.n_steps": 20000, "phonon.delta_A": 0.02}``
     config: dict[str, Any] | None = None

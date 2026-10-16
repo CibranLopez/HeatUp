@@ -13,6 +13,7 @@ dependencies = ["numpy", "scipy", "ase>=3.23", "phonopy>=2.20", "pymatgen", "spg
 [project.optional-dependencies]
 mace = ["mace-torch"]
 mp = ["mp-api"]
+fc3 = ["phono3py"]
 generate = ["pyxtal"]
 test = ["pytest"]
 notebooks = ["pandas", "jupyter", "ipykernel"]

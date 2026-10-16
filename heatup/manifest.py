@@ -27,6 +27,7 @@ STEP_KEYS: dict[str, dict[str, list[str]]] = {
     "relax":   {"sections": ["relax"],            "keys": ["calc.backend", "calc.dtype", "calc.dispersion"]},
     "phonons": {"sections": ["phonon"],           "keys": ["calc.backend", "calc.dtype", "calc.dispersion", "relax.pressure_GPa"]},
     "qha":     {"sections": ["phonon", "qha"],    "keys": ["calc.backend", "calc.dtype", "calc.dispersion", "relax.fmax"]},
+    "fc3":     {"sections": ["phonon", "fc3"],    "keys": ["calc.backend", "calc.dtype", "calc.dispersion"]},
     "elastic": {"sections": ["elastic"],          "keys": ["calc.backend", "calc.dtype", "calc.dispersion"]},
     "md":      {"sections": ["md"],               "keys": ["calc.backend", "calc.dtype", "calc.dispersion"]},
     "analysis": {"sections": [],                  "keys": ["md.equil_ps", "md.stride", "gates.block_ps",
@@ -58,8 +59,12 @@ def file_hash(path: str, nbytes: int = 1 << 24) -> str | None:
     return h.hexdigest()[:16]
 
 
-def _manifest_path(step_dir: str) -> str:
-    return os.path.join(step_dir, "manifest.json")
+#: steps that share a directory with ``phonons`` keep their own manifest, otherwise each would invalidate the others
+_OWN_MANIFEST = {"qha": "manifest_qha.json", "fc3": "manifest_fc3.json"}
+
+
+def _manifest_path(step_dir: str, step: str | None = None) -> str:
+    return os.path.join(step_dir, _OWN_MANIFEST.get(step or "", "manifest.json"))
 
 
 def write_manifest(step_dir: str, step: str, material: str | None = None,
@@ -73,13 +78,13 @@ def write_manifest(step_dir: str, step: str, material: str | None = None,
     }
     if extra:
         m["extra"] = extra
-    return write_json(_manifest_path(step_dir), m)
+    return write_json(_manifest_path(step_dir, step), m)
 
 
 def diff_manifest(step_dir: str, step: str, material: str | None = None,
                   inputs: Iterable[str] = ()) -> dict:
     """Return ``{key: (saved, current)}`` for everything that differs ({} = fresh)."""
-    saved = read_json(_manifest_path(step_dir))
+    saved = read_json(_manifest_path(step_dir, step))
     if saved is None:
         return {"_manifest": (None, "missing")}
     diffs: dict = {}

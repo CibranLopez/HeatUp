@@ -7,7 +7,7 @@ Canonical on-disk layout of one phase plus small I/O helpers.
     <root>/<material>/<label>/            = PhaseDir
         POSCAR                            input structure (never modified)
         relaxation/   CONTCAR energy.json manifest.json
-        phonons/      ha.json [qha.json] band.json phonon.png manifest.json
+        phonons/      ha.json [qha.json] [fc3.json] phonon.png manifest.json [manifest_qha.json manifest_fc3.json]
         elastic/      elastic.json manifest.json
         md/           POSCAR (supercell) cell.json
             <T>K/     output.traj md.json analysis.json vdos.json

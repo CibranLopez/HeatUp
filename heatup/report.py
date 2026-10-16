@@ -175,3 +175,26 @@ def layout(root: str, max_depth: int = 5, max_files: int = 8, hide: tuple = ("__
 
 def print_layout(root: str, **kw) -> None:
     print(layout(root, **kw))
+
+
+def plot_fc3(report: dict, axes=None):
+    """kappa_RTA(T) and <gamma/nu>(T) of the target (needs ``cfg.phonon.fc_order = 3``)."""
+    from heatup.fc3 import load_fc3
+    res = load_fc3(report["phase_dir"])
+    if not res:
+        raise ValueError("no fc3 result: set cfg.phonon.fc_order = 3 and run the 'fc3' step")
+    if axes is None:
+        _, axes = plt.subplots(1, 2, figsize=(8, 3.2))
+    T = res["temperatures_K"]
+    axes[0].plot(T, res["kappa_W_mK"], "o-")
+    axes[0].set_xlabel("T (K)"); axes[0].set_ylabel("kappa_RTA (W/m/K)"); axes[0].set_yscale("log")
+    ratio = [np.nan if r is None else r for r in res["gamma_over_nu_mean"]]
+    axes[1].plot(T, ratio, "o-", color="C3")
+    axes[1].axhline(cfg_ratio_warn(), color="0.5", ls="--", lw=0.8, label="warn")
+    axes[1].set_xlabel("T (K)"); axes[1].set_ylabel("<gamma / nu>"); axes[1].legend()
+    return axes
+
+
+def cfg_ratio_warn() -> float:
+    from heatup.config import cfg
+    return cfg.fc3.ratio_warn
