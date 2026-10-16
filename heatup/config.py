@@ -1,562 +1,402 @@
 """heatup.config
 =================
-Central configuration for all stability thresholds, file paths, physical
-constants, and calculator settings.
+Single, typed configuration object for the whole package.
 
-**All** tuneable parameters live here so that nothing is hardcoded deeper in
-the library.  Override any value *before* calling the pipeline functions::
+All tunable parameters live in nested dataclasses under the global ``cfg``
+object.  Nothing physical is hard-coded elsewhere::
 
-    import heatup.config as cfg
+    from heatup import cfg
 
-    cfg.THERMO_HULL_WARN_EV   = 0.05   # tighter metastability window
-    cfg.MD_ENSEMBLE           = "NVT"  # switch from NPT to NVT
-    cfg.CALC_BACKEND          = "chgnet"  # swap the interatomic potential
+    cfg.calc.model = "medium-mpa-0"
+    cfg.calc.model_overrides = {"BaTiO3": "BTO_MACE.model"}
+    cfg.md.n_steps = 40_000
+    cfg.gates.mobile_species = ["Li"]
 
-Calculator backends
--------------------
-HeatUp supports any ASE-compatible calculator through the ``CALC_BACKEND``
-string and the ``build_calculator`` factory in ``heatup.calculator``.
-Currently implemented backends:
+Why a dataclass tree and not module globals (v0.2)?
 
-    "mace-mp"   — MACE-MP universal potential (default, recommended)
-    "chgnet"    — CHGNet universal potential (needs ``chgnet`` package)
-    "m3gnet"    — M3GNet universal potential (needs ``matgl`` package)
-    "custom"    — Any ASE calculator returned by ``CUSTOM_CALC_FACTORY(device)``
+* it can be **serialised as one JSON blob** and forwarded to child processes
+  (``HEATUP_CONFIG``) - the old per-variable ``HEATUP_CFG_*`` scheme silently
+  dropped every variable that was not in a hand-maintained list;
+* it can be **snapshotted** (``cfg.snapshot()``) for manifests and restored
+  with ``config.override(...)``; no more mutate-and-restore hacks;
+* typos (``cfg.md.n_stpes = 1``) raise ``AttributeError`` instead of creating
+  a new, ignored attribute.
 
-To use a custom calculator, set::
-
-    cfg.CALC_BACKEND = "custom"
-    cfg.CUSTOM_CALC_FACTORY = lambda device: MyCalculator(...)
-
-MD ensembles
-------------
-Two ensembles are available.  Defaults reproduce the tested NPT setup.
-
-    "NPT"  — Nose-Hoover / Parrinello-Rahman barostat (Martyna 1994).
-              Cell shape and volume fluctuate; use for studying structural
-              transitions and thermal expansion.
-    "NVT"  — Nose-Hoover thermostat only, fixed cell.
-              Faster per step; suitable when the relaxed cell is trusted.
+Units: eV, Å, K, fs, GPa unless a field name says otherwise.
 """
 
 from __future__ import annotations
-import os as _os
-from typing import Any, Callable
+
+import contextlib
+import copy
+import dataclasses as dc
+import json
+import os
+from typing import Any, Callable, Iterator
 
 # ---------------------------------------------------------------------------
-# Paths (relative to the project working directory)
+# Status codes (used as dict values in every gate result)
 # ---------------------------------------------------------------------------
-
-#: Root of the simulation database.
-DATABASE_ROOT: str = "database"
-
-#: Root of the MP / generated candidate POSCAR tree.
-CANDIDATES_ROOT: str = "input/candidates"
-
-# ---------------------------------------------------------------------------
-# Compute defaults
-# ---------------------------------------------------------------------------
-
-#: Default MACE compute device ('cuda' or 'cpu').
-DEFAULT_DEVICE: str = "cuda"
-
-# ---------------------------------------------------------------------------
-# Status codes (do not change — used as dict keys throughout)
-# ---------------------------------------------------------------------------
-
-STATUS_OK      = "ok"
-STATUS_WARN    = "warn"
-STATUS_FAIL    = "fail"
+STATUS_OK = "ok"
+STATUS_WARN = "warn"
+STATUS_FAIL = "fail"
 STATUS_MISSING = "missing"
+STATUSES = (STATUS_OK, STATUS_WARN, STATUS_FAIL, STATUS_MISSING)
+
+ENV_VAR = "HEATUP_CONFIG"
+
+
+class _Frozen:
+    """Mixin: forbid creation of unknown attributes (catches typos)."""
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name not in {f.name for f in dc.fields(self)}:  # type: ignore[arg-type]
+            raise AttributeError(
+                f"{type(self).__name__} has no option {name!r}. "
+                f"Valid options: {[f.name for f in dc.fields(self)]}"  # type: ignore[arg-type]
+            )
+        object.__setattr__(self, name, value)
+
 
 # ---------------------------------------------------------------------------
-# Calculator backend
+# Sections
 # ---------------------------------------------------------------------------
 
-#: Which interatomic-potential backend to use.
-#: Supported: "mace-mp", "chgnet", "m3gnet", "custom".
-CALC_BACKEND: str = "mace-mp"
-
-#: Path or name of the MACE-MP model file.
-#: Used only when CALC_BACKEND == "mace-mp".
-#:
-#: Supported values:
-#:   "mace-mpa-0-medium"      — MACE-MP-0 medium (recommended, ~100 MB)
-#:   "mace-mpa-0-large"       — MACE-MP-0 large  (more accurate, ~300 MB)
-#:   "/abs/path/to/model.model" — custom fine-tuned MACE model
-#:
-#: Override via environment variable to avoid editing source:
-#:   export MACE_MODEL_PATH=mace-mpa-0-medium
-MACE_MODEL: str = _os.environ.get("MACE_MODEL_PATH", "mace-mpa-0-medium")
-
-#: Per-material MACE model overrides.  Maps material folder name → model path.
-#: The matching model is used instead of :data:`MACE_MODEL` for that material.
-#: Example::
-#:
-#:     cfg.MACE_MODEL      = 'mace-mpa-0-medium'   # default (competing phases)
-#:     cfg.MODEL_OVERRIDES = {'BaTiO3': 'BTO_MACE.model'}  # target material
-#:
-#: Not forwarded to subprocesses as a dict; the pipeline resolves the
-#: effective model per material before spawning each subprocess.
-MODEL_OVERRIDES: dict = {}
-
-#: Enable the D3 dispersion correction (MACE only; ignored by other backends).
-MACE_DISPERSION: bool = False
-
-#: Data type for MACE forward passes.
-#: 'float64' is more accurate; 'float32' is ~2× faster on GPU.
-MACE_DEFAULT_DTYPE: str = "float64"
-
-#: Factory callable ``(device: str) -> ASE Calculator`` used when
-#: CALC_BACKEND == "custom".  Replace with your own function::
-#:
-#:     import heatup.config as cfg
-#:     from my_package import MyCalc
-#:     cfg.CALC_BACKEND = "custom"
-#:     cfg.CUSTOM_CALC_FACTORY = lambda device: MyCalc(device=device)
-CUSTOM_CALC_FACTORY: Callable[[str], Any] | None = None
-
-# ---------------------------------------------------------------------------
-# MD ensemble & parameters
-# ---------------------------------------------------------------------------
-
-#: MD ensemble: "NPT" (Martyna-Tobias-Klein) or "NVT" (Nose-Hoover).
-#: NPT is recommended for discovering thermal-expansion-driven phase transitions.
-#: NVT is faster and sufficient when you trust the relaxed cell volume.
-MD_ENSEMBLE: str = "NPT"
-
-#: Integration timestep in femtoseconds.
-MD_TIMESTEP_FS: float = 1.0
-
-#: Total number of MD integration steps.
-MD_N_STEPS: int = 30_000
-
-#: Nose-Hoover thermostat time constant in femtoseconds.
-#: Controls how quickly the thermostat exchanges energy with the system.
-#: Larger → slower temperature coupling; 50 fs is appropriate for most solids.
-MD_TTIME_FS: float = 50.0
-
-#: Parrinello-Rahman barostat time constant in femtoseconds.
-#: Only used when MD_ENSEMBLE == "NPT".  10× the thermostat time constant
-#: (500 fs) is the standard recommendation.
-MD_PTIME_FS: float = 500.0
-
-#: Target hydrostatic pressure in GPa.  Zero means ambient (isobaric NPT).
-#: Only used when MD_ENSEMBLE == "NPT".
-MD_PRESSURE_GPA: float = 0.0
-
-#: Trajectory write interval in MD steps.
-#: One frame is saved every NBLOCK steps → effective frame spacing is
-#: ``MD_TIMESTEP_FS × MD_NBLOCK`` fs.
-MD_NBLOCK: int = 20
-
-#: Number of written frames to discard as equilibration before diffusion
-#: analysis and VDOS computation.
-#: With NBLOCK=20 and TIMESTEP=1 fs, 500 frames = 10 ps of equilibration.
-MD_STEP_EQUIV: int = 100
-
-#: Read stride when loading the saved trajectory for analysis.
-#: Set to 1 to use every written frame; increase to reduce memory usage.
-MD_STEP_SKIP: int = 1
-
-# ---------------------------------------------------------------------------
-# Geometry optimisation parameters
-# ---------------------------------------------------------------------------
-
-#: Maximum force component on any atom for BFGS convergence (eV/Å).
-RELAX_FMAX: float = 0.05
-
-#: Maximum number of BFGS steps before aborting.
-RELAX_MAX_STEPS: int = 500
-
-#: Relax the simulation cell shape and volume in addition to atomic positions.
-RELAX_CELL: bool = True
-
-#: When RELAX_CELL is True, keep the volume fixed and relax only the shape.
-RELAX_CONSTANT_VOLUME: bool = False
-
-# ---------------------------------------------------------------------------
-# Phonon parameters (harmonic, finite-displacement)
-# ---------------------------------------------------------------------------
-
-#: Phonon supercell repetitions along each lattice vector.
-PHONON_SUPERCELL: tuple[int, int, int] = (3, 3, 3)
-
-#: Finite-displacement magnitude for force-constant calculations (Å).
-PHONON_DELTA: float = 0.05
-
-#: Number of band-structure k-points along each high-symmetry segment.
-PHONON_NPOINTS: int = 100
-
-#: Monkhorst-Pack grid used for the phonon DOS integration.
-PHONON_DOS_KPTS: tuple[int, int, int] = (20, 20, 20)
-
-#: Number of energy grid points in the phonon DOS.
-PHONON_DOS_NPTS: int = 200
-
-#: Gaussian smearing width for the phonon DOS (eV).
-PHONON_DOS_WIDTH: float = 1e-3
-
-# ---------------------------------------------------------------------------
-# AIMD supercell parameters
-# ---------------------------------------------------------------------------
-
-#: Minimum lattice parameter length in Å for the AIMD supercell.
-#: Repetitions along each axis are the smallest integer that brings every
-#: parameter to at least this value.  25 Å is the recommended minimum for
-#: capturing the relevant phonon wavelengths and avoiding self-interaction
-#: of the mobile ion across periodic images.
-AIMD_MIN_CELL_ANG: float = 25.0
-
-# ---------------------------------------------------------------------------
-# Elastic tensor parameters
-# ---------------------------------------------------------------------------
-
-#: Strain magnitude for the central-difference stress–strain calculation.
-#: 1e-4 is small enough to be in the linear regime for most materials.
-ELASTIC_DELTA: float = 1e-4
-
-# ---------------------------------------------------------------------------
-# Gate 0 — Structural-transition detection (DACF)
-# ---------------------------------------------------------------------------
-
-#: Fraction of the DACF lag range used to estimate the long-time plateau C_∞.
-#: The mean of C(τ) over the last ``DACF_LONG_TIME_FRAC`` of the computed lag
-#: range (0 … T//2) is taken as C_∞.  A value of 0.20 means the last 20 %.
-DACF_LONG_TIME_FRAC: float = 0.20
-
-#: Long-time displacement autocorrelation C_∞ (Å²) above which a structural
-#: phase transition is declared.
-#:
-#: For a thermally vibrating solid, atoms oscillate around their initial
-#: positions so the DACF decays to zero: C_∞ ≈ 0.  After a structural
-#: transition, atoms settle at new equilibrium sites: C_∞ ≈ ⟨|Δr|²⟩, the
-#: mean-square displacement from the starting structure, which is typically
-#: ≫ 0.1 Å².
-DACF_THRESHOLD_ANG2: float = 0.10   # Å²
-
-# ---------------------------------------------------------------------------
-# Gate 1 — Mechanical stability thresholds
-# ---------------------------------------------------------------------------
-
-#: All eigenvalues of the 6×6 Voigt stiffness tensor C must exceed this
-#: value (GPa) for the Born–Huang criterion to be satisfied.
-MECH_BORN_EIGENVALUE_FAIL_GPa: float = 0.0
-
-#: Bulk modulus (GPa) below which a WARNING is issued.
-MECH_BULK_WARN_GPa: float = 10.0
-
-#: Bulk modulus (GPa) below which the material FAILS the mechanical gate.
-MECH_BULK_FAIL_GPa: float = 0.0
-
-#: Shear modulus (GPa) below which a WARNING is issued.
-MECH_SHEAR_WARN_GPa: float = 5.0
-
-# ---------------------------------------------------------------------------
-# Gate 2 — Vibrational stability thresholds (anharmonic VDOS from AIMD)
-# ---------------------------------------------------------------------------
-
-#: Half-width of the soft-mode inspection window around ω = 0 (meV).
-#: VDOS weight within |ω| < VIB_ZERO_WINDOW_MEV flags potential instability.
-VIB_ZERO_WINDOW_MEV: float = 1.0
-
-#: Fraction of integrated normalised VDOS within the zero window that
-#: triggers a WARNING.  Pure acoustic broadening at Γ is typically < 1 %.
-VIB_ZERO_FRAC_WARN: float = 0.02   # 2 %
-
-#: Fraction above which the material FAILS the vibrational gate.
-VIB_ZERO_FRAC_FAIL: float = 0.08   # 8 %
-
-#: Minimum number of production trajectory frames for a reliable VDOS.
-VIB_MIN_FRAMES: int = 500
-
-# ---------------------------------------------------------------------------
-# Gate 3 — Thermodynamic stability thresholds
-# ---------------------------------------------------------------------------
-
-#: E_above_hull (eV/atom) ≤ this value → material is ON the hull (stable).
-THERMO_HULL_STABLE_EV: float = 0.0
-
-#: E_above_hull (eV/atom) ≤ this → metastable WARNING.
-THERMO_HULL_WARN_EV: float = 0.10
-
-#: Fractional spread of F(T) across multiple AIMD temperatures that triggers
-#: a free-energy consistency WARNING.
-THERMO_FE_CONSISTENCY_THRESHOLD: float = 0.05
-
-#: Temperature grid (K) for convex-hull construction.
-HULL_TEMPERATURES: list[int] = list(range(0, 1501, 50))
-
-#: External pressure for PV term (GPa).  Zero = ambient.
-HULL_PRESSURE_GPa: float = 0.0
-
-#: AIMD temperature triggered when no MD simulation exists.
-AIMD_TRIGGER_TEMPERATURE_K: float = 900.0
-
-# ---------------------------------------------------------------------------
-# Competing-phase discovery: Materials Project API
-# ---------------------------------------------------------------------------
-
-#: Materials Project API key.  Set via environment variable MP_API_KEY or
-#: override here.  Required when COMPETING_PHASE_SOURCE includes "mp-api".
-MP_API_KEY: str = _os.environ.get("MP_API_KEY", "")
-
-#: Source(s) for competing-phase structures, in priority order.
-#: Options:
-#:   "mp-api"      — Download from Materials Project (requires MP_API_KEY)
-#:   "database"    — Scan the local simulation database
-#:   "candidates"  — Scan the local candidates tree
-#:   "pyxtal"      — Generate random structures with PyXtal (systematic fallback)
-#:
-#: The list is checked left to right; all sources are combined.
-#: "pyxtal" as the last entry provides systematic coverage of unexplored
-#: stoichiometries but is slow.  Remove it to skip random generation.
-COMPETING_PHASE_SOURCES: list[str] = ["mp-api", "database", "candidates", "pyxtal"]
-
-#: Maximum number of competing phases to fetch per sub-composition from MP.
-#: Higher values → more thorough hull but longer preparation time.
-MP_MAX_PHASES_PER_COMPOSITION: int = 10
-
-#: Maximum atoms per unit cell for PyXtal random structure generation.
-PYXTAL_MAX_ATOMS: int = 40
-
-#: Number of random generation attempts per (formula, space-group) pair.
-PYXTAL_MAX_ATTEMPTS: int = 3
-
-# ---------------------------------------------------------------------------
-# Physical constants
-# ---------------------------------------------------------------------------
-
-#: Boltzmann constant in eV/K.
-KB_EV: float = 8.617333262e-5
-
-#: Boltzmann constant in meV/K.
-KB_MEV: float = 8.617333262145e-2
-
-#: Conversion factor: meV → eV.
-MEV_TO_EV: float = 1e-3
-
-#: Planck constant conversion for VDOS frequency axis:
-#: fftfreq (cycles/fs) × 1e3 × H_FS_MEV → meV.
-H_FS_MEV: float = 4.135667696
-
-#: Minimum physical frequency (meV) below which VDOS modes are treated as
-#: acoustic/numerical noise and excluded from thermodynamic integrals.
-OMEGA_MIN_MEV: float = 0.1
-
-# ---------------------------------------------------------------------------
-# Phonon mode — controls how the vibrational free energy F_vib(T) is computed
-# ---------------------------------------------------------------------------
-#
-# Three methods are available, in increasing accuracy and cost:
-#
-#   "HA"   — Harmonic Approximation.
-#            Phonon DOS computed via finite displacements at the relaxed
-#            volume V₀.  Fast.  Accurate at low T.  Misses thermal expansion
-#            and anharmonic mode softening.  Valid for Gate 1/2 and for
-#            competing-phase free energies.
-#
-#   "QHA"  — Quasi-Harmonic Approximation.
-#            Phonon DOS computed at QHA_N_VOLUMES volumes around V₀.
-#            Fits E(V) + F_vib(V, T) to extract the Grüneisen parameter,
-#            thermal expansion α(T), and F(T, P) at the equilibrium volume.
-#            Captures volume-driven anharmonicity.  Requires QHA_N_VOLUMES
-#            phonon calculations → scales as HA × QHA_N_VOLUMES.
-#            Produces ``phonons/qha/`` output sub-directory.
-#
-#   "VDOS" — Anharmonic VDOS from AIMD trajectory via VACF.
-#            Full anharmonicity at the simulated temperature.  Most expensive
-#            (requires an MD run) but most physically complete.  Used for
-#            the *target* material's free energy in the hull by default.
-#
-# The mode set here is used:
-#   • In the analysis notebook (02_analysis.ipynb) for the target material.
-#   • In `heatup.free_energy.build_default_assembler`.
-#   • In `heatup.thermodynamic.assess_thermodynamic_stability` for the target.
-#
-# Competing phases always use HA (fast) unless they already have VDOS cached.
-PHONON_MODE: str = "VDOS"   # "HA" | "QHA" | "VDOS"
-
-# ---------------------------------------------------------------------------
-# Force-constant order (HA and QHA only; ignored for VDOS)
-# ---------------------------------------------------------------------------
-#
-# Controls the order of the interatomic force constant (IFC) expansion:
-#
-#   2 — Second-order IFCs (standard harmonic).  Implemented via the ASE
-#       Phonons class (PHONON_BACKEND = "ase") or phonopy (PHONON_BACKEND =
-#       "phonopy").  Fast; sufficient for HA and QHA.
-#
-#   3 — Third-order IFCs (phonon–phonon interactions).  Requires phono3py.
-#       Gives anharmonic phonon linewidths and lattice thermal conductivity.
-#       Currently only meaningful for "HA" mode (QHA with 3rd-order is not
-#       standard practice).  Very slow (O(N_disp) ≫ 2nd order).
-#
-# Note: PHONON_MODE = "VDOS" does not use IFCs at all (velocities are from MD).
-FORCE_CONSTANT_ORDER: int = 2   # 2 | 3
-
-# ---------------------------------------------------------------------------
-# Phonon calculation backend (HA and QHA only)
-# ---------------------------------------------------------------------------
-#
-# "ase"     — Use ASE's built-in Phonons class.  No extra dependencies.
-#             Supports FORCE_CONSTANT_ORDER = 2 only.
-#             Stores force cache as JSON files alongside the POSCAR.
-#
-# "phonopy" — Use phonopy (must be installed: pip install phonopy).
-#             Supports FORCE_CONSTANT_ORDER = 2.
-#             Required for QHA (via phono3py or phonopy's built-in QHA).
-#             Produces a standard phonopy_disp.yaml dataset for interoperability.
-#
-PHONON_BACKEND: str = "ase"   # "ase" | "phonopy"
-
-# ---------------------------------------------------------------------------
-# QHA-specific parameters
-# ---------------------------------------------------------------------------
-
-#: Number of volume points to sample for the E(V) + F_vib(V,T) fit.
-#: Must be odd (symmetric around V₀) and ≥ 3.  Recommended range: 5–11.
-#: More points → better Grüneisen / α(T) fit but N times more phonon jobs.
-QHA_N_VOLUMES: int = 7
-
-#: Fractional volume range around V₀ for QHA sampling.
-#: Volumes span V₀ × (1 − QHA_VOLUME_RANGE) … V₀ × (1 + QHA_VOLUME_RANGE).
-#: 0.06 covers ±6 % — appropriate for most ionic / covalent solids at 0–1500 K.
-QHA_VOLUME_RANGE: float = 0.06
-
-#: Equation of state model used to fit E(V) in the QHA.
-#: Supported by phonopy: "vinet", "birch_murnaghan", "murnaghan".
-QHA_EOS: str = "vinet"
-
-# ---------------------------------------------------------------------------
-# Run manifest — traceability
-# ---------------------------------------------------------------------------
-#
-# Every output file written by HeatUp is accompanied by a ``manifest.json``
-# that records the exact configuration used to produce it.  This ensures
-# full reproducibility and makes it easy to compare results from different
-# runs (e.g. HA vs QHA, NPT vs NVT).
-#
-# The manifest is written automatically by heatup.manifest.write_manifest().
-# Set WRITE_MANIFEST = False to disable (not recommended).
-WRITE_MANIFEST: bool = True
+#: names that circulate in notebooks / other repos -> the valid ``mace_mp`` name
+MODEL_ALIASES = {"mace-mpa-0-medium": "medium-mpa-0", "mace_mpa_0_medium": "medium-mpa-0"}
+
+
+@dc.dataclass
+class CalcCfg(_Frozen):
+    """Interatomic-potential backend."""
+    #: "mace-mp" | "chgnet" | "m3gnet" | "emt" (tests only) | "custom"
+    backend: str = "mace-mp"
+    #: ``mace_mp`` model name (``"medium-mpa-0"``, ``"large"``, ...) or a path
+    #: to a ``.model`` file.  NB: ``"mace-mpa-0-medium"`` (the v0.2 default)
+    #: is *not* a valid mace_mp name.
+    model: str = os.environ.get("MACE_MODEL_PATH", "medium-mpa-0")      # THE owner of the default model name
+    #: material folder name -> model path (fine-tuned potentials)
+    model_overrides: dict = dc.field(default_factory=dict)
+    dispersion: bool = False
+    dtype: str = "float64"
+    #: "auto" -> cuda if usable else cpu
+    device: str = "auto"
+
+    def model_for(self, material: str | None) -> str:
+        """Model for *material*: per-material override > ``model``; legacy aliases are normalised
+        (``mace-mpa-0-medium`` -> ``medium-mpa-0``) so every caller ends up with one valid name."""
+        m = self.model_overrides[material] if (material and material in self.model_overrides) else self.model
+        return MODEL_ALIASES.get(m, m)
+
+
+@dc.dataclass
+class RelaxCfg(_Frozen):
+    #: Tight on purpose: phonons / elastic constants are meaningless on a
+    #: loosely relaxed cell (v0.2 used 0.05 eV/Å -> spurious imaginary modes).
+    fmax: float = 0.005
+    max_steps: int = 1000
+    relax_cell: bool = True
+    constant_volume: bool = False
+    #: Keep the input space group during relaxation (assess *this* phase, do
+    #: not let it silently roll downhill into another one).
+    fix_symmetry: bool = True
+    symprec: float = 1e-3
+    #: Hydrostatic pressure of the whole assessment (hull is then an enthalpy hull).
+    pressure_GPa: float = 0.0
+
+
+@dc.dataclass
+class PhononCfg(_Frozen):
+    """Harmonic phonons (finite displacements, phonopy)."""
+    #: explicit (nx, ny, nz) or None -> automatic from ``min_length_A``
+    supercell: tuple | None = None
+    min_length_A: float = 12.0
+    max_atoms: int = 800
+    delta_A: float = 0.01
+    #: q-mesh density: n_i = ceil(mesh_length_A / |a_i|)  (phonopy convention)
+    mesh_length_A: float = 80.0
+    #: Gaussian smearing used only for *plotting* the DOS (meV)
+    dos_sigma_meV: float = 0.5
+    band_npoints: int = 61
+    symprec: float = 1e-4
+    #: Imaginary modes shallower than this (meV, absolute) are treated as numerical noise
+    imag_tol_meV: float = 0.5
+
+
+@dc.dataclass
+class QHACfg(_Frozen):
+    n_volumes: int = 7          # odd, >= 5 recommended
+    volume_range: float = 0.06  # +/- fraction of V0
+    #: polynomial order of the F(V) fit at each temperature
+    poly_order: int = 4
+    relax_internal: bool = True # relax ions at every fixed volume (required for QHA)
+
+
+@dc.dataclass
+class ElasticCfg(_Frozen):
+    strain: float = 0.004
+    #: Relax internal coordinates at every strained cell (relaxed-ion
+    #: constants).  v0.2 used clamped ions, which over-stiffens every crystal
+    #: with internal degrees of freedom (all ferroelectrics, wurtzite, ...).
+    relax_ions: bool = True
+    fmax: float = 0.002
+
+
+@dc.dataclass
+class MDCfg(_Frozen):
+    ensemble: str = "NPT"            # "NPT" | "NVT"
+    timestep_fs: float = 1.0
+    n_steps: int = 30_000
+    #: Write a frame every ``nblock`` steps.  The VDOS Nyquist limit is
+    #: ``h / (2 nblock dt)``: 5 fs -> 413 meV.  (v0.2: 20 fs -> 103 meV, which
+    #: aliases every O/H/Li-containing material.)
+    nblock: int = 5
+    #: Equilibration discarded before analysis (ps)
+    equil_ps: float = 3.0
+    ttime_fs: float = 50.0
+    ptime_fs: float = 100.0
+    pressure_GPa: float = 0.0
+    #: Bulk modulus used to build the barostat mass ``pfactor = ptime^2 B``.
+    #: Overridden by the elastic result when available.
+    default_bulk_modulus_GPa: float = 100.0
+    #: Minimum supercell edge for MD (Å)
+    min_cell_A: float = 15.0
+    max_atoms: int = 1500
+    seed: int = 12345
+    #: Read stride when analysing trajectories
+    stride: int = 1
+
+
+GATES = ("mechanical", "structural_transition", "vibrational", "thermodynamic")
+STEPS = ("relax", "elastic", "phonons", "qha", "md", "analysis")
+
+
+@dc.dataclass
+class RunCfg(_Frozen):
+    """Execution control."""
+    #: Steps to recompute even if cached: any of ``"relax" "elastic" "phonons" "qha" "md" "analysis"``
+    #: (``analysis`` = VDOS + Gate-0 results derived from the MD) or ``"all"``.  Applies to the target
+    #: *and* to the competing phases.  Downstream steps follow automatically: they are invalidated
+    #: when the input they consume changes (manifest hashes).
+    force: list = dc.field(default_factory=list)
+
+    def is_forced(self, step: str) -> bool:
+        return "all" in self.force or step in self.force
+
+
+def normalize_force(force) -> list:
+    """``True`` -> ``["all"]``, ``False``/None -> ``[]``, a step name or list stays a list."""
+    if force is True:
+        return ["all"]
+    if not force:
+        return []
+    return [force] if isinstance(force, str) else list(force)
+
+
+def forced(step: str, explicit: bool | None = None) -> bool:
+    """Effective force flag of *step*: an explicit argument wins, else ``cfg.run.force``."""
+    return bool(explicit) if explicit is not None else cfg.run.is_forced(step)
+
+
+@dc.dataclass
+class GateCfg(_Frozen):
+    #: Gates that are evaluated.  They are independent: a failing gate never prevents another
+    #: enabled gate from running (only a missing relaxation makes every gate "missing").
+    enabled: list = dc.field(default_factory=lambda: list(GATES))
+    # Gate 0 - structural transition (block-averaged structure comparison)
+    block_ps: float = 2.0             # length of first/last averaging window
+    transition_rms_A: float = 0.30    # rms displacement of block-mean positions
+    transition_max_A: float = 0.80    # largest single-atom displacement
+    cell_shape_strain: float = 0.04   # max |eps_ij| of deviatoric strain (first -> last block)
+    cell_volume_change: float = 0.10  # |dV/V|
+    symmetry_break_A: float = 0.06    # rms symmetry-breaking of block-mean structure -> warn
+    #: Species allowed to diffuse (superionic conductors).  Excluded from the
+    #: displacement test and from the soft-mode test.
+    mobile_species: list = dc.field(default_factory=list)
+    # Gate 1 - mechanical
+    born_min_eigenvalue_GPa: float = 0.0
+    bulk_warn_GPa: float = 10.0
+    bulk_fail_GPa: float = 0.0
+    shear_warn_GPa: float = 5.0
+    # Gate 2 - vibrational
+    zero_window_meV: float = 2.0
+    zero_frac_warn: float = 0.01
+    zero_frac_fail: float = 0.05
+    min_production_ps: float = 10.0
+    #: HA: fraction of mode weight that is imaginary (> imag_tol) -> warn / fail
+    imag_frac_warn: float = 0.002
+    imag_frac_fail: float = 0.02
+    # Gate 3 - thermodynamic
+    hull_ok_eV: float = 0.010
+    hull_fail_eV: float = 0.100
+    #: Spread of F_vib(T) between MD temperatures that triggers a warning
+    fe_consistency: float = 0.05
+
+
+@dc.dataclass
+class HullCfg(_Frozen):
+    #: temperature at which Gate 3 is judged (K); must lie inside ``temperatures``
+    operating_T: float = 300.0
+    temperatures: list = dc.field(default_factory=lambda: list(range(0, 1501, 50)))
+    #: ``"HA"`` for *every* phase (consistent, default) | ``"QHA"`` | ``"VDOS"``
+    #: (VDOS only where MD exists; the hull then mixes methods -> flagged).
+    phonon_method: str = "HA"
+    #: Extra anharmonic overlay computed for the target only (reported next to the consistent hull).
+    target_overlay: str = "VDOS"
+    include_electronic: bool = True
+    include_magnetic: bool = True
+    include_configurational: bool = True
+    #: Competitors whose 0 K energy lies more than this above the 0 K hull
+    #: (eV/atom) are dropped before any phonon calculation.
+    prune_window_eV: float = 0.15
+    #: O2/N2/F2... gas-phase corrections are NOT applied; see docs/AUDIT.md.
+    reference_energy_shift: dict = dc.field(default_factory=dict)
+
+
+@dc.dataclass
+class PhasesCfg(_Frozen):
+    #: any of "database", "candidates", "competing", "mp-api", "generate"
+    sources: list = dc.field(default_factory=lambda: ["database", "candidates", "competing", "mp-api"])
+    mp_api_key: str = os.environ.get("MP_API_KEY", "")
+    mp_max_e_above_hull: float = 0.15     # query window on MP's own hull
+    mp_max_per_chemsys: int = 25
+    #: your calculations of *targets* (read/write)
+    database_root: str = "database"
+    #: your own input structures (READ-ONLY: HeatUp never writes here; targets generated by
+    #: ``heatup.generation`` go here only when you ask for it)
+    candidates_root: str = "input/candidates"
+    #: everything HeatUp itself fetches, generates or mirrors for use as *competing phases*
+    #: (Materials Project downloads, generated structures, copies of ``candidates``), together
+    #: with their relaxation / phonon results.  Safe to share between projects and to delete.
+    competing_root: str = "competing_phases"
+
+
+@dc.dataclass
+class GenerationCfg(_Frozen):
+    #: "pyxtal" | "matgen" (MatterGen CLI) | "custom"
+    method: str = "pyxtal"
+    n_per_composition: int = 20
+    max_atoms: int = 24
+    space_groups: list | None = None      # None -> all
+    #: StructureMatcher tolerances for de-duplication
+    ltol: float = 0.2
+    stol: float = 0.3
+    angle_tol: float = 5.0
+    #: MatterGen
+    matgen_model: str = "mattergen_base"
+    matgen_command: str = "mattergen-generate"
+    matgen_extra_args: list = dc.field(default_factory=list)
+    #: pre-screen: keep candidates whose 0 K E_hull (MLIP) is below this
+    prescreen_e_hull_eV: float = 0.10
+    seed: int = 0
+
+
+@dc.dataclass
+class Config(_Frozen):
+    calc: CalcCfg = dc.field(default_factory=CalcCfg)
+    relax: RelaxCfg = dc.field(default_factory=RelaxCfg)
+    phonon: PhononCfg = dc.field(default_factory=PhononCfg)
+    qha: QHACfg = dc.field(default_factory=QHACfg)
+    elastic: ElasticCfg = dc.field(default_factory=ElasticCfg)
+    md: MDCfg = dc.field(default_factory=MDCfg)
+    gates: GateCfg = dc.field(default_factory=GateCfg)
+    run: RunCfg = dc.field(default_factory=RunCfg)
+    hull: HullCfg = dc.field(default_factory=HullCfg)
+    phases: PhasesCfg = dc.field(default_factory=PhasesCfg)
+    generation: GenerationCfg = dc.field(default_factory=GenerationCfg)
+    #: Factory ``device -> ASE calculator`` for backend="custom" (not serialised).
+    custom_calc_factory: Callable | None = None
+
+    # -- serialisation -----------------------------------------------------
+    def to_dict(self) -> dict:
+        d = {}
+        for f in dc.fields(self):
+            v = getattr(self, f.name)
+            if f.name == "custom_calc_factory":
+                continue
+            d[f.name] = dc.asdict(v)
+        return d
+
+    def snapshot(self) -> dict:
+        return json.loads(json.dumps(self.to_dict(), default=_json_default))
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), default=_json_default)
+
+    def update_from_dict(self, d: dict) -> None:
+        for sec, vals in d.items():
+            if not hasattr(self, sec):
+                raise KeyError(f"unknown config section {sec!r}")
+            section = getattr(self, sec)
+            for k, v in vals.items():
+                cur = getattr(section, k)
+                if isinstance(cur, tuple) and isinstance(v, list):
+                    v = tuple(v)
+                setattr(section, k, v)
+
+    def get(self, dotted: str) -> Any:
+        sec, key = dotted.split(".", 1)
+        return getattr(getattr(self, sec), key)
+
+
+def _json_default(o: Any) -> Any:
+    if isinstance(o, tuple):
+        return list(o)
+    raise TypeError(f"not JSON serialisable: {type(o)}")
+
+
+#: the global configuration
+cfg = Config()
 
 
 # ---------------------------------------------------------------------------
-# Subprocess config propagation
+# Forwarding to child processes
 # ---------------------------------------------------------------------------
-# When the pipeline spawns child processes (for GPU memory isolation), all
-# in-memory config overrides must be forwarded via environment variables,
-# because the child process re-imports config.py with its default values.
-#
-# Usage (inside _cuda_env() of each pipeline module):
-#   env.update(config_to_env())
-#
-# Usage (at the top of each __main__ entry point):
-#   import heatup.config as _cfg; _cfg.config_from_env()
 
-#: Prefix used for every config env-var forwarded to child processes.
-_ENV_PREFIX = "HEATUP_CFG_"
+def to_env(material: str | None = None) -> dict[str, str]:
+    """Env-var dict that reproduces the live config in a child process.
 
-#: Names of module-level config variables that are forwarded to subprocesses.
-#: Extend this list if you add new parameters that subprocesses need.
-_FORWARDED_VARS: list[str] = [
-    # Calculator
-    "CALC_BACKEND", "MACE_MODEL", "MACE_DISPERSION", "MACE_DEFAULT_DTYPE",
-    # MD
-    "MD_ENSEMBLE", "MD_TIMESTEP_FS", "MD_N_STEPS", "MD_NBLOCK",
-    "MD_STEP_EQUIV", "MD_STEP_SKIP", "MD_TTIME_FS", "MD_PTIME_FS",
-    "MD_PRESSURE_GPA",
-    # Relaxation
-    "RELAX_FMAX", "RELAX_MAX_STEPS", "RELAX_CELL", "RELAX_CONSTANT_VOLUME",
-    # Phonons
-    "PHONON_MODE", "PHONON_BACKEND", "FORCE_CONSTANT_ORDER",
-    "PHONON_SUPERCELL", "PHONON_DELTA", "PHONON_NPOINTS",
-    "PHONON_DOS_NPTS", "PHONON_DOS_WIDTH",
-    # QHA
-    "QHA_N_VOLUMES", "QHA_VOLUME_RANGE", "QHA_EOS",
-    # AIMD / elastic
-    "AIMD_MIN_CELL_ANG", "ELASTIC_DELTA",
-    # Paths
-    "DATABASE_ROOT", "CANDIDATES_ROOT", "DEFAULT_DEVICE",
-    # Manifests
-    "WRITE_MANIFEST",
-]
-
-
-def config_to_env() -> dict[str, str]:
-    """Serialise live config values to a flat dict of ``HEATUP_CFG_*`` env vars.
-
-    Called by the subprocess helpers in :mod:`heatup.structure_pipeline` and
-    :mod:`heatup.md_pipeline` to propagate any in-process overrides (e.g. set
-    via ``cfg.CALC_BACKEND = 'chgnet'`` in a notebook) to the child process.
-
-    Returns:
-        Dict mapping ``HEATUP_CFG_<NAME>`` → str(value) for every variable
-        listed in :data:`_FORWARDED_VARS`.
+    The per-material MACE model is resolved *here* (``calc.model`` is replaced,
+    ``model_overrides`` emptied) so the child never needs to know the material.
     """
-    import sys as _sys
-    this_module = _sys.modules[__name__]
-    env: dict[str, str] = {}
-    for name in _FORWARDED_VARS:
-        val = getattr(this_module, name, None)
-        if val is not None:
-            env[_ENV_PREFIX + name] = str(val)
-    return env
+    d = cfg.snapshot()
+    d["calc"]["model"] = cfg.calc.model_for(material)
+    d["calc"]["model_overrides"] = {}
+    return {ENV_VAR: json.dumps(d)}
 
 
-def config_from_env() -> None:
-    """Apply ``HEATUP_CFG_*`` environment variables to the live config module.
-
-    Called at the start of each subprocess ``__main__`` entry point so that
-    parent-process overrides are honoured inside the child.
-
-    Type coercion is performed using the type of the current default value so
-    that, e.g., ``HEATUP_CFG_MD_N_STEPS=5000`` sets an ``int``, not a string.
-    Tuple values (e.g. ``PHONON_SUPERCELL``) are parsed from their ``str()``
-    representation (e.g. ``"(3, 3, 3)"``).
-    """
-    import sys as _sys
-    import ast as _ast
-    this_module = _sys.modules[__name__]
-    for name in _FORWARDED_VARS:
-        env_key = _ENV_PREFIX + name
-        raw = _os.environ.get(env_key)
-        if raw is None:
-            continue
-        current = getattr(this_module, name, None)
-        try:
-            if isinstance(current, bool):
-                coerced = raw.lower() in ("1", "true", "yes")
-            elif isinstance(current, int):
-                coerced = int(raw)
-            elif isinstance(current, float):
-                coerced = float(raw)
-            elif isinstance(current, tuple):
-                coerced = tuple(_ast.literal_eval(raw))
-            elif isinstance(current, list):
-                coerced = list(_ast.literal_eval(raw))
-            else:
-                coerced = raw  # str — use as-is
-            setattr(this_module, name, coerced)
-        except Exception:
-            # If parsing fails, keep the default rather than crashing.
-            pass
+def load_from_env() -> bool:
+    """Apply ``HEATUP_CONFIG`` (if present) to the live config. Returns True if applied."""
+    raw = os.environ.get(ENV_VAR)
+    if not raw:
+        return False
+    cfg.update_from_dict(json.loads(raw))
+    return True
 
 
-def effective_mace_model(material: str) -> str:
-    """Return the MACE model path for *material*, applying :data:`MODEL_OVERRIDES`.
+def load_json(path: str) -> None:
+    """Load a JSON file produced by ``cfg.to_json()`` / hand-written (partial allowed)."""
+    with open(path) as fh:
+        cfg.update_from_dict(json.load(fh))
 
-    If *material* has an entry in ``MODEL_OVERRIDES`` that value is returned;
-    otherwise :data:`MACE_MODEL` is returned.
 
-    Args:
-        material: Material folder name (e.g. ``'BaTiO3'``, ``'Ba'``).
+@contextlib.contextmanager
+def override(**dotted: Any) -> Iterator[Config]:
+    """Temporarily change options: ``with override(**{"md.n_steps": 10}): ...``"""
+    saved = copy.deepcopy(cfg.to_dict())
+    saved_factory = cfg.custom_calc_factory
+    try:
+        for k, v in dotted.items():
+            sec, key = k.split(".", 1)
+            setattr(getattr(cfg, sec), key, v)
+        yield cfg
+    finally:
+        cfg.update_from_dict(saved)
+        cfg.custom_calc_factory = saved_factory
 
-    Returns:
-        Resolved model path string.
-    """
-    import sys as _sys
-    m = _sys.modules[__name__]
-    overrides = getattr(m, "MODEL_OVERRIDES", {})
-    return overrides.get(material, getattr(m, "MACE_MODEL", "mace-mpa-0-medium"))
+
+def reset() -> None:
+    """Restore factory defaults (used by tests)."""
+    fresh = Config()
+    for f in dc.fields(cfg):
+        object.__setattr__(cfg, f.name, getattr(fresh, f.name))

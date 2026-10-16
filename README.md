@@ -1,196 +1,103 @@
-# heatup
+# HeatUp 0.3
 
-**Sequential Stability Evaluation for Solid-State Electrolyte Candidates**
+Automatic, temperature-aware stability assessment of a crystal with a machine-learning potential
+(MACE-MP by default), plus an optional generative front end for new candidate structures.
 
-`heatup` implements a three-gate sequential stability pipeline for solid-state
-electrolyte (SSE) candidates discovered by machine-learning-guided active learning.
-Each gate must pass (or at least not fail) before the next one is evaluated, avoiding
-expensive computations on materials that are already ruled out by simpler criteria.
+| gate | question | evidence |
+|---|---|---|
+| **1** mechanical | positive-definite stiffness matrix (Born-Huang)? | relaxed-ion elastic tensor (Voigt/Reuss/Hill moduli) |
+| **0** structural transition | did the structure stay in its basin? | block-averaged positions, cell strain, symmetry breaking in the MD |
+| **2** vibrational | soft modes? | MD VDOS (momenta VACF) and harmonic phonons |
+| **3** thermodynamic | above the T-dependent convex hull? | G(T) = H0 + F_vib + F_el + F_mag + F_conf, the *same* method for every phase |
 
-```
-Candidate structure
-       │
-       ▼
-┌──────────────────┐
-│  Gate 1          │  Born–Huang criterion (elastic tensor eigenvalues)
-│  Mechanical      │  Bulk modulus B, Shear modulus G
-└────────┬─────────┘
-         │ pass / warn
-         ▼
-┌──────────────────┐
-│  Gate 2          │  Anharmonic VDOS from AIMD (VACF method)
-│  Vibrational     │  Soft-mode weight at ω ≈ 0
-└────────┬─────────┘
-         │ pass / warn
-         ▼
-┌──────────────────┐
-│  Gate 3          │  Temperature-dependent convex hull
-│  Thermodynamic   │  F(T) = E₀ + F_vib(T),  anharmonic for target
-└──────────────────┘
-         │
-         ▼
-    stability_report.json  +  stability_report.pdf
-```
+Compute order is cheapest-first (`relax -> elastic -> [1] -> phonons -> MD -> [0][2] -> hull -> [3]`);
+a failed gate stops the funnel. Verdicts are `ok / warn / fail / missing` and are recomputed from cached
+step outputs, so thresholds can be changed without recomputation. See `docs/AUDIT.md` for what changed
+from v0.2, what was verified and what was not.
 
-## Installation
+## Install
 
 ```bash
-pip install heatup                        # core only
-pip install "heatup[md]"                  # + MACE / ASE for MD triggering
-pip install "heatup[generation]"          # + PyXtal for polymorph generation
-pip install "heatup[all]"                 # everything
+pip install -e .[mace,mp,generate,test]      # mace-torch, mp-api, pyxtal, pytest
+export MP_API_KEY=...                         # only for Materials Project downloads
+export MACE_MODEL_PATH=/path/to/model.model   # optional; default "medium-mpa-0" (mace_mp name)
 ```
 
-For development:
+## Use
 
-```bash
-git clone https://github.com/CibranLopez/HeatUp
-cd heatup
-pip install -r requirements.txt
-pytest
-```
-
-## Quick start
-
-### Python API
+**From other software - one call** (details and guarantees in `docs/INTEGRATION.md`):
 
 ```python
-from heatup import run_stability_pipeline
+from heatup import screen, ScreenOptions
 
-report = run_stability_pipeline(
-    sym_dir     = "database/LiZrS2/R3m",
-    operating_T = 1200.0,          # K
-    device      = "cuda",
-)
-
-print(report["overall"])           # "ok" | "warn" | "fail" | "missing"
-for flag in report["flags"]:
-    print(flag)
+r = screen("work/BaTiO3/P4mm", stage="pre_md",             # "pre_md": relax + elastic + 0 K hull (cheap)
+           options=ScreenOptions(operating_T=600, mobile_species=[], thresholds={"hull_fail_eV": 0.08}))
+r.verdict      # "accept" | "reject" | "inconclusive"
+r.reasons, r.e_hull_eV, r.gates                              # why, hull energy (eV/atom), per-gate status
+r = screen("work/BaTiO3/P4mm", stage="post_md", options=...) # all four gates incl. MD and the T-dependent hull
 ```
 
-### Command line
-
-```bash
-# Single material
-heatup database/LiZrS2/R3m --operating-T 1200 --device cuda
-
-# Entire database
-heatup batch --database database --operating-T 1200
-
-# Skip PyXtal generation (faster)
-heatup batch --no-generate
-
-# Force recompute
-heatup database/LiZrS2/R3m --force
-```
-
-### Integration with the active-learning pipeline
-
-In `02_validate.ipynb` (or equivalent), replace the existing stability call with:
+**Interactive / notebooks:**
 
 ```python
-from heatup import run_stability_pipeline
+from heatup import cfg, run_pipeline, screen_many, summary_rows
 
-for sym_dir in validated_dirs:
-    report = run_stability_pipeline(
-        sym_dir                 = sym_dir,
-        operating_T             = OPERATING_TEMPERATURE,
-        device                  = DEVICE,
-        generate_missing_phases = True,
-    )
-    if report["overall"] == "ok":
-        retraining_candidates.append(sym_dir)
-    elif report["overall"] == "warn":
-        # borderline — human review
-        flagged.append((sym_dir, report["flags"]))
-    # "fail" → excluded automatically
+cfg.calc.model_overrides = {"BaTiO3": "BTO_MACE.model"}     # per-material fine-tuned model
+cfg.hull.operating_T = 600
+cfg.gates.mobile_species = []                               # ["Li"] for a superionic conductor
+
+cfg.gates.enabled = ["mechanical", "vibrational", "thermodynamic"]     # gates are independent: pick any subset
+cfg.run.force = ["md"]                                      # recompute these steps (or "all"); [] = use the cache
+
+report = run_pipeline("database/BaTiO3/P4mm", md_temperatures=[600])   # one phase, the enabled gates
+print(report["overall"], report["flags"])                              # + stability/report_post_md.{json,png}
+
+rows = screen_many(["input/candidates/X/a", "input/candidates/X/b"], out_dir="screening")   # many targets
 ```
 
-## Directory layout
+`heatup.report.print_layout(root)` prints this tree with file sizes (the notebooks do it after every stage).
 
-```
-database/
-  <material>/<symmetry>/
-    POSCAR
-    relaxation/
-      energy.json           ← MACE ground-state energy per atom
-    elastic/
-      elastic_tensor.json   ← 6×6 stiffness tensor + derived moduli
-    phonons/
-      dos.json              ← harmonic DOS (fallback for Gate 3)
-    aimd/
-      <T>K/
-        output.traj
-        simulation-input.json
-        anharmonic_phonons/
-          vdos.json         ← cached VACF→VDOS (written by this package)
-          thermo.json
-          free_energy.json
-    stability/
-      secondary_phases.json
-      hull_vs_T.json
-      stability_report.json ← gate results + overall verdict
-      stability_report.pdf  ← three-panel dashboard
-```
+Directory layout (`<root>/<material>/<label>/`): `POSCAR` -> `relaxation/` `elastic/` `phonons/` `md/<T>K/`
+`stability/` (`report_<stage>.json`, `result_<stage>.json`). Every step directory holds a `manifest.json`.
+Trees: `database_root` (your targets, read/write), `candidates_root` (your input structures, **read-only**),
+`competing_root` (everything HeatUp fetches, generates or mirrors as competing phases, with their results).
 
-## Configuration
+Each expensive step runs in a child process (`python -m heatup._worker <step> <phase_dir>`), which returns
+all GPU memory to the OS and receives the live config as one JSON env var (`HEATUP_CONFIG`). Only
+documented CUDA runtime failures are retried on CPU; real errors are reported once.
 
-All thresholds live in `heatup/config.py` and can be overridden at runtime:
+Generate and screen new compositions:
 
 ```python
-import heatup.config as cfg
-
-cfg.THERMO_HULL_WARN_EV      = 0.05   # tighter metastability window (50 meV)
-cfg.VIB_ZERO_FRAC_FAIL       = 0.05   # stricter soft-mode threshold
-cfg.MECH_BULK_WARN_GPa       = 20.0   # demand stiffer electrolytes
-cfg.PYXTAL_MAX_ATOMS         = 60     # allow larger unit cells
+from heatup.workflow import generate_and_screen
+rows = generate_and_screen({"Ba": 1, "Ti": 1, "O": 3}, n=50, method="pyxtal", out_dir="screening")
+# method="matgen" -> MatterGen CLI (cfg.generation.matgen_*), or register_generator("mine", fn)
 ```
 
-## Gate details
+## Modules
 
-### Gate 1 — Mechanical (Born–Huang)
+`config` `constants` `paths` `structure` `calculator` `manifest` `runtime` - infrastructure ·
+`relax` `elastic` `phonons` `md` `md_analysis` `vdos` `vibthermo` - computations ·
+`mechanical` `structural_transition` `vibrational` `thermodynamic` - gates ·
+`free_energy` `phases` `generation` - thermodynamic inputs ·
+`api` (stable entry point) `pipeline` `workflow` `plotting` - orchestration ·
+`builders` `report` `validation` - notebook helpers.
 
-Reads `elastic/elastic_tensor.json`.  All six eigenvalues of the 6×6 Voigt
-stiffness tensor C must be positive (Born–Huang criterion).  The Voigt-averaged
-bulk modulus B and shear modulus G are checked against configurable thresholds.
-
-### Gate 2 — Vibrational (anharmonic VDOS)
-
-Reads `aimd/<T>K/anharmonic_phonons/vdos.json`.  The VDOS is extracted from
-AIMD trajectories via the velocity autocorrelation function (VACF), averaged
-across all available MD temperatures, and the fraction of spectral weight within
-a narrow window around ω = 0 is computed.  Significant weight there indicates
-soft modes surviving at finite temperature — a signature of structural instability
-or pre-transitional dynamics.
-
-### Gate 3 — Thermodynamic (convex hull with T)
-
-Constructs F(T) = E₀ + F_vib(T) for the target material (using the anharmonic
-VDOS) and for all secondary phases (harmonic approximation).  Missing polymorphs
-are generated automatically with PyXtal.  The pymatgen `PhaseDiagram` engine
-builds the convex hull at each temperature and the distance above the hull is
-evaluated at `operating_T`.
-
-## Running the tests
+## Tests
 
 ```bash
-pytest                        # all tests
-pytest -k mechanical          # Gate 1 only
-pytest -v --tb=long           # verbose
-pytest --cov=heatup    # with coverage report
+pytest                 # 42 fast unit/analytic tests
+pytest -m slow         # 11 end-to-end runs with ASE's EMT potential (Cu/Ag/Au), ~4 min
+HEATUP_BACKEND=emt jupyter nbconvert --execute notebooks/03_binary_validation.ipynb
 ```
 
-## Citation
+Notebooks: `01_structure_and_md` (prepare), `02_stability_analysis` (gates + hull), `03_binary_validation`
+(Ag-Au-Cu: miscible vs immiscible, elastic moduli vs experiment). Convention (enforced by a test): notebooks hold
+configuration and *visible loops* over steps/gates only - no `def`/`class`/`lambda`. Structure builders live in
+`heatup.builders`, tables and figures in `heatup.report`, reference data in `heatup.validation`.
 
-If you use this package in your research, please cite:
+## Status
 
-```bibtex
-@article{heatup_2025,
-  title   = {HeatUp: Sequential Stability Evaluation for Machine-Learning-Guided
-             Discovery of Solid-State Electrolytes},
-  author  = {López, C. et al.},
-  journal = {---},
-  year    = {2026},
-  note    = {preprint}
-}
-```
+Verified on the EMT toy potential only; the MACE/CHGNet/M3GNet, Materials Project and MatterGen paths
+have not been run (see `docs/AUDIT.md`, section 0). Thresholds still need calibration on BaTiO3 and a
+diffusive system.

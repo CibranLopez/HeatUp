@@ -1,359 +1,223 @@
 """heatup.structural_transition
 ================================
-Gate 0: Structural transition detection from AIMD trajectories.
+Gate 0 - did the structure survive the MD run?
 
-Detects whether an MD simulation has undergone a structural phase transition
-by computing the displacement autocorrelation function (DACF)::
+Why not the v0.2 DACF plateau
+-----------------------------
+v0.2 measured the long-time plateau of ``C(tau) = <du(t) du(t+tau)>`` with
+``du = r(t) - r(first production frame)``.  The reference is a *single thermal
+snapshot*: du(t) = delta(t) - delta(0), so even a perfectly stable crystal has
+``C_inf = <delta^2>`` = the thermal mean-square displacement (0.01-0.1 A^2
+at 1000 K) - i.e. the gate threshold (0.10 A^2) sat inside the thermal noise
+and the reported value depended on the random first frame.
 
-    C(τ) = (1 / (N·3)) · Σᵢ Σ_α ⟨Δuᵢₐ(t) · Δuᵢₐ(t + τ)⟩_t   [Å²]
-
-where Δuᵢₐ(t) = rᵢₐ(t) − rᵢₐ(0) is the PBC-aware cumulative displacement
-of atom i in direction α from its initial (first production frame) position.
-
-For a thermally vibrating solid, atoms remain near their equilibrium sites:
-Δu(t) is bounded and oscillatory → C(τ) → 0 as τ → ∞.
-
-After a structural phase transition, atoms settle at new equilibrium
-positions: Δu(t) → constant ≠ 0 → C(τ) plateaus at C_∞ > 0.
-
-The long-time value C_∞ is estimated as the mean of C(τ) over the last
-``config.DACF_LONG_TIME_FRAC`` fraction of the computed lag range (0 … T//2).
-A structural transition is declared if C_∞ > ``config.DACF_THRESHOLD_ANG2``.
-
-Results are cached in::
-
-    <sim_dir>/anharmonic_phonons/dacf.json
-
-so they are computed once and reused in subsequent pipeline runs.
+Present test (all per MD temperature)
+-------------------------------------
+1. block-mean positions of the first and last ``gates.block_ps`` of the
+   production run (thermal noise averages out), centre-of-mass drift removed,
+   mapped to Cartesian on the mean cell;
+   * rms and max displacement of the non-mobile atoms   -> FAIL above thresholds
+   * mobile species (``gates.mobile_species``) are excluded;
+2. cell change between the same blocks: deviatoric Green-Lagrange strain and
+   volume change                                          -> FAIL above thresholds
+3. symmetry breaking: every symmetry operation of the *initial* structure is
+   applied to the block-mean structures and the rms mismatch is measured.  A
+   thermally vibrating crystal gives the mean-position noise (~0.02 A); a
+   polar/tilt distortion gives its amplitude.  -> WARN when the last block is
+   more broken than ``gates.symmetry_break_A`` (spglib on noisy *average*
+   structures was tried first: it is unreliable in small, shear-fluctuating
+   NPT cells);
+4. diffusing species not declared as mobile (MSD)           -> reported, and they
+   normally trigger (1);
+5. the DACF relative to the **first-block mean** is still computed (as a
+   diagnostic plot): its plateau is |<d>|^2 and is ~0 for a stable crystal.
 """
 
 from __future__ import annotations
 
-import json
+import logging
 import os
 
 import numpy as np
 
-from heatup import config
+from heatup import manifest
+from heatup.config import (STATUS_FAIL, STATUS_MISSING, STATUS_OK, STATUS_WARN, cfg, forced)
+from heatup.md_analysis import TrajData, autocorr_fft, diffusion_by_species, load_trajectory, unwrap_frac
+from heatup.paths import PhaseDir, read_json, write_json
+
+log = logging.getLogger("heatup")
 
 
-# ---------------------------------------------------------------------------
-# Core DACF computation
-# ---------------------------------------------------------------------------
+def symmetry_break(f_mean: np.ndarray, f_ref: np.ndarray, cell: np.ndarray,
+                   numbers: np.ndarray, max_ops: int = 200, symprec: float = 1e-3):
+    """rms mismatch (A) between a structure and its images under the symmetry
+    operations of the ideal reference structure ``f_ref`` (worst operation).
 
-def compute_dacf_from_traj(
-        traj: list,
-        traj_timestep_fs: float,
-) -> dict:
-    """Compute the displacement autocorrelation function from a trajectory.
-
-    Velocities are *not* used here — only positions.  PBC-aware cumulative
-    displacements from the first frame are computed via the minimum-image
-    convention on finite differences of fractional coordinates.
-
-    The DACF is evaluated via FFT-based linear autocorrelation (zero-padded
-    to avoid circular aliasing) with the unbiased denominator (n_frames − τ).
-    Lags are limited to T//2 so that the unbiased estimator remains reliable.
-
-    Args:
-        traj:             List of ASE Atoms objects (production frames only —
-                          equilibration must be stripped by the caller).
-        traj_timestep_fs: Effective time between consecutive frames in fs
-                          (= ``timestep_fs × nblock × step_skip``).
-
-    Returns:
-        Dict with keys:
-
-        ``'dacf'`` (list[float])
-            C(τ) in Å², length T//2, from τ=0 to τ=(T//2−1)·dt.
-        ``'lag_fs'`` (list[float])
-            Lag times in femtoseconds, one value per DACF entry.
-        ``'c_inf_ang2'`` (float)
-            Long-time plateau C_∞ (Å²), averaged over the last
-            ``config.DACF_LONG_TIME_FRAC`` of the lag range.
-        ``'transitioned'`` (bool)
-            True if C_∞ > ``config.DACF_THRESHOLD_ANG2``.
-        ``'n_frames'`` (int)
-            Number of trajectory frames used.
-        ``'n_atoms'`` (int)
-            Number of atoms per frame.
+    Returns ``(amplitude_A, n_ops)``; (nan, 0) if spglib is unavailable.
     """
-    if len(traj) < 4:
-        raise ValueError(
-            f'Trajectory has only {len(traj)} frames — need at least 4 for DACF.'
-        )
+    try:
+        import spglib
+        sym = spglib.get_symmetry((cell, f_ref % 1.0, numbers), symprec=symprec)
+        rots, trans = sym["rotations"], sym["translations"]
+    except Exception:  # noqa: BLE001
+        return float("nan"), 0
+    n_ops = len(rots)
+    idx = np.arange(n_ops)
+    if n_ops > max_ops:
+        idx = np.unique(np.linspace(0, n_ops - 1, max_ops).astype(int))
+    same = numbers[:, None] == numbers[None, :]
+    worst = 0.0
+    for k in idx:
+        fp = f_mean @ rots[k].T + trans[k]
+        d = fp[:, None, :] - f_mean[None, :, :]
+        d -= np.round(d)
+        dist = np.linalg.norm(d @ cell, axis=-1)
+        dist = np.where(same, dist, np.inf)
+        worst = max(worst, float(np.sqrt((dist.min(axis=1) ** 2).mean())))
+    return worst, int(n_ops)
 
-    n_frames = len(traj)
-    n_atoms  = len(traj[0])
 
-    # ── PBC-aware cumulative displacements (fractional → Cartesian Å) ──────
-    pos  = np.array([a.get_scaled_positions() for a in traj])  # (T, N, 3)
-    dpos = np.diff(pos, axis=0)                                 # (T-1, N, 3)
-    dpos -= np.round(dpos)                                      # minimum image
-    u_frac = np.concatenate(
-        [np.zeros((1, n_atoms, 3)), np.cumsum(dpos, axis=0)],
-        axis=0,
-    )  # (T, N, 3) — cumulative displacement from frame 0 in fractional coords
+def transition_metrics(td: TrajData, mobile: list[str] | None = None) -> dict:
+    """Block-mean displacement / cell / symmetry metrics for one trajectory."""
+    g = cfg.gates
+    mobile = list(mobile if mobile is not None else g.mobile_species)
+    p = td.production()
+    nb = int(round(g.block_ps * 1000.0 / p.dt_fs))
+    nb = max(1, min(nb, p.n_frames // 2))
+    short = p.n_frames < 2 * int(round(g.block_ps * 1000.0 / p.dt_fs))
 
-    cell   = traj[0].get_cell()[:]  # (3, 3) row vectors
-    u_cart = u_frac @ cell          # (T, N, 3)  in Å
+    u = unwrap_frac(p.frac)                                         # (T,N,3)
+    f0, f1 = u[:nb].mean(0), u[-nb:].mean(0)
+    h0, h1 = p.cell[:nb].mean(0), p.cell[-nb:].mean(0)
+    hm = p.cell.mean(0)
+    d_frac = f1 - f0
+    fixed = ~p.species_mask(mobile) if mobile else np.ones(p.n_atoms, bool)
+    if fixed.sum() == 0:
+        fixed[:] = True
+    # remove rigid drift of the framework (mass-weighted mean over non-mobile atoms)
+    wf = (p.masses[fixed] / p.masses[fixed].sum())[:, None]
+    d_frac = d_frac - (d_frac[fixed] * wf).sum(0, keepdims=True)
+    d_cart = d_frac @ hm
+    dist = np.linalg.norm(d_cart, axis=1)
 
-    # ── FFT-based autocorrelation with unbiased estimator ──────────────────
-    # Zero-padding to 2·T ensures the circular FFT gives the linear
-    # autocorrelation: IFFT(|FFT(x, n=2T)|²)[τ] = Σ_{t=0}^{T-τ-1} x[t]·x[t+τ].
-    # Lags are limited to T//2 for reliable unbiased division.
-    max_lag  = n_frames // 2
-    u_flat   = u_cart.reshape(n_frames, -1)  # (T, N*3)
-    n_fft    = 2 * n_frames                  # zero-pad length
-    dacf_sum = np.zeros(max_lag)
+    per_species = {sp: {"rms_A": float(np.sqrt((dist[p.species_mask(sp)] ** 2).mean())),
+                        "max_A": float(dist[p.species_mask(sp)].max())}
+                   for sp in sorted(set(p.symbols))}
+    rms = float(np.sqrt((dist[fixed] ** 2).mean()))
+    mx = float(dist[fixed].max())
 
-    for k in range(u_flat.shape[1]):
-        X        = np.fft.rfft(u_flat[:, k], n=n_fft)
-        autocorr = np.fft.irfft(X * np.conj(X), n=n_fft)[:max_lag]
-        dacf_sum += np.real(autocorr)
+    # cell change: x1 = x0 @ M, M = h0^-1 h1  ->  eps = (M M^T - I)/2
+    M = np.linalg.solve(h0, h1)
+    eps = 0.5 * (M @ M.T - np.eye(3))
+    dev = eps - np.trace(eps) / 3.0 * np.eye(3)
+    shape_strain = float(np.abs(np.linalg.eigvalsh(dev)).max())
+    dV = float(np.linalg.det(h1) / np.linalg.det(h0) - 1.0)
 
-    # Unbiased denominator: at lag τ, there are (n_frames − τ) pairs.
-    counts = np.arange(n_frames, n_frames - max_lag, -1, dtype=float)
-    dacf   = dacf_sum / counts / u_flat.shape[1]  # average over N*3 DOF
+    from ase.data import atomic_numbers
+    numbers = np.array([atomic_numbers[x] for x in p.symbols])
+    ideal = td.frac[0]                       # frame 0 of the run = relaxed, symmetric supercell
+    sb0, n_ops = symmetry_break(f0, ideal, hm, numbers)
+    sb1, _ = symmetry_break(f1, ideal, hm, numbers)
 
-    # ── Long-time plateau ───────────────────────────────────────────────────
-    long_start   = max(1, int((1.0 - config.DACF_LONG_TIME_FRAC) * max_lag))
-    c_inf        = float(np.mean(dacf[long_start:]))
-    transitioned = c_inf > config.DACF_THRESHOLD_ANG2
-
-    lag_fs = np.arange(max_lag, dtype=float) * traj_timestep_fs
+    # DACF relative to the first-block mean (diagnostic)
+    uc = (u - f0[None]) @ hm
+    uc = uc[:, fixed, :].reshape(p.n_frames, -1)
+    max_lag = p.n_frames // 2
+    dacf = autocorr_fft(uc, max_lag) / uc.shape[1]
+    sub = max(1, max_lag // 600)
 
     return {
-        'dacf'        : dacf.tolist(),
-        'lag_fs'      : lag_fs.tolist(),
-        'c_inf_ang2'  : c_inf,
-        'transitioned': transitioned,
-        'n_frames'    : n_frames,
-        'n_atoms'     : n_atoms,
+        "rms_A": rms, "max_A": mx, "per_species": per_species,
+        "cell_shape_strain": shape_strain, "cell_volume_change": dV,
+        "symmetry_break_first_A": sb0, "symmetry_break_last_A": sb1, "n_symmetry_ops": n_ops,
+        "symmetry_broken": bool(np.isfinite(sb1) and sb1 > g.symmetry_break_A),
+        "dacf_A2": dacf[::sub], "dacf_lag_fs": (np.arange(max_lag) * p.dt_fs)[::sub],
+        "dacf_plateau_A2": float(dacf[int(0.8 * max_lag):].mean()),
+        "block_frames": nb, "production_ps": p.duration_ps, "too_short": bool(short),
+        "mobile_species": mobile,
     }
 
 
-# ---------------------------------------------------------------------------
-# Per-simulation assessment with caching
-# ---------------------------------------------------------------------------
+def verdict(m: dict) -> tuple[str, list[str]]:
+    g = cfg.gates
+    fails, warns = [], []
+    if m["rms_A"] > g.transition_rms_A:
+        fails.append(f"rms block displacement {m['rms_A']:.2f} A > {g.transition_rms_A:g}")
+    if m["max_A"] > g.transition_max_A:
+        fails.append(f"max atomic displacement {m['max_A']:.2f} A > {g.transition_max_A:g}")
+    if m["cell_shape_strain"] > g.cell_shape_strain:
+        fails.append(f"cell shape strain {m['cell_shape_strain']:.3f} > {g.cell_shape_strain:g}")
+    if abs(m["cell_volume_change"]) > g.cell_volume_change:
+        fails.append(f"volume change {100 * m['cell_volume_change']:+.1f}% (> {100 * g.cell_volume_change:g}%)")
+    if m["symmetry_broken"]:
+        warns.append(f"symmetry of the initial structure broken by {m['symmetry_break_last_A']:.2f} A "
+                     f"(was {m['symmetry_break_first_A']:.2f} A at the start)")
+    if m["too_short"]:
+        warns.append("production run shorter than two averaging blocks")
+    if m["rms_A"] > 0.5 * g.transition_rms_A and not fails:
+        warns.append(f"rms block displacement {m['rms_A']:.2f} A is close to the threshold")
+    if fails:
+        return STATUS_FAIL, fails
+    return (STATUS_WARN if warns else STATUS_OK), warns
 
-def assess_structural_transition_for_sim(
-        sim_dir: str,
-        force_recompute: bool = False,
-) -> dict | None:
-    """Compute or load cached DACF for a single AIMD temperature sim_dir.
 
-    The result is cached in ``sim_dir/anharmonic_phonons/dacf.json``.
+def assess_sim(phase_dir, temperature: float, force: bool | None = None) -> dict | None:
+    """Per-temperature Gate-0 result (cached in ``md/<T>K/transition.json``)."""
+    phase = PhaseDir.of(phase_dir)
+    sim = phase.md_run(temperature)
+    out = os.path.join(sim, "transition.json")
+    traj = os.path.join(sim, "output.traj")
+    force = forced("analysis", force)
+    if (not force and os.path.exists(out)
+            and manifest.is_fresh(sim, "analysis", phase.material, [traj])):
+        return read_json(out)
+    if not os.path.exists(traj) or os.path.getsize(traj) == 0:
+        return None
+    td = load_trajectory(sim)
+    m = transition_metrics(td)
+    status, notes = verdict(m)
+    diff = diffusion_by_species(td)
+    undeclared = [sp for sp, v in diff.items()
+                  if v["mobile"] and sp not in cfg.gates.mobile_species]
+    m.update({"status": status, "notes": notes, "temperature_K": temperature,
+              "diffusive_species": [sp for sp, v in diff.items() if v["mobile"]],
+              "undeclared_diffusive_species": undeclared})
+    write_json(out, m, indent=None)
+    manifest.write_manifest(sim, "analysis", phase.material, [traj])
+    return m
 
-    Args:
-        sim_dir:         Path to a temperature sub-folder
-                         (e.g. ``database/AgI/P63mc/aimd/1200K``).
-        force_recompute: Ignore cached result and recompute.
 
-    Returns:
-        DACF result dict (keys: ``'dacf'``, ``'lag_fs'``, ``'c_inf_ang2'``,
-        ``'transitioned'``, ``'n_frames'``, ``'n_atoms'``, ``'sim_dir'``,
-        ``'temperature_K'``), or ``None`` if the trajectory is missing or
-        analysis fails.
-    """
-    anh_dir    = os.path.join(sim_dir, 'anharmonic_phonons')
-    cache_path = os.path.join(anh_dir, 'dacf.json')
-
-    if not force_recompute and os.path.exists(cache_path):
+def assess_structural_transition(phase_dir, force: bool | None = None) -> dict:
+    """Gate 0 over every available MD temperature."""
+    phase = PhaseDir.of(phase_dir)
+    temps = phase.md_temperatures()
+    if not temps:
+        return {"available": False, "status": STATUS_MISSING, "sim_results": [],
+                "message": "No MD trajectory found - run step 'md' first."}
+    sims = []
+    for T in temps:
         try:
-            with open(cache_path) as fh:
-                return json.load(fh)
-        except Exception:
-            pass  # cache corrupt — fall through to recompute
-
-    traj_path  = os.path.join(sim_dir, 'output.traj')
-    input_path = os.path.join(sim_dir, 'simulation-input.json')
-
-    if not os.path.exists(traj_path) or os.path.getsize(traj_path) == 0:
-        return None
-    if not os.path.exists(input_path):
-        return None
-
-    with open(input_path) as fh:
-        params = json.load(fh)
-
-    timestep_fs      = float(params['timestep_fs'])
-    nblock           = int(params['nblock'])
-    step_skip        = int(params.get('step_skip', 1))
-    step_equiv       = int(params.get('step_equiv', 100))
-    # Backward/forward compatible key: older runs used `temperature`,
-    # current inputs use `temperature_K`.
-    temperature_K    = float(params.get('temperature_K', params.get('temperature')))
-    traj_timestep_fs = timestep_fs * nblock * step_skip
-
-    try:
-        from ase.io import read as ase_read
-        full_traj = ase_read(traj_path, index=f'::{step_skip}')
-    except Exception as exc:
-        print(f'  [dacf] {sim_dir}: could not read trajectory: {exc}')
-        return None
-
-    prod_traj = full_traj[step_equiv:]
-    if len(prod_traj) < 4:
-        print(f'  [dacf] {sim_dir}: only {len(prod_traj)} production frames — skipping.')
-        return None
-
-    print(f'  [dacf] Computing DACF from {len(prod_traj)} frames ({sim_dir}) ...')
-    try:
-        result = compute_dacf_from_traj(prod_traj, traj_timestep_fs)
-    except Exception as exc:
-        print(f'  [dacf] {sim_dir}: DACF computation failed: {exc}')
-        return None
-
-    result['sim_dir']      = sim_dir
-    result['temperature_K'] = temperature_K
-
-    os.makedirs(anh_dir, exist_ok=True)
-    with open(cache_path, 'w') as fh:
-        json.dump(result, fh, indent=4)
-
-    flag = '✗ TRANSITION' if result['transitioned'] else '✓ stable'
-    print(f'    {flag}  C_∞ = {result["c_inf_ang2"]:.4f} Å²'
-          f'  (threshold {config.DACF_THRESHOLD_ANG2:.3f} Å²)')
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Gate 0 — whole sym_dir assessment
-# ---------------------------------------------------------------------------
-
-def assess_structural_transition(
-        sym_dir: str,
-        force_recompute: bool = False,
-) -> dict:
-    """Gate 0: Check all AIMD simulations for structural phase transitions.
-
-    Scans ``sym_dir/aimd/`` for completed trajectories, computes or loads the
-    DACF for each temperature sub-folder, and fails the gate if **any**
-    simulation shows a structural transition (C_∞ > threshold).
-
-    Args:
-        sym_dir:         Path to ``database/<material>/<symmetry>/``.
-        force_recompute: Re-run DACF computation even if cached results exist.
-
-    Returns:
-        Dict with keys:
-
-        ``'available'`` (bool)
-            True if at least one trajectory was found.
-        ``'sim_results'`` (list[dict])
-            Per-simulation summaries (large DACF/lag arrays stripped).
-        ``'transitioned_sims'`` (list[str])
-            sim_dir paths where a structural transition was detected.
-        ``'max_c_inf_ang2'`` (float | None)
-            Maximum C_∞ across all simulations (Å²).
-        ``'threshold_ang2'`` (float)
-            The threshold used (``config.DACF_THRESHOLD_ANG2``).
-        ``'status'`` (str)
-            ``'ok'`` | ``'fail'`` | ``'missing'``.
-        ``'message'`` (str)
-            Human-readable explanation.
-    """
-    aimd_dir = os.path.join(sym_dir, 'aimd')
-
-    if not os.path.isdir(aimd_dir):
-        return {
-            'available'         : False,
-            'sim_results'       : [],
-            'transitioned_sims' : [],
-            'max_c_inf_ang2'    : None,
-            'threshold_ang2'    : config.DACF_THRESHOLD_ANG2,
-            'status'            : config.STATUS_MISSING,
-            'message'           : (
-                'No AIMD directory found — structural transition check skipped.'
-            ),
-        }
-
-    # ── Discover completed sim_dirs ────────────────────────────────────────
-    sim_dirs = []
-    for temp_folder in sorted(os.listdir(aimd_dir)):
-        if not temp_folder.endswith('K'):
-            continue
-        sd        = os.path.join(aimd_dir, temp_folder)
-        traj_path = os.path.join(sd, 'output.traj')
-        if (os.path.isdir(sd)
-                and os.path.exists(traj_path)
-                and os.path.getsize(traj_path) > 0):
-            sim_dirs.append(sd)
-
-    if not sim_dirs:
-        return {
-            'available'         : False,
-            'sim_results'       : [],
-            'transitioned_sims' : [],
-            'max_c_inf_ang2'    : None,
-            'threshold_ang2'    : config.DACF_THRESHOLD_ANG2,
-            'status'            : config.STATUS_MISSING,
-            'message'           : 'No completed AIMD trajectories found.',
-        }
-
-    # ── Compute DACF per sim_dir ───────────────────────────────────────────
-    sim_results:       list[dict] = []
-    transitioned_sims: list[str]  = []
-
-    for sd in sim_dirs:
-        res = assess_structural_transition_for_sim(sd, force_recompute=force_recompute)
-        if res is not None:
-            sim_results.append(res)
-            if res.get('transitioned', False):
-                transitioned_sims.append(sd)
-
-    if not sim_results:
-        return {
-            'available'         : False,
-            'sim_results'       : [],
-            'transitioned_sims' : [],
-            'max_c_inf_ang2'    : None,
-            'threshold_ang2'    : config.DACF_THRESHOLD_ANG2,
-            'status'            : config.STATUS_MISSING,
-            'message'           : 'DACF could not be computed for any trajectory.',
-        }
-
-    max_c_inf = max(r['c_inf_ang2'] for r in sim_results)
-    thr       = config.DACF_THRESHOLD_ANG2
-    T_labels  = [
-        os.path.basename(r['sim_dir'])
-        for r in sim_results if r.get('transitioned')
-    ]
-
-    if transitioned_sims:
-        status  = config.STATUS_FAIL
-        message = (
-            f'Structural transition detected in {len(transitioned_sims)} of '
-            f'{len(sim_results)} MD simulation(s) '
-            f'({", ".join(T_labels)}). '
-            f'Max C\u221e = {max_c_inf:.3f} \u00c5\u00b2 '
-            f'(threshold {thr:.3f} \u00c5\u00b2). '
-            f'Material is dynamically unstable — excluded from convex hull.'
-        )
+            r = assess_sim(phase, T, force=force)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Gate 0 failed for %s %dK: %s", phase.tag, T, exc)
+            r = None
+        if r:
+            sims.append(r)
+    if not sims:
+        return {"available": False, "status": STATUS_MISSING, "sim_results": [],
+                "message": "MD trajectories could not be analysed."}
+    order = {STATUS_OK: 0, STATUS_WARN: 1, STATUS_FAIL: 2}
+    worst = max(sims, key=lambda r: order[r["status"]])
+    failed = [f"{int(r['temperature_K'])}K" for r in sims if r["status"] == STATUS_FAIL]
+    if worst["status"] == STATUS_FAIL:
+        msg = (f"Structural transition/instability at {', '.join(failed)}: "
+               + "; ".join(worst["notes"]))
+    elif worst["status"] == STATUS_WARN:
+        msg = "; ".join(worst["notes"])
     else:
-        status  = config.STATUS_OK
-        message = (
-            f'No structural transition detected across {len(sim_results)} '
-            f'MD simulation(s). '
-            f'Max C\u221e = {max_c_inf:.4f} \u00c5\u00b2 '
-            f'(threshold {thr:.3f} \u00c5\u00b2).'
-        )
-
-    # Strip large DACF/lag arrays from the per-sim summaries stored in the
-    # report (full arrays are preserved in each sim_dir/anharmonic_phonons/dacf.json).
-    slim_results = [
-        {k: v for k, v in r.items() if k not in ('dacf', 'lag_fs')}
-        for r in sim_results
-    ]
-
-    return {
-        'available'         : True,
-        'sim_results'       : slim_results,
-        'transitioned_sims' : transitioned_sims,
-        'max_c_inf_ang2'    : max_c_inf,
-        'threshold_ang2'    : thr,
-        'status'            : status,
-        'message'           : message,
-    }
+        msg = (f"Structure retained at all {len(sims)} MD temperature(s) "
+               f"(max rms block displacement {max(r['rms_A'] for r in sims):.2f} A).")
+    slim = [{k: v for k, v in r.items() if k not in ("dacf_A2", "dacf_lag_fs")} for r in sims]
+    return {"available": True, "status": worst["status"], "message": msg,
+            "sim_results": slim, "max_rms_A": max(r["rms_A"] for r in sims),
+            "failed_temperatures": failed}

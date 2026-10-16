@@ -1,239 +1,117 @@
-"""heatup.plotting
-========================
-Dashboard figure for a complete stability report.
-
-Three panels:
-    Left:   Anharmonic VDOS with the soft-mode window highlighted.
-    Centre: E_above_hull vs temperature with stability regions.
-    Right:  Scorecard summarising all three gates with thresholds.
-"""
+"""heatup.plotting - dashboard figure for a stability report."""
 
 from __future__ import annotations
 
-import os
-
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from heatup import config
+from heatup.config import STATUS_FAIL, STATUS_MISSING, STATUS_OK, STATUS_WARN, cfg
 
-# Colour palette (accessible, print-friendly).
-_COL = {
-    "ok"      : "#27ae60",
-    "warn"    : "#f39c12",
-    "fail"    : "#c0392b",
-    "missing" : "#95a5a6",
-    "blue"    : "#1a4a8a",
-    "light_g" : "#d5f5e3",
-    "light_y" : "#fef9e7",
-    "light_r" : "#fadbd8",
-}
-_MARKER = {
-    config.STATUS_OK      : "✓",
-    config.STATUS_WARN    : "⚠",
-    config.STATUS_FAIL    : "✗",
-    config.STATUS_MISSING : "—",
-}
+COLORS = {STATUS_OK: "#2a9d5c", STATUS_WARN: "#e0a100", STATUS_FAIL: "#c0392b", STATUS_MISSING: "#8a8f98"}
+MARK = {STATUS_OK: "pass", STATUS_WARN: "warn", STATUS_FAIL: "FAIL", STATUS_MISSING: "n/a"}
+TITLES = {"structural_transition": "Gate 0  structure", "mechanical": "Gate 1  Born",
+          "vibrational": "Gate 2  vibrational", "thermodynamic": "Gate 3  hull"}
 
 
-def plot_stability_report(
-        report: dict,
-        save_path: str | None = None,
-        show: bool = False,
-) -> plt.Figure:
-    """Generate the three-panel stability dashboard.
+def _wrap(s: str, n: int = 58) -> str:
+    out, line = [], ""
+    for w in s.split():
+        if len(line) + len(w) + 1 > n:
+            out.append(line)
+            line = w
+        else:
+            line = f"{line} {w}".strip()
+    return "\n".join(out + [line])
 
-    Args:
-        report:    Dict returned by :func:`heatup.pipeline.run_stability_pipeline`.
-        save_path: Save the figure to this path if provided (PDF recommended).
-        show:      Call ``plt.show()``; set ``False`` inside notebooks with
-                   ``%matplotlib inline``.
 
-    Returns:
-        The :class:`matplotlib.figure.Figure` object.
-    """
-    mech  = report.get("mechanical",    {})
-    vib   = report.get("vibrational",   {})
-    therm = report.get("thermodynamic", {})
+def _scorecard(ax, report: dict) -> None:
+    ax.axis("off")
+    ax.set_title(f"{report['material']} / {report['label']}  -  {report['operating_T_K']:g} K  -  "
+                 f"overall {report['overall'].upper()}", loc="left", fontsize=11,
+                 color=COLORS[report["overall"]], fontweight="bold")
+    y = 0.95
+    for g, title in TITLES.items():
+        r = report.get(g)
+        st = r["status"] if r else STATUS_MISSING
+        if g in report.get("skipped", []) and not r:
+            st = STATUS_MISSING
+        ax.text(0.0, y, f"{title}", fontsize=10, fontweight="bold", va="top", transform=ax.transAxes)
+        ax.text(0.30, y, MARK[st], fontsize=10, color=COLORS[st], fontweight="bold", va="top",
+                transform=ax.transAxes)
+        msg = _wrap(r["message"] if r else ("skipped" if g in report.get("skipped", []) else "not evaluated"))
+        ax.text(0.40, y, msg, fontsize=8, va="top", transform=ax.transAxes)
+        y -= 0.07 + 0.055 * msg.count("\n") + 0.03
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5),
-                             gridspec_kw={"wspace": 0.35})
-    ax_vib, ax_hull, ax_score = axes
 
-    _panel_vdos    (ax_vib,   vib)
-    _panel_hull    (ax_hull,  therm)
-    _panel_scorecard(ax_score, mech, vib, therm,
-                    report.get("material", "?"), report.get("symmetry", "?"))
+def _vdos(ax, report: dict) -> None:
+    from heatup.phonons import load_ha
+    vib = report.get("vibrational") or {}
+    ax.set_xlabel("energy (meV)")
+    ax.set_ylabel("DOS (modes / atom / meV)")
+    ax.set_title("Vibrational DOS", loc="left", fontsize=10)
+    ha = load_ha(report["phase_dir"]) if report.get("phase_dir") else None
+    if ha:
+        sm = ha["modes"].smooth_dos(sigma_meV=1.0)
+        ax.fill_between(sm[0], sm[1], color="#b0c4de", alpha=0.6, label="HA (0 K)")
+    cols = plt.cm.viridis(np.linspace(0.15, 0.85, max(1, len(vib.get("vdos", [])))))
+    for c, r in zip(cols, vib.get("vdos", [])):
+        w, o = np.asarray(r["weight"]), np.asarray(r["omega_meV"])
+        if len(o) > 2:
+            ax.plot(o, w / np.gradient(o), color=c, lw=1.2, label=f"MD {r['temperature_K']:.0f} K")
+            ax.axvspan(-r["zero_window_meV"], r["zero_window_meV"], color=COLORS[STATUS_FAIL], alpha=0.15)
+    if ha or vib.get("vdos"):
+        ax.legend(frameon=False, fontsize=8)
+    else:
+        ax.text(0.5, 0.5, "no spectra", ha="center", transform=ax.transAxes)
 
-    overall = report.get("overall", config.STATUS_MISSING)
-    ov_col  = _COL.get(overall, _COL["missing"])
-    fig.suptitle(
-        f"Stability report — {report.get('material','?')} / {report.get('symmetry','?')}",
-        fontsize=12, fontweight="bold", color=ov_col, y=1.02,
-    )
 
+def _hull(ax, report: dict) -> None:
+    th = report.get("thermodynamic") or {}
+    ax.set_title("Distance to hull", loc="left", fontsize=10)
+    ax.set_xlabel("T (K)")
+    ax.set_ylabel("E$_{hull}$ (meV/atom)")
+    if not th.get("available"):
+        ax.text(0.5, 0.5, "hull not evaluated", ha="center", transform=ax.transAxes)
+        return
+    T, e = np.asarray(th["temperatures"]), 1e3 * np.asarray(th["e_hull_eV"])
+    g = cfg.gates
+    ax.axhspan(-1e3, 1e3 * g.hull_ok_eV, color=COLORS[STATUS_OK], alpha=0.12)
+    ax.axhspan(1e3 * g.hull_ok_eV, 1e3 * g.hull_fail_eV, color=COLORS[STATUS_WARN], alpha=0.12)
+    ax.axhspan(1e3 * g.hull_fail_eV, 1e4, color=COLORS[STATUS_FAIL], alpha=0.12)
+    ax.plot(T, e, color="#1f3a6e", lw=1.8, label=f"{th['method']} (consistent)")
+    if th.get("overlay"):
+        ax.plot(T, 1e3 * np.asarray(th["overlay"]["e_hull_eV"]), "--", color="#7a3e9d",
+                label="+ anharmonic overlay")
+    ax.axvline(th["operating_T_K"], color="k", lw=0.6, ls=":")
+    lo, hi = min(e.min(), -20), max(e.max(), 1e3 * g.hull_fail_eV * 1.3)
+    ax.set_ylim(lo * 1.1 if lo < 0 else lo, hi)
+    ax.legend(frameon=False, fontsize=8)
+
+
+def _elastic(ax, report: dict) -> None:
+    m = report.get("mechanical") or {}
+    ax.set_title("Stiffness matrix C (GPa)", loc="left", fontsize=10)
+    if not m.get("available"):
+        ax.axis("off")
+        ax.text(0.5, 0.5, "not computed", ha="center", transform=ax.transAxes)
+        return
+    C = np.array(m["C_GPa"])
+    ax.imshow(C, cmap="RdBu_r", vmin=-abs(C).max(), vmax=abs(C).max())
+    for i in range(6):
+        for j in range(6):
+            ax.text(j, i, f"{C[i, j]:.0f}", ha="center", va="center", fontsize=7)
+    ax.set_xticks(range(6), list("123456"))
+    ax.set_yticks(range(6), list("123456"))
+    ax.set_xlabel(f"B={m['bulk_GPa']:.0f}  G={m['shear_GPa']:.0f}  "
+                  f"min eig={m['min_eigenvalue_GPa']:.0f} GPa", fontsize=8)
+
+
+def plot_stability_report(report: dict, save_path: str | None = None) -> plt.Figure:
+    fig, axes = plt.subplots(2, 2, figsize=(11.5, 8), constrained_layout=True)
+    _scorecard(axes[0, 0], report)
+    _elastic(axes[0, 1], report)
+    _vdos(axes[1, 0], report)
+    _hull(axes[1, 1], report)
     if save_path:
-        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"  Figure → {save_path}")
-
-    if show:
-        plt.show()
-
+        fig.savefig(save_path, dpi=150)
     return fig
-
-
-# ---------------------------------------------------------------------------
-# Individual panels
-# ---------------------------------------------------------------------------
-
-def _panel_vdos(ax: plt.Axes, vib: dict) -> None:
-    st  = vib.get("status", config.STATUS_MISSING)
-    col = _COL.get(st, _COL["missing"])
-    ax.set_title(
-        f"Vibrational VDOS  {_MARKER.get(st, '—')}",
-        fontsize=10, fontweight="bold", color=col,
-    )
-    if vib.get("available") and vib.get("omega_mev") is not None:
-        om = np.array(vib["omega_mev"])
-        g  = np.array(vib["vdos"])
-        ax.plot(om, g, color=_COL["blue"], lw=1.4, label="VDOS")
-        win = config.VIB_ZERO_WINDOW_MEV
-        ax.axvspan(-win, win, color=_COL["light_r"], alpha=0.55,
-                   label=f"Soft-mode window\n|ω| < {win:.1f} meV")
-        ax.axvline(0.0, color="k", lw=0.7, ls="--")
-        ax.set_xlabel("ω (meV)", fontsize=9)
-        ax.set_ylabel("VDOS (normalised)", fontsize=9)
-        ax.set_xlim(om.min(), om.max())
-        ax.set_ylim(bottom=0)
-        n_src = vib.get("n_sources", 1)
-        ax.legend(fontsize=7, loc="upper right",
-                  title=f"Averaged over {n_src} MD run(s)", title_fontsize=6)
-    else:
-        ax.text(0.5, 0.5, "No VDOS data available",
-                transform=ax.transAxes, ha="center", va="center",
-                color=_COL["missing"])
-        ax.set_axis_off()
-    ax.grid(True, alpha=0.3, lw=0.5)
-
-
-def _panel_hull(ax: plt.Axes, therm: dict) -> None:
-    st  = therm.get("status", config.STATUS_MISSING)
-    col = _COL.get(st, _COL["missing"])
-    ax.set_title(
-        f"Thermodynamic stability  {_MARKER.get(st, '—')}",
-        fontsize=10, fontweight="bold", color=col,
-    )
-    if not therm.get("available") or not therm.get("hull_results"):
-        ax.text(0.5, 0.5, "No hull data available",
-                transform=ax.transAxes, ha="center", va="center",
-                color=_COL["missing"])
-        ax.set_axis_off()
-        return
-
-    valid = [(r["T"], r["e_above_hull_eV_atom"])
-             for r in therm["hull_results"]
-             if r.get("e_above_hull_eV_atom") is not None]
-    if not valid:
-        ax.text(0.5, 0.5, "Insufficient hull data",
-                transform=ax.transAxes, ha="center", va="center",
-                color=_COL["missing"])
-        return
-
-    T_arr = np.array([v[0] for v in valid])
-    E_meV = np.array([v[1] for v in valid]) * 1000
-
-    ax.fill_between(T_arr, -200, 0,
-                    color=_COL["light_g"], alpha=0.5, zorder=0, label="Stable")
-    ax.fill_between(T_arr, 0, config.THERMO_HULL_WARN_EV * 1000,
-                    color=_COL["light_y"], alpha=0.5, zorder=0, label="Metastable")
-    ax.fill_between(T_arr, config.THERMO_HULL_WARN_EV * 1000, 600,
-                    color=_COL["light_r"], alpha=0.35, zorder=0, label="Unstable")
-
-    ax.axhline(0, color=_COL["ok"],   lw=1.0, ls="--", zorder=1)
-    ax.axhline(config.THERMO_HULL_WARN_EV * 1000,
-               color=_COL["warn"], lw=1.0, ls="--", zorder=1)
-    ax.plot(T_arr, E_meV, color=_COL["blue"], lw=1.5, zorder=3)
-
-    op_T = therm.get("operating_T_K", 1200.0)
-    e_op = therm.get("e_above_hull_at_T_eV")
-    if e_op is not None:
-        ax.axvline(op_T, color="grey", lw=1.0, ls=":", zorder=2)
-        ax.annotate(
-            f"{op_T:.0f} K\n{e_op * 1000:+.1f} meV/at",
-            xy=(op_T, e_op * 1000),
-            xytext=(op_T * 1.04, e_op * 1000),
-            fontsize=7, color=col,
-            arrowprops=dict(arrowstyle="->", color=col, lw=0.8),
-        )
-
-    ymax = max(abs(E_meV).max() * 1.15, config.THERMO_HULL_WARN_EV * 1200)
-    ax.set_xlim(T_arr.min(), T_arr.max())
-    ax.set_ylim(min(E_meV.min() - 20, -30), ymax)
-    ax.set_xlabel(
-        f"Temperature (K)  [{therm.get('n_competing', 0)} competing phases]",
-        fontsize=9,
-    )
-    ax.set_ylabel("E above hull (meV/atom)", fontsize=9)
-    ax.legend(fontsize=7, loc="upper right")
-    ax.grid(True, alpha=0.3, lw=0.5)
-
-
-def _panel_scorecard(
-        ax: plt.Axes,
-        mech: dict, vib: dict, therm: dict,
-        material: str, symmetry: str,
-) -> None:
-    ax.set_axis_off()
-
-    criteria = [
-        ("1. Mechanical",    mech),
-        ("2. Vibrational",   vib),
-        ("3. Thermodynamic", therm),
-    ]
-    statuses = [c.get("status", config.STATUS_MISSING) for _, c in criteria]
-    if config.STATUS_FAIL in statuses:
-        overall, ov_col = "UNSTABLE", _COL["fail"]
-    elif config.STATUS_WARN in statuses or config.STATUS_MISSING in statuses:
-        overall, ov_col = "NEEDS ATTENTION", _COL["warn"]
-    else:
-        overall, ov_col = "STABLE", _COL["ok"]
-
-    ax.text(0.5, 0.97, f"{material} / {symmetry}",
-            transform=ax.transAxes, ha="center", va="top",
-            fontsize=11, fontweight="bold")
-    ax.text(0.5, 0.88, overall,
-            transform=ax.transAxes, ha="center", va="top",
-            fontsize=13, fontweight="bold", color=ov_col,
-            bbox=dict(boxstyle="round,pad=0.4", fc="white",
-                      ec=ov_col, linewidth=2))
-
-    row_y = 0.72
-    for label, c in criteria:
-        st  = c.get("status", config.STATUS_MISSING)
-        mk  = _MARKER.get(st, "—")
-        col = _COL.get(st, _COL["missing"])
-        msg = c.get("message", "No data.")[:80]
-        ax.text(0.04, row_y, f"{mk}  {label}",
-                transform=ax.transAxes, ha="left", va="top",
-                fontsize=9, fontweight="bold", color=col)
-        ax.text(0.08, row_y - 0.09, msg,
-                transform=ax.transAxes, ha="left", va="top",
-                fontsize=7.5, color="#333333")
-        row_y -= 0.23
-
-    ax.text(0.04, row_y - 0.02, "Thresholds:",
-            transform=ax.transAxes, ha="left", va="top",
-            fontsize=7, color="#666666", style="italic")
-    thresh_lines = [
-        f"  Born:  all C eigenvalues > {config.MECH_BORN_EIGENVALUE_FAIL_GPa:.0f} GPa",
-        f"  B:     warn < {config.MECH_BULK_WARN_GPa:.0f} GPa,  fail < {config.MECH_BULK_FAIL_GPa:.0f} GPa",
-        f"  VDOS@0: warn > {config.VIB_ZERO_FRAC_WARN * 100:.0f}%,  fail > {config.VIB_ZERO_FRAC_FAIL * 100:.0f}%  (|ω|<{config.VIB_ZERO_WINDOW_MEV:.1f} meV)",
-        f"  Hull:  warn > {config.THERMO_HULL_WARN_EV * 1000:.0f} meV/atom at operating T",
-    ]
-    for i, line in enumerate(thresh_lines):
-        ax.text(0.04, row_y - 0.12 - i * 0.09, line,
-                transform=ax.transAxes, ha="left", va="top",
-                fontsize=6.5, color="#666666", family="monospace")

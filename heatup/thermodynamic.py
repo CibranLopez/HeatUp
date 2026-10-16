@@ -1,770 +1,297 @@
 """heatup.thermodynamic
 ========================
-Gate 3: Temperature-dependent thermodynamic stability via the convex hull.
+Gate 3 - temperature-dependent convex hull.
 
-This module:
+Workflow
+--------
+1. discover competing phases (:mod:`heatup.phases`);
+2. relax all of them (0 K, same calculator);
+3. **0 K pruning**: build the 0 K hull from the relaxed enthalpies and drop every
+   competitor more than ``hull.prune_window_eV`` above it - no phonon calculation
+   is spent on phases that cannot reach the hull (the dominant cost in v0.2);
+4. harmonic (or QHA) phonons for the survivors;
+5. G(T) for every phase with the *same* method (:mod:`heatup.free_energy`):
+   the target is **not** treated with a different method than its competitors
+   (v0.2 compared an anharmonic target with harmonic competitors, which makes
+   the hull distance depend on the method offset, not on chemistry);
+6. hull at every temperature; the target's *signed* distance to the hull of its
+   competitors (negative = stable with margin) at ``hull.operating_T``;
+7. optional anharmonic overlay: dF_anh(T) = F_VDOS(T) - F_HA(T) of the target is
+   added to its distance (an estimate, reported next to - never instead of - the
+   consistent number).
 
-1. **Discovers secondary phases** from up to four sources (in priority order):
-
-   a. **Materials Project API** — downloads all structures in the target
-      chemical space directly from MP.  Most reliable; requires an API key
-      (``config.MP_API_KEY`` or ``MP_API_KEY`` env var).
-
-   b. **Local simulation database** — scans ``database_root`` for structures
-      whose element set ⊆ target elements.
-
-   c. **Local candidates tree** — scans ``candidates_root`` for the same.
-
-   d. **PyXtal random generation** — for every sub-composition not already
-      covered, generates random crystal structures for all 230 ITA space
-      groups.  Provides systematic coverage when MP and local data are
-      incomplete, but is slow.
-
-   Which sources are active is controlled by ``config.COMPETING_PHASE_SOURCES``
-   (a list that can be freely reordered or trimmed).  Removing ``"mp-api"``
-   skips the download; removing ``"pyxtal"`` skips generation entirely.
-
-2. **Prepares competing phases** — ensures every phase has a MACE-relaxed
-   energy (``relaxation/energy.json``) and a harmonic phonon DOS
-   (``phonons/dos.json``), triggering the calculations if needed.
-
-3. **Computes F(T)** for all phases:
-
-   - **Target**: anharmonic F(T) from AIMD VACF/VDOS
-     (via :mod:`heatup.anharmonic_phonons`), with transparent fallback to
-     harmonic if no AIMD data are available.
-
-   - **Competing phases**: harmonic F(T) from their stored DOS.  This
-     asymmetric choice is intentional — competing phases rarely have AIMD
-     trajectories, and the harmonic approximation introduces a consistent
-     systematic offset that largely cancels in hull-distance differences.
-     If AIMD VDOS is available for a competing phase, anharmonic F(T) is
-     used automatically.
-
-4. **Builds the pymatgen convex hull** at each temperature in
-   ``config.HULL_TEMPERATURES`` and evaluates E_above_hull at ``operating_T``.
-
-Outputs::
-
-    <sym_dir>/stability/
-        stability_report.json   ← written by heatup.pipeline
-        secondary_phases.json   ← list of all competing phases used
-        hull_vs_T.json          ← hull results at every requested temperature
+Not included (documented limitations): gas-phase corrections for O2/N2/F2
+references, spin/orbital contributions beyond ``magnetic/moments.json``, and
+finite-size / charged defects.  See ``docs/AUDIT.md``.
 """
 
 from __future__ import annotations
 
-import json
+import logging
 import os
-import re
-import warnings
-from itertools import chain, combinations
 
 import numpy as np
 
-from heatup import config
+from heatup.config import (STATUS_FAIL, STATUS_MISSING, STATUS_OK, STATUS_WARN, cfg, forced)
+from heatup.free_energy import free_energy, reference_energy
+from heatup.paths import PhaseDir, write_json
+from heatup.phases import Phase, find_competing_phases, phase_from_dir
+
+log = logging.getLogger("heatup")
 
 
 # ---------------------------------------------------------------------------
-# Free-energy helpers
+# hull arithmetic (pure functions - unit tested analytically)
 # ---------------------------------------------------------------------------
 
-def _load_e0(sym_dir: str) -> float | None:
-    """Return the MLIP ground-state energy per atom (eV), or None."""
-    path = os.path.join(sym_dir, "relaxation", "energy.json")
-    if not os.path.exists(path):
-        return None
-    with open(path) as fh:
-        return float(json.load(fh)["energy_eV_per_atom"])
-
-
-def _load_harmonic_dos(sym_dir: str) -> tuple[np.ndarray, np.ndarray] | None:
-    """Load and normalise the harmonic phonon DOS from ``phonons/dos.json``."""
-    path = os.path.join(sym_dir, "phonons", "dos.json")
-    if not os.path.exists(path):
-        return None
-    with open(path) as fh:
-        d = json.load(fh)
-    en = np.array(d["energies_eV"], dtype=float)
-    wt = np.array(d["weights"],     dtype=float)
-    mask = en > config.OMEGA_MIN_MEV * config.MEV_TO_EV
-    en, wt = en[mask], wt[mask]
-    norm = np.trapezoid(wt, en)
-    if norm > 0:
-        wt /= norm
-    return en, wt
-
-
-def _harmonic_f_vib(en: np.ndarray, wt: np.ndarray, T: float) -> float:
-    """Harmonic vibrational Helmholtz free energy per atom (eV) at temperature T."""
-    if T <= 0.0:
-        return float(np.trapezoid(0.5 * wt * en, en))
-    kT = config.KB_EV * T
-    x  = en / (2.0 * kT)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        integrand = wt * np.log(2.0 * np.sinh(np.clip(x, 1e-12, 500.0)))
-    return float(kT * np.trapezoid(integrand, en))
-
-
-def _harmonic_free_energy(sym_dir: str, temperatures: list[float]) -> dict | None:
-    """Compute harmonic F(T) = E0 + F_vib(T).  Returns None if data absent."""
-    e0 = _load_e0(sym_dir)
-    if e0 is None:
-        return None
-    dos = _load_harmonic_dos(sym_dir)
-    if dos is None:
-        return None
-    en, wt = dos
-    return {
-        "E0_eV_per_atom" : e0,
-        "temperatures"   : temperatures,
-        "F_eV_per_atom"  : [e0 + _harmonic_f_vib(en, wt, T) for T in temperatures],
-    }
-
-
-def _anharmonic_free_energy(
-        sym_dir: str,
-        temperatures: list[float],
-        device: str,
-) -> dict | None:
-    """Compute anharmonic G(T) via the GibbsAssembler."""
-    from heatup.free_energy import build_default_assembler
-    asm    = build_default_assembler(phonon_mode="anharmonic", device=device)
-    result = asm.compute(sym_dir, temperatures)
-    return result if result.get("E0_eV_per_atom") is not None else None
-
-
-# ---------------------------------------------------------------------------
-# Structure parsing helpers
-# ---------------------------------------------------------------------------
-
-def _elements_of_poscar(poscar_path: str) -> frozenset[str]:
-    """Return element symbols present in a POSCAR, or empty frozenset."""
-    try:
-        from pymatgen.io.vasp import Poscar
-        s = Poscar.from_file(poscar_path).structure
-        return frozenset(str(sp) for sp in s.composition.elements)
-    except Exception:
-        return frozenset()
-
-
-def _formula_from_poscar(poscar_path: str) -> tuple[str, dict[str, float]]:
-    """Return ``(reduced_formula, {element: mole_fraction})`` for a POSCAR."""
-    from pymatgen.io.vasp import Poscar
-    s    = Poscar.from_file(poscar_path).structure
-    comp = s.composition
-    tot  = comp.num_atoms
-    fracs = {str(el): amt / tot for el, amt in comp.items()}
-    return comp.reduced_formula, fracs
-
-
-# ---------------------------------------------------------------------------
-# Secondary-phase discovery
-# ---------------------------------------------------------------------------
-
-def _discover_from_local(
-        target_sym_dir: str,
-        target_elements: frozenset[str],
-        roots: list[tuple[str, str]],
-) -> list[dict]:
-    """Scan local directory trees for competing phases.
-
-    Args:
-        target_sym_dir:   Target symmetry directory (excluded from results).
-        target_elements:  Element set of the target.
-        roots:            List of ``(root_path, source_label)`` pairs to scan.
-
-    Returns:
-        List of phase dicts with keys ``sym_dir``, ``poscar_path``,
-        ``formula``, ``composition``, ``elements``, ``source``.
-    """
-    target_abs = os.path.abspath(target_sym_dir)
-    phases: list[dict] = []
-    seen:   set[str]   = set()
-
-    for root, label in roots:
-        if not os.path.isdir(root):
-            continue
-        for mat in sorted(os.listdir(root)):
-            mat_dir = os.path.join(root, mat)
-            if not os.path.isdir(mat_dir):
-                continue
-            for sym in sorted(os.listdir(mat_dir)):
-                sd     = os.path.join(mat_dir, sym)
-                poscar = os.path.join(sd, "POSCAR")
-                if not os.path.exists(poscar):
-                    continue
-                abs_sd = os.path.abspath(sd)
-                if abs_sd == target_abs or abs_sd in seen:
-                    continue
-                els = _elements_of_poscar(poscar)
-                if not els or not els.issubset(target_elements):
-                    continue
-                try:
-                    formula, comp = _formula_from_poscar(poscar)
-                except Exception:
-                    continue
-                seen.add(abs_sd)
-                phases.append({
-                    "sym_dir"    : sd,
-                    "poscar_path": poscar,
-                    "formula"    : formula,
-                    "composition": comp,
-                    "elements"   : sorted(els),
-                    "source"     : label,
-                })
-    return phases
-
-
-def _discover_from_mp(
-        target_elements: frozenset[str],
-        candidates_root: str,
-        existing_sym_dirs: set[str],
-) -> list[dict]:
-    """Download competing phases from the Materials Project API.
-
-    Downloads all materials in the target chemical space (all sub-compositions)
-    that are not already present locally.  Structures are saved to
-    ``candidates_root/<formula>/<sg>/POSCAR`` for reuse.
-
-    Args:
-        target_elements:   Element set of the target phase.
-        candidates_root:   Root of the candidates POSCAR tree.
-        existing_sym_dirs: Absolute paths already discovered (to avoid duplicates).
-
-    Returns:
-        List of newly downloaded phase dicts.
-    """
-    api_key = config.MP_API_KEY.strip()
-    if not api_key:
-        print("  [mp-api] MP_API_KEY is not set — skipping Materials Project download.")
-        print("           Set it with: import heatup.config as cfg; "
-              "cfg.MP_API_KEY = 'YOUR_KEY'")
-        return []
-
-    try:
-        from mp_api.client import MPRester
-        from pymatgen.io.vasp import Poscar as PmgPoscar
-        from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
-    except ImportError as exc:
-        print(f"  [mp-api] mp_api or pymatgen not available ({exc}) — skipping MP download.")
-        return []
-
-    elements = sorted(target_elements)
-    print(f"  [mp-api] Querying Materials Project for elements {elements} ...")
-
-    phases: list[dict] = []
-    try:
-        with MPRester(api_key) as mpr:
-            # Fetch all materials whose element set ⊆ target_elements.
-            docs = mpr.materials.summary.search(
-                elements   = elements,
-                fields     = ["material_id", "formula_pretty", "structure",
-                              "energy_per_atom", "band_gap"],
-                all_fields = False,
-            )
-    except Exception as exc:
-        print(f"  [mp-api] MP query failed: {exc}")
-        return []
-
-    print(f"  [mp-api] Received {len(docs)} structures from MP.")
-    for doc in docs:
-        if not doc.structure:
-            continue
-        # Verify the element subset constraint (MP may return supersets).
-        doc_els = frozenset(str(el) for el in doc.structure.composition.elements)
-        if not doc_els.issubset(target_elements):
-            continue
-
-        try:
-            sga      = SpacegroupAnalyzer(doc.structure)
-            sg_sym   = sga.get_space_group_symbol()
-            formula  = doc.structure.composition.reduced_formula
-            fracs    = {str(el): doc.structure.composition[el] / doc.structure.composition.num_atoms
-                        for el in doc.structure.composition.elements}
-        except Exception:
-            continue
-
-        out_dir = os.path.join(candidates_root, formula, sg_sym)
-        abs_dir = os.path.abspath(out_dir)
-        if abs_dir in existing_sym_dirs:
-            continue
-
-        poscar_out = os.path.join(out_dir, "POSCAR")
-        if not os.path.exists(poscar_out):
-            os.makedirs(out_dir, exist_ok=True)
-            try:
-                PmgPoscar(doc.structure).write_file(poscar_out)
-                with open(os.path.join(out_dir, "metadata.json"), "w") as fh:
-                    json.dump({
-                        "material_id"    : str(doc.material_id),
-                        "formula"        : formula,
-                        "symmetry"       : sg_sym,
-                        "energy_per_atom": doc.energy_per_atom,
-                        "band_gap"       : doc.band_gap,
-                        "source"         : "mp-api",
-                    }, fh, indent=2)
-            except Exception as exc:
-                import shutil
-                shutil.rmtree(out_dir, ignore_errors=True)
-                continue
-
-        existing_sym_dirs.add(abs_dir)
-        phases.append({
-            "sym_dir"    : out_dir,
-            "poscar_path": poscar_out,
-            "formula"    : formula,
-            "composition": fracs,
-            "elements"   : sorted(doc_els),
-            "source"     : "mp-api",
-        })
-
-    print(f"  [mp-api] Added {len(phases)} new structure(s).")
-    return phases
-
-
-def _powerset(iterable):
-    s = list(iterable)
-    return chain.from_iterable(combinations(s, r) for r in range(1, len(s)))
-
-
-def _discover_from_pyxtal(
-        target_elements: frozenset[str],
-        candidates_root: str,
-        existing_keys: set[tuple[str, str]],
-) -> list[dict]:
-    """Generate missing secondary-phase structures with PyXtal.
-
-    For every sub-composition of the target element set and for every ITA
-    space group 1–230, generates a random crystal if no POSCAR already exists.
-    This provides systematic coverage without requiring any experimental or
-    database knowledge of the stoichiometry.
-
-    This replaces the former ``stoichiometry_hints.json`` mechanism: instead
-    of manually listing non-trivial stoichiometries, all sub-compositions
-    are enumerated automatically from the element set.
-
-    Args:
-        target_elements:  Element set of the target phase.
-        candidates_root:  Root of the candidates POSCAR tree.
-        existing_keys:    Set of ``(reduced_formula, sg_symbol)`` pairs already
-                          present (avoids overwriting existing structures).
-
-    Returns:
-        List of newly generated phase dicts.
-    """
-    try:
-        from pyxtal import pyxtal
-        from pymatgen.io.vasp import Poscar as PmgPoscar
-        from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
-        from pymatgen.symmetry.groups import SpaceGroup
-    except ImportError as exc:
-        print(f"  [pyxtal] PyXtal not available ({exc}) — skipping generation.")
-        return []
-
-    # Build sg number → symbol table.
-    sg_num2name = {}
-    for n in range(1, 231):
-        try:
-            sg_num2name[n] = SpaceGroup.from_int_number(n).symbol
-        except Exception:
-            sg_num2name[n] = f"SG{n}"
-
-    struc     = pyxtal()
-    generated: list[dict] = []
-    elements  = sorted(target_elements)
-
-    for el_subset in _powerset(elements):
-        atoms = list(el_subset)
-        n     = len(atoms)
-
-        for sg_num in range(1, 231):
-            sg_name = sg_num2name[sg_num]
-            gen_struc = None
-
-            for mult in range(1, config.PYXTAL_MAX_ATOMS // max(n, 1) + 1):
-                ions = [mult] * n
-                for _ in range(config.PYXTAL_MAX_ATTEMPTS):
-                    try:
-                        struc.from_random(3, sg_num, atoms, ions)
-                        if struc.valid:
-                            gen_struc = struc
-                            break
-                    except Exception:
-                        pass
-                if gen_struc is not None:
-                    break
-
-            if gen_struc is None:
-                continue
-
-            try:
-                pmg_s   = gen_struc.to_pymatgen()
-                actual_sg = SpacegroupAnalyzer(pmg_s).get_space_group_symbol()
-                formula   = pmg_s.composition.reduced_formula
-                fracs     = {str(el): pmg_s.composition[el] / pmg_s.composition.num_atoms
-                             for el in pmg_s.composition.elements}
-            except Exception:
-                actual_sg = sg_name
-                formula   = "".join(f"{el}{1}" if 1 == 1 else el for el in atoms)
-                fracs     = {el: 1.0 / n for el in atoms}
-
-            if (formula, actual_sg) in existing_keys:
-                continue
-
-            out_dir    = os.path.join(candidates_root, formula, actual_sg)
-            poscar_out = os.path.join(out_dir, "POSCAR")
-            if os.path.exists(poscar_out):
-                existing_keys.add((formula, actual_sg))
-                continue
-
-            os.makedirs(out_dir, exist_ok=True)
-            try:
-                PmgPoscar(pmg_s).write_file(poscar_out)
-                with open(os.path.join(out_dir, "metadata.json"), "w") as fh:
-                    json.dump({"material_id": "pyxtal-generated", "formula": formula,
-                               "symmetry": actual_sg, "energy_per_atom": None,
-                               "band_gap": None, "source": "pyxtal"}, fh, indent=2)
-                existing_keys.add((formula, actual_sg))
-                generated.append({
-                    "sym_dir"    : out_dir,
-                    "poscar_path": poscar_out,
-                    "formula"    : formula,
-                    "composition": fracs,
-                    "elements"   : sorted(frozenset(atoms)),
-                    "source"     : "pyxtal",
-                })
-            except Exception:
-                import shutil
-                shutil.rmtree(out_dir, ignore_errors=True)
-
-    print(f"  [pyxtal] Generated {len(generated)} new structure(s).")
-    return generated
-
-
-def find_secondary_phases(
-        target_sym_dir: str,
-        candidates_root: str = config.CANDIDATES_ROOT,
-        database_root: str = config.DATABASE_ROOT,
-) -> list[dict]:
-    """Discover all competing phases for the target material.
-
-    Combines results from the sources listed in ``config.COMPETING_PHASE_SOURCES``
-    (default: ``["mp-api", "database", "candidates", "pyxtal"]``).  Each source
-    is checked in order; the combined, de-duplicated list is returned.
-
-    Removing a source from ``config.COMPETING_PHASE_SOURCES`` disables it
-    entirely without code changes.
-
-    Args:
-        target_sym_dir:  Path to the target symmetry directory.
-        candidates_root: Root of the candidate POSCAR tree.
-        database_root:   Root of the simulation database.
-
-    Returns:
-        De-duplicated list of phase dicts with keys ``sym_dir``,
-        ``poscar_path``, ``formula``, ``composition``, ``elements``, ``source``.
-    """
-    target_poscar   = os.path.join(target_sym_dir, "POSCAR")
-    target_elements = _elements_of_poscar(target_poscar)
-    if not target_elements:
-        return []
-
-    sources = config.COMPETING_PHASE_SOURCES
-    all_phases: list[dict] = []
-
-    # --- Local sources first (fast, no network) ---
-    local_roots = []
-    if "database"   in sources:
-        local_roots.append((database_root,   "database"))
-    if "candidates" in sources:
-        local_roots.append((candidates_root, "candidates"))
-
-    local = _discover_from_local(target_sym_dir, target_elements, local_roots)
-    all_phases.extend(local)
-
-    # Track absolute dirs and (formula, sg) keys for de-duplication.
-    seen_dirs = {os.path.abspath(target_sym_dir)} | {os.path.abspath(p["sym_dir"]) for p in local}
-    seen_keys = {(p["formula"], os.path.basename(p["sym_dir"])) for p in local}
-
-    # --- Materials Project API ---
-    if "mp-api" in sources:
-        mp_phases = _discover_from_mp(target_elements, candidates_root, seen_dirs)
-        for ph in mp_phases:
-            key = (ph["formula"], os.path.basename(ph["sym_dir"]))
-            if key not in seen_keys:
-                all_phases.append(ph)
-                seen_keys.add(key)
-
-    # --- PyXtal random generation ---
-    if "pyxtal" in sources:
-        pyxtal_phases = _discover_from_pyxtal(target_elements, candidates_root, seen_keys)
-        all_phases.extend(pyxtal_phases)
-
-    return all_phases
-
-
-# ---------------------------------------------------------------------------
-# Phase preparation (relaxation + phonons)
-# ---------------------------------------------------------------------------
-
-def _ensure_phase_prepared(ph: dict, device: str) -> bool:
-    """Ensure a competing phase has ``relaxation/energy.json`` + ``phonons/dos.json``.
-
-    Triggers CUDA-isolated subprocess runs if either file is missing.
-
-    Args:
-        ph:     Phase dict with key ``"sym_dir"``.
-        device: Compute device string.
-
-    Returns:
-        ``True`` if both files exist after preparation attempts.
-    """
-    from heatup.structure_pipeline import run_relaxation_subprocess, run_phonons_subprocess
-
-    sd = ph["sym_dir"]
-    if not os.path.exists(os.path.join(sd, "relaxation", "energy.json")):
-        run_relaxation_subprocess(sd, device=device)
-    if not os.path.exists(os.path.join(sd, "phonons", "dos.json")):
-        run_phonons_subprocess(sd, device=device)
-
-    return (
-        os.path.exists(os.path.join(sd, "relaxation", "energy.json"))
-        and os.path.exists(os.path.join(sd, "phonons", "dos.json"))
-    )
-
-
-# ---------------------------------------------------------------------------
-# Convex hull
-# ---------------------------------------------------------------------------
-
-def _build_hull_at_T(
-        target_phase: dict,
-        competing_phases: list[dict],
-        free_energies: dict[str, dict],
-        T: float,
-) -> dict:
-    """Build the pymatgen convex hull at a single temperature T.
-
-    Args:
-        target_phase:     Phase dict for the target material.
-        competing_phases: List of phase dicts for competitors.
-        free_energies:    Mapping from ``sym_dir`` → free-energy dict.
-        T:                Temperature in Kelvin.
-
-    Returns:
-        Dict with keys ``T``, ``e_above_hull_eV_atom``, ``stable``,
-        ``hull_phases``, ``n_entries``.
-    """
+def _entry(comp: dict, e_per_atom: float, name: str):
+    from pymatgen.analysis.phase_diagram import PDEntry
     from pymatgen.core import Composition
-    from pymatgen.analysis.phase_diagram import PDEntry, PhaseDiagram
-
-    entries = []
-    for ph in competing_phases:
-        fe = free_energies.get(ph["sym_dir"])
-        if fe is None:
-            continue
-        F_at_T = float(np.interp(T, fe["temperatures"], fe["F_eV_per_atom"]))
-        comp   = Composition(ph["formula"])
-        entries.append(PDEntry(comp, F_at_T * comp.num_atoms, name=ph["formula"]))
-
-    if not entries:
-        return {"T": T, "e_above_hull_eV_atom": None, "stable": None}
-
-    try:
-        pd      = PhaseDiagram(entries)
-        tgt_fe  = free_energies[target_phase["sym_dir"]]
-        F_tgt   = float(np.interp(T, tgt_fe["temperatures"], tgt_fe["F_eV_per_atom"]))
-        tgt_comp = Composition(target_phase["formula"])
-        tgt_entry = PDEntry(tgt_comp, F_tgt * tgt_comp.num_atoms, name="TARGET")
-        e_hull  = pd.get_e_above_hull(tgt_entry)
-        return {
-            "T"                    : T,
-            "e_above_hull_eV_atom" : float(e_hull),
-            "stable"               : bool(e_hull < 1e-4),
-            "hull_phases"          : [e.name for e in pd.stable_entries],
-            "n_entries"            : len(entries),
-        }
-    except Exception as exc:
-        return {"T": T, "e_above_hull_eV_atom": None, "stable": None,
-                "error": str(exc)}
+    return PDEntry(Composition(comp), float(e_per_atom), name=name)   # fractions sum to 1 -> E per atom
 
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
+def has_element_references(elements, comps) -> list[str]:
+    """Elements for which no pure-element competitor exists (hull would be undefined)."""
+    pure = {next(iter(c)) for c in comps if len(c) == 1}
+    return sorted(set(elements) - pure)
 
-def assess_thermodynamic_stability(
-        sym_dir: str,
-        operating_T: float,
-        candidates_root: str = config.CANDIDATES_ROOT,
-        database_root: str = config.DATABASE_ROOT,
-        temperatures: list[float] | None = None,
-        device: str = config.DEFAULT_DEVICE,
-        generate_missing: bool = True,
-) -> dict:
-    """Build the T-dependent convex hull and assess stability at *operating_T*.
 
-    Steps:
-    1. Discover secondary phases from all enabled sources
-       (``config.COMPETING_PHASE_SOURCES``).
-    2. Prepare each competitor (relaxation + harmonic phonons).
-    3. Compute F(T) for the target (anharmonic) and all competitors (harmonic,
-       or anharmonic if VDOS is available).
-    4. Build the convex hull at every temperature in *temperatures*.
-    5. Evaluate E_above_hull at *operating_T*.
+def hull_distance(target_comp: dict, target_G: float, competitors: dict) -> dict:
+    """Signed distance (eV/atom) of the target above the hull of *competitors*.
 
-    Args:
-        sym_dir:          Target symmetry directory.
-        operating_T:      Temperature (K) at which to evaluate the hull.
-        candidates_root:  Root of the candidates tree.
-        database_root:    Root of the simulation database.
-        temperatures:     Temperature grid (K).  Defaults to
-                          ``config.HULL_TEMPERATURES``.
-        device:           Compute device for MACE if calculations are needed.
-        generate_missing: If True, enable PyXtal and MP-API phase generation
-                          (as permitted by ``config.COMPETING_PHASE_SOURCES``).
-
-    Returns:
-        Dict with keys ``available``, ``e_above_hull_at_T_eV``,
-        ``operating_T_K``, ``hull_results``, ``n_competing``,
-        ``n_generated``, ``status``, ``message``.
+    ``competitors``: ``{name: (composition_fractions, G_per_atom)}``.
+    Negative => the target lies below the competitors' hull (stable by that margin).
     """
-    if temperatures is None:
-        temperatures = [float(t) for t in config.HULL_TEMPERATURES]
+    from pymatgen.analysis.phase_diagram import PhaseDiagram
+    missing = has_element_references(target_comp, [c for c, _ in competitors.values()])
+    if missing:
+        raise ValueError(f"no elemental reference for {missing}: add the pure elements to the competitors")
+    entries = [_entry(c, g, n) for n, (c, g) in competitors.items()]
+    pd = PhaseDiagram(entries)
+    t = _entry(target_comp, target_G, "TARGET")
+    decomp, e = pd.get_decomp_and_e_above_hull(t, allow_negative=True)
+    return {"e_hull_eV": float(e),
+            "decomposition": {k.name: float(v) for k, v in decomp.items()} if decomp else {},
+            "stable_phases": sorted(x.name for x in pd.stable_entries)}
 
-    target_poscar = os.path.join(sym_dir, "POSCAR")
-    if not os.path.exists(target_poscar):
-        return {"available": False, "status": config.STATUS_MISSING,
-                "message": "Target POSCAR not found."}
-    try:
-        tgt_formula, tgt_comp = _formula_from_poscar(target_poscar)
-    except Exception as exc:
-        return {"available": False, "status": config.STATUS_MISSING,
-                "message": f"Cannot read target POSCAR: {exc}"}
 
-    if _load_e0(sym_dir) is None:
-        return {"available": False, "status": config.STATUS_MISSING,
-                "message": "relaxation/energy.json missing — run relaxation first."}
+def hull_scan(target_comp: dict, target_G: np.ndarray, competitors: dict) -> dict:
+    """:func:`hull_distance` at every temperature. ``competitors[name] = (comp, G(T) array)``."""
+    n = len(target_G)
+    e = np.zeros(n)
+    dec: list[dict] = []
+    stable: list[list[str]] = []
+    for i in range(n):
+        r = hull_distance(target_comp, float(target_G[i]),
+                          {k: (c, float(g[i])) for k, (c, g) in competitors.items()})
+        e[i] = r["e_hull_eV"]
+        dec.append(r["decomposition"])
+        stable.append(r["stable_phases"])
+    return {"e_hull_eV": e, "decomposition": dec, "stable_phases": stable}
 
-    target_elements = _elements_of_poscar(target_poscar)
-    target_phase = {
-        "sym_dir"    : sym_dir,
-        "poscar_path": target_poscar,
-        "formula"    : tgt_formula,
-        "composition": tgt_comp,
-        "elements"   : sorted(target_elements),
-        "source"     : "target",
-    }
 
-    # ── Discover competing phases ─────────────────────────────────────────
-    print(f"    Scanning competing phases (elements ⊆ {set(target_phase['elements'])}) ...")
+# ---------------------------------------------------------------------------
+# 0 K pre-screen
+# ---------------------------------------------------------------------------
 
-    # Temporarily restrict sources if generate_missing=False.
-    _orig_sources = config.COMPETING_PHASE_SOURCES
-    if not generate_missing:
-        config.COMPETING_PHASE_SOURCES = [s for s in _orig_sources
-                                          if s not in ("mp-api", "pyxtal")]
-    try:
-        competing = find_secondary_phases(sym_dir, candidates_root, database_root)
-    finally:
-        config.COMPETING_PHASE_SOURCES = _orig_sources
+def zero_k_screen(target: Phase, competitors: list[Phase]) -> dict:
+    """0 K enthalpy hull of target + competitors -> distance of each competitor (>= 0)."""
+    from pymatgen.analysis.phase_diagram import PhaseDiagram
+    ent = []
+    ref = {}
+    for p in [target] + competitors:
+        h0 = reference_energy(p.phase_dir)
+        if h0 is None:
+            continue
+        ref[p.tag] = h0
+        ent.append(_entry(p.composition, h0, p.tag))
+    pd = PhaseDiagram(ent)
+    dist = {e.name: float(pd.get_e_above_hull(e, allow_negative=True)) for e in ent}
+    return {"e_above_hull_0K": dist, "H0": ref}
 
-    n_generated = sum(1 for p in competing if p["source"] in ("pyxtal", "mp-api"))
-    print(f"    Found {len(competing)} competing phase(s) "
-          f"({n_generated} newly added).")
 
-    # Persist secondary-phases list.
-    stab_dir = os.path.join(sym_dir, "stability")
-    os.makedirs(stab_dir, exist_ok=True)
-    with open(os.path.join(stab_dir, "secondary_phases.json"), "w") as fh:
-        json.dump(
-            [{k: v for k, v in ph.items() if k != "composition"} for ph in competing],
-            fh, indent=4,
-        )
+# ---------------------------------------------------------------------------
+# main entry
+# ---------------------------------------------------------------------------
 
-    # ── Prepare competing phases ──────────────────────────────────────────
-    print(f"    Preparing {len(competing)} competing phase(s) ...")
-    usable = [ph for ph in competing if _ensure_phase_prepared(ph, device)]
-    print(f"    {len(usable)} phase(s) ready for hull.")
+def _prepare(phases: list[Phase], step: str, device: str | None, force: bool | None = None) -> list[Phase]:
+    from heatup.runtime import run_step
+    ok = []
+    for p in phases:
+        if step == "relax" and p.phase_dir.has_relaxation() and not forced("relax", force):
+            ok.append(p)
+            continue
+        if run_step(step, p.phase_dir, device=device, force=force):
+            ok.append(p)
+        else:
+            log.warning("%s: %s failed - phase dropped from the hull", p.tag, step)
+    return ok
 
-    # ── Compute F(T) ─────────────────────────────────────────────────────
-    free_energies: dict[str, dict] = {}
 
-    # Target — anharmonic (with harmonic fallback).
-    tgt_fe = _anharmonic_free_energy(sym_dir, temperatures, device)
-    if tgt_fe is None:
-        return {"available": False, "status": config.STATUS_MISSING,
-                "message": "Cannot compute free energy for target."}
-    free_energies[sym_dir] = tgt_fe
+def assess_thermodynamic_stability(target_dir, operating_T: float | None = None,
+                                   device: str | None = None, prepare: bool = True,
+                                   force: bool | None = None, mp_docs: list | None = None) -> dict:
+    target_dir = PhaseDir.of(target_dir)
+    hc = cfg.hull
+    T = np.asarray(hc.temperatures, float)
+    op = float(hc.operating_T if operating_T is None else operating_T)
+    if not (T.min() <= op <= T.max()):
+        return {"available": False, "status": STATUS_MISSING,
+                "message": f"operating T = {op:g} K outside the hull grid [{T.min():g}, {T.max():g}] K"}
+    target = phase_from_dir(target_dir, "target")
+    if target is None or not target_dir.has_relaxation():
+        return {"available": False, "status": STATUS_MISSING,
+                "message": "target has no converged relaxation (run step 'relax')."}
 
-    # Competitors — upgrade to anharmonic if VDOS is cached.
-    for ph in usable:
-        aimd_d   = os.path.join(ph["sym_dir"], "aimd")
-        has_vdos = (
-            os.path.isdir(aimd_d) and any(
-                os.path.exists(os.path.join(aimd_d, tf, "anharmonic_phonons", "vdos.json"))
-                for tf in os.listdir(aimd_d) if tf.endswith("K")
-            )
-        )
-        fe = (_anharmonic_free_energy(ph["sym_dir"], temperatures, device)
-              if has_vdos
-              else _harmonic_free_energy(ph["sym_dir"], temperatures))
-        if fe is not None:
-            free_energies[ph["sym_dir"]] = fe
-            src = "anharmonic" if has_vdos else "harmonic"
-            print(f"      [{src}] {ph['formula']} ({os.path.basename(ph['sym_dir'])})")
+    stab = target_dir.stability_dir
+    os.makedirs(stab, exist_ok=True)
+    flags: list[str] = []
+    method = hc.phonon_method.upper()
 
-    # ── Build hull ────────────────────────────────────────────────────────
-    print(f"    Building convex hull at {len(temperatures)} temperatures ...")
-    hull_results = [
-        _build_hull_at_T(target_phase, usable, free_energies, T)
-        for T in temperatures
-    ]
-
-    with open(os.path.join(stab_dir, "hull_vs_T.json"), "w") as fh:
-        json.dump({
-            "target"          : {k: v for k, v in target_phase.items()
-                                 if k != "composition"},
-            "competing_phases": [{k: v for k, v in ph.items() if k != "composition"}
-                                 for ph in usable],
-            "temperatures"    : temperatures,
-            "hull_results"    : hull_results,
-        }, fh, indent=4)
-
-    # ── Evaluate at operating_T ───────────────────────────────────────────
-    valid = [(r["T"], r["e_above_hull_eV_atom"]) for r in hull_results
-             if r.get("e_above_hull_eV_atom") is not None]
-    e_at_T = None
-    if valid:
-        Ts_arr = np.array([v[0] for v in valid])
-        Es_arr = np.array([v[1] for v in valid])
-        e_at_T = float(np.interp(operating_T, Ts_arr, Es_arr))
-
-    if e_at_T is None:
-        status  = config.STATUS_MISSING
-        message = "Could not evaluate hull (insufficient competing phases)."
-    elif e_at_T > config.THERMO_HULL_WARN_EV:
-        status  = config.STATUS_FAIL
-        message = (f"E_above_hull = {e_at_T * 1000:.1f} meV/atom at {operating_T:.0f} K "
-                   f"(threshold {config.THERMO_HULL_WARN_EV * 1000:.0f} meV/atom) — unstable.")
-    elif e_at_T > config.THERMO_HULL_STABLE_EV + 1e-4:
-        status  = config.STATUS_WARN
-        message = (f"E_above_hull = {e_at_T * 1000:.1f} meV/atom at {operating_T:.0f} K "
-                   f"— metastable.")
+    # 1-2. discover + relax
+    competitors = find_competing_phases(target_dir, mp_docs)
+    log.info("%d competing phase(s) found", len(competitors))
+    if prepare:
+        competitors = _prepare(competitors, "relax", device, force)
     else:
-        status  = config.STATUS_OK
-        message = (f"On the convex hull at {operating_T:.0f} K "
-                   f"(E_above_hull = {e_at_T * 1000:.1f} meV/atom).")
+        competitors = [p for p in competitors if p.phase_dir.has_relaxation()]
 
-    return {
-        "available"            : True,
-        "e_above_hull_at_T_eV" : e_at_T,
-        "operating_T_K"        : operating_T,
-        "hull_results"         : hull_results,
-        "n_competing"          : len(usable),
-        "n_generated"          : n_generated,
-        "status"               : status,
-        "message"              : message,
-    }
+    # 3. 0 K pruning
+    try:
+        z = zero_k_screen(target, competitors)
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "status": STATUS_MISSING,
+                "message": f"0 K hull could not be built: {exc}"}
+    keep, dropped = [], []
+    for p in competitors:
+        d = z["e_above_hull_0K"].get(p.tag)
+        (keep if d is not None and d <= hc.prune_window_eV else dropped).append(p)
+    log.info("0 K pruning (> %.0f meV): %d kept, %d dropped", 1e3 * hc.prune_window_eV,
+             len(keep), len(dropped))
+    write_json(os.path.join(stab, "zero_K_hull.json"), {
+        "prune_window_eV": hc.prune_window_eV, "e_above_hull_0K": z["e_above_hull_0K"],
+        "kept": [p.tag for p in keep], "dropped": [p.tag for p in dropped]})
+
+    # 4. phonons
+    if prepare:
+        if method in ("HA", "QHA"):
+            keep = _prepare(keep, "phonons", device, force)
+            if method == "QHA":
+                keep = _prepare(keep, "qha", device, force)
+            tgt_ok = _prepare([target], "phonons", device, force) and (
+                method != "QHA" or _prepare([target], "qha", device, force))
+            if not tgt_ok:
+                return {"available": False, "status": STATUS_MISSING,
+                        "message": "target phonons failed."}
+
+    # 5. G(T) for everyone, same method
+    gt = free_energy(target_dir, T, method)
+    if not gt.get("available"):
+        return {"available": False, "status": STATUS_MISSING,
+                "message": f"target free energy unavailable: {gt.get('message')}"}
+    flags += [f"target: {f}" for f in gt["flags"]]
+    comps: dict[str, tuple[dict, np.ndarray]] = {}
+    labels: dict[str, str] = {}
+    for p in keep:
+        g = free_energy(p.phase_dir, T, method)
+        if not g.get("available"):
+            flags.append(f"{p.tag}: {g.get('message')} - dropped")
+            continue
+        flags += [f"{p.tag}: {f}" for f in g["flags"]]
+        comps[p.tag] = (p.composition, g["G_eV_per_atom"])
+        labels[p.tag] = (p.phase_dir.energy() or {}).get("calculator", "?")
+    tlabel = (target_dir.energy() or {}).get("calculator", "?")
+    mism = sorted({v for v in labels.values() if v != tlabel})
+    if mism:
+        flags.append(f"energy-scale mismatch: target {tlabel} vs competitors {mism} "
+                     "- hull distances are not comparable across calculators")
+
+    # 6. hull
+    try:
+        scan = hull_scan(target.composition, gt["G_eV_per_atom"], comps)
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "status": STATUS_MISSING,
+                "message": f"hull could not be built: {exc}", "flags": flags}
+    e_T = float(np.interp(op, T, scan["e_hull_eV"]))
+    i_op = int(np.argmin(np.abs(T - op)))
+    decomp = scan["decomposition"][i_op]
+
+    # 7. anharmonic overlay for the target
+    overlay = None
+    if hc.target_overlay.upper() == "VDOS" and method != "VDOS":
+        try:
+            gv = free_energy(target_dir, T, "VDOS")
+            if gv.get("available"):
+                # dF_anh (HA subtracted *with the same ZPE/T grid*)
+                dF = gv["G_eV_per_atom"] - gt["G_eV_per_atom"]
+                overlay = {"dF_anh_eV": dF, "e_hull_eV": scan["e_hull_eV"] + dF,
+                           "e_hull_at_T_eV": float(np.interp(op, T, scan["e_hull_eV"] + dF)),
+                           "md_temperatures": target_dir.md_temperatures()}
+        except Exception as exc:  # noqa: BLE001
+            flags.append(f"VDOS overlay failed: {exc}")
+
+    if len(comps) < len(target.elements):
+        flags.append("few competing phases - hull may be incomplete")
+    status = (STATUS_OK if e_T <= cfg.gates.hull_ok_eV else
+              STATUS_WARN if e_T <= cfg.gates.hull_fail_eV else STATUS_FAIL)
+    if status == STATUS_OK and mism:
+        status = STATUS_WARN
+    if e_T <= cfg.gates.hull_ok_eV:
+        msg = (f"On the hull at {op:g} K ({1e3 * e_T:+.1f} meV/atom vs competitors)"
+               if e_T <= 1e-4 else f"{1e3 * e_T:.1f} meV/atom above hull at {op:g} K (within tolerance)")
+    else:
+        dec = ", ".join(f"{v:.2f} {k}" for k, v in sorted(decomp.items(), key=lambda kv: -kv[1]))
+        msg = f"{1e3 * e_T:.1f} meV/atom above the hull at {op:g} K; decomposes to {dec}"
+    if mism:
+        msg += " [calculator mismatch - see flags]"
+
+    res = {"available": True, "status": status, "message": msg, "method": method,
+           "operating_T_K": op, "e_hull_at_T_eV": e_T,
+           "decomposition": decomp, "n_competing": len(comps),
+           "n_pruned_0K": len(dropped), "temperatures": T, "e_hull_eV": scan["e_hull_eV"],
+           "stable_phases": scan["stable_phases"][i_op],
+           "overlay": overlay, "flags": flags,
+           "G_target_eV": gt["G_eV_per_atom"], "contributions": gt["contributions"],
+           "competitors": {k: {"formula": next(p.formula for p in keep if p.tag == k)} for k in comps}}
+    write_json(os.path.join(stab, "hull_vs_T.json"), res)
+    write_json(os.path.join(stab, "secondary_phases.json"),
+               [p.to_dict() for p in keep] + [dict(p.to_dict(), pruned=True) for p in dropped])
+    return res
+
+
+# ---------------------------------------------------------------------------
+# 0 K hull for the pre-MD stage (no phonons, no MD)
+# ---------------------------------------------------------------------------
+
+def zero_k_hull(target_dir, device: str | None = None, prepare: bool = True, force: bool | None = None,
+                mp_docs: list | None = None) -> dict:
+    """Signed distance of the target's relaxed enthalpy to the 0 K hull of its competitors.
+
+    Needs only relaxations (cheap).  ``{"available": False, "message": ...}`` when the hull cannot
+    be built (no competitors / missing elemental references).
+    """
+    target_dir = PhaseDir.of(target_dir)
+    target = phase_from_dir(target_dir, "target")
+    if target is None or not target_dir.has_relaxation():
+        return {"available": False, "message": "target has no converged relaxation"}
+    comps = find_competing_phases(target_dir, mp_docs)
+    comps = _prepare(comps, "relax", device, force) if prepare else [
+        p for p in comps if p.phase_dir.has_relaxation()]
+    ref = {}
+    labels = set()
+    for p in comps:
+        h = reference_energy(p.phase_dir)
+        if h is not None:
+            ref[p.tag] = (p.composition, h)
+            labels.add((p.phase_dir.energy() or {}).get("calculator", "?"))
+    flags = []
+    tl = (target_dir.energy() or {}).get("calculator", "?")
+    if labels - {tl}:
+        flags.append(f"energy-scale mismatch: target {tl} vs competitors {sorted(labels - {tl})}")
+    try:
+        r = hull_distance(target.composition, reference_energy(target_dir), ref)
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "message": f"0 K hull could not be built: {exc}", "flags": flags,
+                "n_competing": len(ref)}
+    return {"available": True, "e_hull_0K_eV": r["e_hull_eV"], "decomposition": r["decomposition"],
+            "stable_phases": r["stable_phases"], "n_competing": len(ref), "flags": flags}

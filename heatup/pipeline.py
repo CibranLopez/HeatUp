@@ -1,354 +1,224 @@
 """heatup.pipeline
-========================
-Top-level pipeline orchestrating the three sequential stability gates.
+===================
+The gate runner for one phase directory.
 
-Usage::
+Gates (``cfg.gates.enabled``, default all)::
 
-    from heatup import run_stability_pipeline
+    mechanical (1)   structural_transition (0)   vibrational (2)   thermodynamic (3)
 
-    report = run_stability_pipeline(
-        sym_dir     = "database/LiZrS2/R3m",
-        operating_T = 1200.0,
-        device      = "cuda",
-    )
-    if report["overall"] == "ok":
-        # include in retraining dataset
-        ...
+They are **independent**: whichever are enabled are evaluated, in the order of increasing cost
+(relax -> elastic -> phonons -> MD -> hull), and a failing gate never stops another one - you get the
+full picture of *how* a candidate fails.  Only a missing relaxation makes every gate ``missing``.
+A gate whose evidence cannot be produced (a failed step, no MD yet) is ``missing`` with the reason;
+a gate you disabled is listed under ``report["skipped"]`` and does not count for ``overall``.
+
+Caching and ``force``: every step is cached by ``manifest`` (config fingerprint + input hashes).
+``cfg.run.force`` (or the ``force=`` argument) lists the steps to recompute.  Gate verdicts are
+*always recomputed* from the cached step outputs (cheap); v0.2 cached the final
+``stability_report.json`` and returned it after the config or the structure had changed.  Reports are
+now written per stage (``stability/report_<stage>.json``, with ``stage`` and ``complete`` fields)
+and are never read back as a result.
 """
 
 from __future__ import annotations
 
-import json
+import logging
 import os
 import traceback
 
-import matplotlib.pyplot as plt
+from heatup import __version__
+from heatup.config import (STATUS_FAIL, STATUS_MISSING, STATUS_OK, STATUS_WARN, cfg)
+from heatup.mechanical import assess_mechanical_stability
+from heatup.paths import PhaseDir, iter_phase_dirs, write_json
+from heatup.runtime import run_step
+from heatup.structural_transition import assess_structural_transition
+from heatup.vibrational import assess_vibrational_stability
 
-from heatup import config
-from heatup.mechanical             import assess_mechanical_stability
-from heatup.vibrational            import assess_vibrational_stability
-from heatup.thermodynamic          import assess_thermodynamic_stability
-from heatup.structural_transition  import assess_structural_transition
-from heatup.plotting               import plot_stability_report
+log = logging.getLogger("heatup")
+
+GATES = ("structural_transition", "mechanical", "vibrational", "thermodynamic")
+_SEVERITY = {STATUS_FAIL: 3, STATUS_MISSING: 2, STATUS_WARN: 1, STATUS_OK: 0}
 
 
-def run_stability_pipeline(
-        sym_dir: str,
-        operating_T: float = 1200.0,
-        candidates_root: str = config.CANDIDATES_ROOT,
-        database_root: str = config.DATABASE_ROOT,
-        temperatures: list[float] | None = None,
-        device: str = config.DEFAULT_DEVICE,
-        generate_missing_phases: bool = True,
-        force_rerun: bool = False,
-        save_figure: bool = True,
-        figure_fmt: str = "pdf",
-) -> dict:
-    """Run the three-gate stability pipeline for a single material.
+def overall_status(report: dict) -> str:
+    skipped = set(report.get("skipped", []))
+    st = [report[g].get("status", STATUS_MISSING) for g in GATES
+          if g not in skipped and report.get(g) is not None]
+    if STATUS_FAIL in st:
+        return STATUS_FAIL
+    if STATUS_WARN in st or STATUS_MISSING in st or not st:
+        return STATUS_WARN
+    return STATUS_OK
 
-    Gates are evaluated in order:
 
-        1. **Mechanical** — Born elastic stability.
-           A **fail** result stops the pipeline (no point computing phonons
-           for a mechanically collapsed crystal).
-        2. **Vibrational** — soft-mode detection from anharmonic VDOS.
-           A **fail** result stops the pipeline (thermodynamic hull requires
-           meaningful free energies, which cannot be extracted from a phase
-           undergoing a structural instability).
-        3. **Thermodynamic** — temperature-dependent convex hull.
-           Always runs if gates 1–2 are ``ok`` or ``warn``.
+def _log_gate(name: str, r: dict) -> None:
+    log.info("[%s] %s - %s", name, r.get("status", "?").upper(), r.get("message", ""))
 
-    A ``warn`` in any gate does not block subsequent gates, so borderline
-    materials are fully characterised before a decision is made.
 
-    Args:
-        sym_dir:                 Path to ``database/<material>/<symmetry>/``.
-        operating_T:             Temperature (K) for stability evaluation.
-        candidates_root:         Root of the candidates POSCAR tree.
-        database_root:           Root of the simulation database.
-        temperatures:            Hull temperature grid (K).  Defaults to
-                                 ``config.HULL_TEMPERATURES``.
-        device:                  MACE compute device (``'cuda'`` or ``'cpu'``).
-        generate_missing_phases: Generate secondary-phase POSCARs with PyXtal
-                                 before building the hull.
-        force_rerun:             Recompute even if ``stability_report.json``
-                                 already exists.
-        save_figure:             Save the dashboard figure to
-                                 ``<sym_dir>/stability/stability_report.<fmt>``.
-        figure_fmt:              Figure format (``'pdf'`` or ``'png'``).
+def run_pipeline(phase_dir, operating_T: float | None = None, device: str | None = None,
+                 md_temperatures: list[float] | None = None, force=None,
+                 compute: bool = True, gates: list[str] | None = None,
+                 save_figure: bool = True, figure_fmt: str = "png", mp_docs: list | None = None) -> dict:
+    """Run (or just re-evaluate, ``compute=False``) the enabled gates for one phase.
 
-    Returns:
-        Dict with keys:
-
-        ``'material'``, ``'symmetry'``, ``'sym_dir'``, ``'operating_T_K'``
-            Identification.
-        ``'mechanical'``, ``'vibrational'``, ``'thermodynamic'``
-            Gate result dicts (see individual assess functions).
-        ``'overall'``
-            ``'ok'`` | ``'warn'`` | ``'fail'`` | ``'missing'``.
-        ``'flags'``
-            List of human-readable flag strings for non-OK gates.
-        ``'stopped_at'``
-            ``None`` if all gates ran; gate name if pipeline was stopped early.
+    * Which gates run: ``gates`` or ``cfg.gates.enabled`` (default: all four).  They are
+      **independent** - a failing gate never prevents another enabled gate from being evaluated;
+      only a missing relaxation makes every gate ``missing``.  Disabled gates are listed in
+      ``report["skipped"]``.
+    * ``force``: ``None`` -> ``cfg.run.force``; ``True`` (all steps), a step name or a list of step
+      names (``"relax" "elastic" "phonons" "qha" "md" "analysis"``) recompute those steps.
+    * Steps are only run for the enabled gates (mechanical: elastic; structural_transition: md;
+      vibrational: phonons + md; thermodynamic: its own competitor/phonon steps).
     """
-    if temperatures is None:
-        temperatures = [float(t) for t in config.HULL_TEMPERATURES]
+    from heatup.config import normalize_force, override
+    if force is None:
+        return _run(phase_dir, operating_T, device, md_temperatures, compute, gates,
+                    save_figure, figure_fmt, mp_docs)
+    with override(**{"run.force": normalize_force(force)}):
+        return _run(phase_dir, operating_T, device, md_temperatures, compute, gates,
+                    save_figure, figure_fmt, mp_docs)
 
-    sym_dir  = os.path.abspath(sym_dir)
-    symmetry = os.path.basename(sym_dir)
-    material = os.path.basename(os.path.dirname(sym_dir))
-    tag      = f"{material}/{symmetry}"
 
-    stab_dir    = os.path.join(sym_dir, "stability")
-    report_path = os.path.join(stab_dir, "stability_report.json")
+def _run(phase_dir, operating_T, device, md_temperatures, compute, gates, save_figure, figure_fmt, mp_docs) -> dict:
+    from heatup.config import GATES
+    from heatup.thermodynamic import assess_thermodynamic_stability
 
-    if not force_rerun and os.path.exists(report_path):
+    phase = PhaseDir.of(phase_dir)
+    enabled = list(cfg.gates.enabled if gates is None else gates)
+    unknown = [g for g in enabled if g not in GATES]
+    if unknown:
+        raise ValueError(f"unknown gate(s) {unknown}; choose from {list(GATES)}")
+    T_op = float(cfg.hull.operating_T if operating_T is None else operating_T)
+    temps = [float(t) for t in (md_temperatures or [T_op])]
+    report: dict = {"version": __version__, "stage": "post_md", "material": phase.material, "label": phase.label,
+                    "phase_dir": phase.path, "operating_T_K": T_op, "md_temperatures_K": temps,
+                    "calculator": cfg.calc.model_for(phase.material), "config": cfg.snapshot(),
+                    "structural_transition": None, "mechanical": None, "vibrational": None,
+                    "thermodynamic": None, "skipped": [g for g in GATES if g not in enabled],
+                    "enabled": enabled, "flags": [], "overall": STATUS_MISSING}
+    log.info("=== %s  (T = %g K, gates: %s) ===", phase.tag, T_op, ", ".join(enabled))
+    if not enabled:
+        report["flags"].append("[MISSING] no gate enabled")
+        return _finish(report, phase, save_figure, figure_fmt)
+
+    def step(name: str, **kw) -> bool:
+        return (not compute) or run_step(name, phase, device=device, **kw)
+
+    def gate(name: str, fn, *args, **kw) -> None:
+        """Evaluate one gate; an exception inside it becomes that gate's ``missing`` - never the others'."""
         try:
-            with open(report_path) as fh:
-                cached = json.load(fh)
-            print(f"[done] {tag} — stability_report.json exists. "
-                  "Pass force_rerun=True to redo.")
-            return cached
-        except Exception:
-            pass
+            r = fn(*args, **kw)
+        except Exception as exc:  # noqa: BLE001
+            log.error("%s: gate %s failed: %s", phase.tag, name, exc)
+            log.debug(traceback.format_exc())
+            r = {"available": False, "status": STATUS_MISSING, "message": f"evaluation failed: {exc}"}
+        report[name] = r
+        _log_gate(name, r)
 
-    print(f"\n{'=' * 65}")
-    print(f"  HeatUp Pipeline: {tag}")
-    print(f"  Operating temperature : {operating_T:.0f} K")
-    print(f"{'=' * 65}")
+    if not step("relax") and not (not compute and phase.has_relaxation()):
+        for g in enabled:
+            report[g] = {"available": False, "status": STATUS_MISSING,
+                         "message": "relaxation failed or not available"}
+        report["flags"].append("[MISSING] relaxation failed")
+        return _finish(report, phase, save_figure, figure_fmt)
 
-    report: dict = {
-        "material"              : material,
-        "symmetry"              : symmetry,
-        "sym_dir"               : sym_dir,
-        "operating_T_K"         : operating_T,
-        "structural_transition" : {},
-        "mechanical"            : {},
-        "vibrational"           : {},
-        "thermodynamic"         : {},
-        "overall"               : config.STATUS_MISSING,
-        "flags"                 : [],
-        "stopped_at"            : None,
-    }
+    if "mechanical" in enabled:
+        step("elastic")
+        gate("mechanical", assess_mechanical_stability, phase)
+    needs_md = "structural_transition" in enabled or "vibrational" in enabled
+    if "vibrational" in enabled:
+        step("phonons")
+    if needs_md:
+        for T in temps:
+            step("md", temperature=T)
+    if "structural_transition" in enabled:
+        gate("structural_transition", assess_structural_transition, phase)
+    if "vibrational" in enabled:
+        gate("vibrational", assess_vibrational_stability, phase)
+    if "thermodynamic" in enabled:
+        gate("thermodynamic", assess_thermodynamic_stability, phase, operating_T=T_op, device=device,
+             prepare=compute, mp_docs=mp_docs)
+    return _finish(report, phase, save_figure, figure_fmt)
 
-    # ── Gate 0: Structural transition ─────────────────────────────────────
-    print(f"\n  [Gate 0] Structural transition check (DACF)...")
-    struct_trans = assess_structural_transition(
-        sym_dir, force_recompute=force_rerun
-    )
-    report["structural_transition"] = struct_trans
-    print(f"    {struct_trans['status'].upper()} — {struct_trans['message']}")
 
-    if struct_trans["status"] == config.STATUS_FAIL:
-        report["stopped_at"] = "structural_transition"
-        report["flags"].append(
-            f"[FAIL] Structural transition: {struct_trans['message']}"
-        )
-        _finalise(report)
-        _persist(report, stab_dir, save_figure, figure_fmt)
-        return report
-
-    if struct_trans["status"] == config.STATUS_MISSING:
-        report["flags"].append(
-            f"[MISSING] Structural transition: {struct_trans['message']}"
-        )
-
-    # ── Gate 1: Mechanical ────────────────────────────────────────────────
-    print(f"\n  [Gate 1] Mechanical stability...")
-    mech = assess_mechanical_stability(sym_dir)
-    report["mechanical"] = mech
-    print(f"    {mech['status'].upper()} — {mech['message']}")
-
-    if mech["status"] == config.STATUS_FAIL:
-        report["stopped_at"] = "mechanical"
-        report["flags"].append(f"[FAIL] Mechanical: {mech['message']}")
-        _finalise(report)
-        _persist(report, stab_dir, save_figure, figure_fmt)
-        return report
-
-    if mech["status"] in (config.STATUS_WARN, config.STATUS_MISSING):
-        report["flags"].append(
-            f"[{mech['status'].upper()}] Mechanical: {mech['message']}"
-        )
-
-    # ── Gate 2: Vibrational ───────────────────────────────────────────────
-    print(f"\n  [Gate 2] Vibrational stability (anharmonic VDOS)...")
-    vib = assess_vibrational_stability(sym_dir)
-    report["vibrational"] = vib
-    print(f"    {vib['status'].upper()} — {vib['message']}")
-
-    if vib["status"] == config.STATUS_FAIL:
-        report["stopped_at"] = "vibrational"
-        report["flags"].append(f"[FAIL] Vibrational: {vib['message']}")
-        _finalise(report)
-        _persist(report, stab_dir, save_figure, figure_fmt)
-        return report
-
-    if vib["status"] in (config.STATUS_WARN, config.STATUS_MISSING):
-        report["flags"].append(
-            f"[{vib['status'].upper()}] Vibrational: {vib['message']}"
-        )
-
-    # ── Gate 3: Thermodynamic ─────────────────────────────────────────────
-    print(f"\n  [Gate 3] Thermodynamic stability (convex hull with T)...")
-    therm = assess_thermodynamic_stability(
-        sym_dir          = sym_dir,
-        operating_T      = operating_T,
-        candidates_root  = candidates_root,
-        database_root    = database_root,
-        temperatures     = temperatures,
-        device           = device,
-        generate_missing = generate_missing_phases,
-    )
-    report["thermodynamic"] = therm
-    print(f"    {therm['status'].upper()} — {therm['message']}")
-
-    if therm["status"] in (config.STATUS_WARN, config.STATUS_FAIL,
-                           config.STATUS_MISSING):
-        report["flags"].append(
-            f"[{therm['status'].upper()}] Thermodynamic: {therm['message']}"
-        )
-
-    _finalise(report)
-    _persist(report, stab_dir, save_figure, figure_fmt)
+def _finish(report: dict, phase: PhaseDir, save_figure: bool, fmt: str) -> dict:
+    for g in GATES:
+        r = report.get(g)
+        if r and r.get("status") in (STATUS_WARN, STATUS_FAIL, STATUS_MISSING) \
+                and not any(f.endswith(r.get("message", "")) for f in report["flags"]):
+            report["flags"].append(f"[{r['status'].upper()}] {g}: {r.get('message', '')}")
+        if r:
+            report["flags"] += [f"[note] {g}: {x}" for x in r.get("flags", []) if isinstance(x, str)]
+    report["overall"] = overall_status(report)
+    report["complete"] = bool(report.get("enabled")) and all(
+        (report.get(g) or {}).get("status", STATUS_MISSING) != STATUS_MISSING
+        for g in GATES if g not in report["skipped"])
+    os.makedirs(phase.stability_dir, exist_ok=True)
+    slim = dict(report)
+    slim["vibrational"] = _strip(report.get("vibrational"), ("vdos",))
+    slim["thermodynamic"] = _strip(report.get("thermodynamic"), ("contributions",))
+    write_json(os.path.join(phase.stability_dir, f"report_{report['stage']}.json"), slim)
+    if save_figure:
+        try:
+            from heatup.plotting import plot_stability_report
+            import matplotlib.pyplot as plt
+            fig = plot_stability_report(report, os.path.join(phase.stability_dir,
+                                                             f"report_{report['stage']}.{fmt}"))
+            plt.close(fig)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("figure failed: %s", exc)
+    log.info("=== %s: OVERALL %s ===", phase.tag, report["overall"].upper())
     return report
 
 
-def _finalise(report: dict) -> None:
-    statuses = [
-        report.get("mechanical", {}).get("status",    config.STATUS_MISSING),
-        report.get("vibrational", {}).get("status",   config.STATUS_MISSING),
-        report.get("thermodynamic", {}).get("status", config.STATUS_MISSING),
-    ]
-    if "structural_transition" in report:
-        statuses.insert(
-            0,
-            report.get("structural_transition", {}).get("status", config.STATUS_MISSING),
-        )
-    if config.STATUS_FAIL in statuses:
-        report["overall"] = config.STATUS_FAIL
-    elif config.STATUS_WARN in statuses or config.STATUS_MISSING in statuses:
-        report["overall"] = config.STATUS_WARN
-    else:
-        report["overall"] = config.STATUS_OK
+def _strip(d, keys):
+    if not isinstance(d, dict):
+        return d
+    return {k: v for k, v in d.items() if k not in keys}
 
 
-def _persist(
-        report: dict,
-        stab_dir: str,
-        save_figure: bool,
-        figure_fmt: str,
-) -> None:
-    os.makedirs(stab_dir, exist_ok=True)
+def run_batch(database_root: str | None = None, **kwargs) -> list[dict]:
+    """:func:`run_pipeline` for every phase directory under *database_root*.
 
-    # Slim down the JSON: strip large arrays (stored in anharmonic_phonons/ files).
-    slim = {k: v for k, v in report.items() if k != "vibrational"}
-    slim["vibrational"] = {
-        k: v for k, v in report.get("vibrational", {}).items()
-        if k not in ("omega_mev", "vdos")
-    }
-    # structural_transition large arrays are already stripped in
-    # assess_structural_transition(); the full DACF is in dacf.json per sim.
-    with open(os.path.join(stab_dir, "stability_report.json"), "w") as fh:
-        json.dump(slim, fh, indent=4)
-
-    print(f"\n  Report → {os.path.join(stab_dir, 'stability_report.json')}")
-    print(f"  Overall: {report['overall'].upper()}")
-
-    if save_figure:
-        fig_path = os.path.join(stab_dir, f"stability_report.{figure_fmt}")
-        try:
-            fig = plot_stability_report(report, save_path=fig_path)
-            plt.close(fig)
-        except Exception as exc:
-            print(f"  [warn] Figure generation failed: {exc}")
-
-
-# ---------------------------------------------------------------------------
-# Batch runner
-# ---------------------------------------------------------------------------
-
-def run_stability_pipeline_batch(
-        database_root: str = config.DATABASE_ROOT,
-        candidates_root: str = config.CANDIDATES_ROOT,
-        operating_T: float = 1200.0,
-        temperatures: list[float] | None = None,
-        device: str = config.DEFAULT_DEVICE,
-        generate_missing_phases: bool = True,
-        force_rerun: bool = False,
-        save_figures: bool = True,
-        figure_fmt: str = "pdf",
-) -> list[dict]:
-    """Run :func:`run_stability_pipeline` for every validated database entry.
-
-    An entry is considered validated if its ``aimd/`` directory contains at
-    least one non-empty ``output.traj`` file.
-
-    Args:
-        database_root:           Root of the simulation database.
-        candidates_root:         Root of the candidate tree.
-        operating_T:             Hull evaluation temperature (K).
-        temperatures:            Hull temperature grid.
-        device:                  MACE compute device.
-        generate_missing_phases: Run PyXtal for missing polymorphs.
-        force_rerun:             Recompute all reports.
-        save_figures:            Write dashboard figures.
-        figure_fmt:              Figure format (``'pdf'`` or ``'png'``).
-
-    Returns:
-        List of report dicts sorted by severity (fail → warn → ok) then name.
+    Phases that have no ``POSCAR`` are skipped; errors in one phase never stop the batch.
+    Returned sorted fail -> warn -> missing -> ok.
     """
-    reports: list[dict] = []
+    root = database_root or cfg.phases.database_root
+    out = []
+    for pd in iter_phase_dirs(root):
+        try:
+            out.append(run_pipeline(pd, **kwargs))
+        except Exception as exc:  # noqa: BLE001
+            log.error("%s: %s", PhaseDir.of(pd).tag, exc)
+    out.sort(key=lambda r: (-_SEVERITY.get(r["overall"], 0), r["material"], r["label"]))
+    return out
 
-    if not os.path.isdir(database_root):
-        print(f"[warn] database_root not found: {database_root}")
-        return reports
 
-    for material in sorted(os.listdir(database_root)):
-        mat_dir = os.path.join(database_root, material)
-        if not os.path.isdir(mat_dir):
-            continue
-        for symmetry in sorted(os.listdir(mat_dir)):
-            sym_dir  = os.path.join(mat_dir, symmetry)
-            aimd_dir = os.path.join(sym_dir, "aimd")
-            if not os.path.isdir(sym_dir) or not os.path.isdir(aimd_dir):
-                continue
+def summary_rows(reports: "dict[str, dict] | list[dict]") -> list[dict]:
+    """Flat one-row-per-phase table (feed to ``pandas.DataFrame``)."""
+    items = reports.items() if isinstance(reports, dict) else [(f"{r['material']}/{r['label']}", r) for r in reports]
+    rows = []
+    for tag, r in items:
+        m, s, v, t = (r.get(k) or {} for k in ("mechanical", "structural_transition", "vibrational", "thermodynamic"))
+        rows.append({
+            "phase": tag, "overall": r.get("overall"),
+            "G1 mech": m.get("status"), "B_GPa": m.get("bulk_GPa"), "G_GPa": m.get("shear_GPa"),
+            "G0 struct": s.get("status"), "G2 vib": v.get("status"), "G3 hull": t.get("status"),
+            "E_hull_meV": None if t.get("e_hull_at_T_eV") is None else 1e3 * t["e_hull_at_T_eV"],
+        })
+    return rows
 
-            has_traj = any(
-                os.path.exists(os.path.join(aimd_dir, tf, "output.traj"))
-                and os.path.getsize(
-                    os.path.join(aimd_dir, tf, "output.traj")
-                ) > 0
-                for tf in os.listdir(aimd_dir)
-                if tf.endswith("K")
-            )
-            if not has_traj:
-                continue
 
-            print(f"\n  Processing {material}/{symmetry}...")
-            try:
-                rep = run_stability_pipeline(
-                    sym_dir                 = sym_dir,
-                    operating_T             = operating_T,
-                    candidates_root         = candidates_root,
-                    database_root           = database_root,
-                    temperatures            = temperatures,
-                    device                  = device,
-                    generate_missing_phases = generate_missing_phases,
-                    force_rerun             = force_rerun,
-                    save_figure             = save_figures,
-                    figure_fmt              = figure_fmt,
-                )
-                reports.append(rep)
-            except Exception as exc:
-                print(f"  [error] {material}/{symmetry}: {exc}")
-                traceback.print_exc()
-
-    _order = {
-        config.STATUS_FAIL   : 0,
-        config.STATUS_WARN   : 1,
-        config.STATUS_OK     : 2,
-        config.STATUS_MISSING: 3,
-    }
-    reports.sort(key=lambda r: (_order.get(r["overall"], 9), r["material"]))
-    return reports
+def database_status(root: str | None = None) -> list[dict]:
+    """Which calculations exist for every phase directory under *root*."""
+    out = []
+    for d in iter_phase_dirs(root or cfg.phases.database_root):
+        p = PhaseDir.of(d)
+        out.append({"phase": p.tag, "relaxed": p.has_relaxation(),
+                    "elastic": os.path.exists(p.elastic_json),
+                    "HA": os.path.exists(os.path.join(p.phonon_dir, "ha.json")),
+                    "QHA": os.path.exists(os.path.join(p.phonon_dir, "qha.json")),
+                    "MD_T_K": p.md_temperatures(),
+                    "reports": sorted(f[7:-5] for f in (os.listdir(p.stability_dir) if os.path.isdir(p.stability_dir) else [])
+                                          if f.startswith("report_") and f.endswith(".json"))})
+    return out
