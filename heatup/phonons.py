@@ -37,10 +37,10 @@ from ase.optimize import BFGS
 
 from heatup import manifest
 from heatup.calculator import build_calculator, calculator_label, release_calculator
-from heatup.config import cfg
+from heatup.config import AUTO_MIN_LENGTH_A, cfg
 from heatup.constants import GPA_TO_EV_A3, MEV_PER_THZ
 from heatup.paths import PhaseDir, read_json, write_json
-from heatup.structure import read_structure, supercell_reps
+from heatup.structure import read_structure, resolve_supercell
 from heatup.vibthermo import ModeSet
 
 log = logging.getLogger("heatup")
@@ -52,9 +52,8 @@ log = logging.getLogger("heatup")
 
 def choose_supercell(atoms: Atoms) -> tuple[int, int, int]:
     pc = cfg.phonon
-    if pc.supercell is not None:
-        return tuple(int(x) for x in pc.supercell)  # type: ignore[return-value]
-    return supercell_reps(atoms.cell.array, pc.min_length_A, pc.max_atoms, len(atoms))
+    return resolve_supercell(atoms.cell.array, len(atoms), supercell=pc.supercell, min_length=pc.min_length_A,
+                             max_atoms=pc.max_atoms, auto_min_length=AUTO_MIN_LENGTH_A["phonon"], what="phonon supercell")
 
 
 def _phonopy(atoms: Atoms, sc: tuple[int, int, int]):

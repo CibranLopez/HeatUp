@@ -228,3 +228,49 @@ def test_linewidth_statistics_and_summary():
            "frac_ioffe_regel": [0.0, 0.0], "tau_median_ps": [5.0, 1.0]}
     assert anharmonic_summary(res, 120)["flag"] is None
     assert "anharmonic" in anharmonic_summary(res, 290)["flag"] and anharmonic_summary(None, 300) is None
+
+
+def test_resolve_supercell_none_means_as_needed(caplog):
+    import numpy as np
+    from heatup.structure import resolve_supercell
+    cell = np.diag([3.6, 3.6, 3.6])
+    kw = dict(auto_min_length=10.8)
+    assert resolve_supercell(cell, 4, **kw) == (3, 3, 3)                       # everything None -> the step's own default
+    assert resolve_supercell(cell, 4, min_length=7.0, **kw) == (2, 2, 2)       # explicit length beats the default
+    assert resolve_supercell(cell, 4, supercell=(2, 1, 1), **kw) == (2, 1, 1)  # explicit supercell, nothing else needed
+    assert resolve_supercell(cell, 4, max_atoms=None, **kw) == (3, 3, 3)       # None = unlimited
+    with caplog.at_level("WARNING", logger="heatup"):
+        assert resolve_supercell(cell, 4, supercell=(2, 2, 2), min_length=20.0, **kw) == (2, 2, 2)
+    assert "ignored" in caplog.text                                            # supercell wins, and says so
+    with pytest.raises(ValueError):
+        resolve_supercell(cell, 4, max_atoms=100, **kw)                        # 27 * 4 = 108 > 100
+    with pytest.raises(ValueError):
+        resolve_supercell(cell, 4, supercell=(3, 3, 3), max_atoms=100, **kw)   # the guard also applies to explicit cells
+    with pytest.raises(ValueError):
+        resolve_supercell(cell, 4, supercell=(2, 2), **kw)
+
+
+def test_sizing_defaults_are_none():
+    for sec in (cfg.phonon, cfg.fc3):
+        assert sec.supercell is None and sec.min_length_A is None and sec.max_atoms is None
+    assert cfg.md.supercell is None and cfg.md.min_cell_A is None and cfg.md.max_atoms is None
+
+
+def test_md_cell_explicit_supercell_and_cache(tmp_path):
+    from ase.build import bulk
+    from ase.io import write
+    from heatup.md import build_md_cell
+    from heatup.paths import PhaseDir
+    d = tmp_path / "Cu" / "Fm-3m"
+    (d / "relaxation").mkdir(parents=True)
+    write(str(d / "relaxation" / "CONTCAR"), bulk("Cu", "fcc", a=3.61, cubic=True), format="vasp")
+    ph = PhaseDir(str(d))
+    assert len(build_md_cell(ph)) == 4 * 5 ** 3                                   # all None -> built-in 15 A
+    cfg.md.supercell = (2, 2, 2)
+    assert len(build_md_cell(ph)) == 32                                           # explicit request invalidates the cached cell
+    cfg.md.supercell = None
+    cfg.md.min_cell_A = 10.0
+    assert len(build_md_cell(ph)) == 4 * 3 ** 3
+    cfg.md.max_atoms = 50
+    with pytest.raises(ValueError):
+        build_md_cell(ph, force=True)

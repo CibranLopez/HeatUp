@@ -120,11 +120,15 @@ def _mp_query(elements: frozenset) -> list:
     with MPRester(key) as mpr:
         for sys_ in subsystems(elements):
             chemsys = "-".join(sys_)
+            kw: dict = {}
+            if cfg.phases.mp_max_e_above_hull is not None:
+                kw["energy_above_hull"] = (0.0, cfg.phases.mp_max_e_above_hull)
             res = mpr.materials.summary.search(
-                chemsys=chemsys, energy_above_hull=(0.0, cfg.phases.mp_max_e_above_hull),
-                fields=["material_id", "structure", "energy_above_hull", "formula_pretty",
-                        "symmetry"])
-            res = sorted(res, key=lambda d: d.energy_above_hull)[: cfg.phases.mp_max_per_chemsys]
+                chemsys=chemsys, fields=["material_id", "structure", "energy_above_hull", "formula_pretty",
+                                         "symmetry"], **kw)
+            res = sorted(res, key=lambda d: d.energy_above_hull)
+            if cfg.phases.mp_max_per_chemsys is not None:
+                res = res[: cfg.phases.mp_max_per_chemsys]
             log.info("[mp-api] %-12s %3d phase(s)", chemsys, len(res))
             docs += res
     return docs

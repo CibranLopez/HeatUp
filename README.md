@@ -58,6 +58,8 @@ rows = screen_many(["input/candidates/X/a", "input/candidates/X/b"], out_dir="sc
 
 `heatup.report.print_layout(root)` prints this tree with file sizes (the notebooks do it after every stage).
 
+Sizing options (`supercell`, `min_length_A`, `max_atoms` of `phonon` / `fc3` / `md`) default to `None` = as needed: an explicit `supercell` wins, otherwise the smallest cell with perpendicular widths >= `min_length_A` (built-in default when `None`), and no atom limit unless you set one.
+
 Directory layout (`<root>/<material>/<label>/`): `POSCAR` -> `relaxation/` `elastic/` `phonons/` `md/<T>K/`
 `stability/` (`report_<stage>.json`, `result_<stage>.json`). Every step directory holds a `manifest.json`.
 Trees: `database_root` (your targets, read/write), `candidates_root` (your input structures, **read-only**),

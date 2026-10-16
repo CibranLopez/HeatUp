@@ -165,9 +165,10 @@ def assess_thermodynamic_stability(target_dir, operating_T: float | None = None,
     keep, dropped = [], []
     for p in competitors:
         d = z["e_above_hull_0K"].get(p.tag)
-        (keep if d is not None and d <= hc.prune_window_eV else dropped).append(p)
-    log.info("0 K pruning (> %.0f meV): %d kept, %d dropped", 1e3 * hc.prune_window_eV,
-             len(keep), len(dropped))
+        ok = d is not None and (hc.prune_window_eV is None or d <= hc.prune_window_eV)
+        (keep if ok else dropped).append(p)
+    log.info("0 K pruning (%s): %d kept, %d dropped",
+             "off" if hc.prune_window_eV is None else f"> {1e3 * hc.prune_window_eV:.0f} meV", len(keep), len(dropped))
     write_json(os.path.join(stab, "zero_K_hull.json"), {
         "prune_window_eV": hc.prune_window_eV, "e_above_hull_0K": z["e_above_hull_0K"],
         "kept": [p.tag for p in keep], "dropped": [p.tag for p in dropped]})

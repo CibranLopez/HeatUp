@@ -5,6 +5,8 @@ Structure helpers shared by all steps (previously duplicated in 3 modules).
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 from ase import Atoms
 from ase.io import read as ase_read
@@ -73,6 +75,32 @@ def supercell_reps(cell: np.ndarray, min_length: float, max_atoms: int | None = 
             f"supercell {tuple(reps)} would have {reps.prod() * n_atoms_cell} atoms "
             f"(> max_atoms={max_atoms}); reduce min length or raise max_atoms")
     return int(reps[0]), int(reps[1]), int(reps[2])
+
+
+log = logging.getLogger("heatup")
+
+
+def resolve_supercell(cell: np.ndarray, n_atoms_cell: int, *, supercell=None, min_length=None, max_atoms=None,
+                      auto_min_length: float, what: str = "supercell") -> tuple[int, int, int]:
+    """The one rule behind every ``supercell / min_length_A / max_atoms`` triple of the configuration.
+
+    * ``supercell`` given  -> used as is; ``min_length`` is not needed (a value there is ignored, with a warning).
+    * ``supercell is None`` -> smallest repetition whose perpendicular widths are >= ``min_length``; when
+      ``min_length`` is ``None`` too, the built-in ``auto_min_length`` of that step is used.
+    * ``max_atoms is None`` -> no limit; otherwise exceeding it raises (also for an explicit ``supercell``).
+    """
+    if supercell is not None:
+        reps = tuple(int(x) for x in supercell)
+        if len(reps) != 3 or min(reps) < 1:
+            raise ValueError(f"{what}: supercell must be three positive integers, got {supercell!r}")
+        if min_length is not None:
+            log.warning("%s: min_length is ignored because an explicit supercell %s is set (set it to None)",
+                        what, reps)
+        n = int(np.prod(reps)) * n_atoms_cell
+        if max_atoms is not None and n > max_atoms:
+            raise ValueError(f"{what}: explicit supercell {reps} has {n} atoms (> max_atoms={max_atoms})")
+        return reps  # type: ignore[return-value]
+    return supercell_reps(cell, auto_min_length if min_length is None else min_length, max_atoms, n_atoms_cell)
 
 
 def perpendicular_widths(cell: np.ndarray) -> np.ndarray:

@@ -45,29 +45,32 @@ from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
 
 from heatup import manifest
 from heatup.calculator import build_calculator, calculator_label, release_calculator
-from heatup.config import cfg
+from heatup.config import AUTO_MIN_LENGTH_A, cfg
 from heatup.paths import PhaseDir, read_json, write_json
-from heatup.structure import read_structure, supercell_reps, upper_triangular, write_poscar
+from heatup.structure import read_structure, resolve_supercell, upper_triangular, write_poscar
 
 log = logging.getLogger("heatup")
 
 
 def build_md_cell(phase: PhaseDir, force: bool = False):
-    """Supercell (>= md.min_cell_A perpendicular width) from the relaxed cell."""
+    """MD supercell from the relaxed cell: ``md.supercell`` if set, else perpendicular width >= ``md.min_cell_A``."""
     poscar = os.path.join(phase.md_dir, "POSCAR")
     info = os.path.join(phase.md_dir, "cell.json")
     mcfg = cfg.md
+    request = {"supercell": None if mcfg.supercell is None else list(mcfg.supercell),
+               "min_cell_A": mcfg.min_cell_A, "max_atoms": mcfg.max_atoms}
     if os.path.exists(poscar) and not force:
         old = read_json(info) or {}
-        if old.get("min_cell_A") == mcfg.min_cell_A and old.get("source") == manifest.file_hash(phase.contcar):
+        if old.get("request") == request and old.get("source") == manifest.file_hash(phase.contcar):
             return read_structure(poscar)
     unit = upper_triangular(read_structure(phase.contcar))
-    reps = supercell_reps(unit.cell.array, mcfg.min_cell_A, mcfg.max_atoms, len(unit))
+    reps = resolve_supercell(unit.cell.array, len(unit), supercell=mcfg.supercell, min_length=mcfg.min_cell_A,
+                             max_atoms=mcfg.max_atoms, auto_min_length=AUTO_MIN_LENGTH_A["md"], what="MD supercell")
     sc = unit.repeat(reps)
     os.makedirs(phase.md_dir, exist_ok=True)
     write_poscar(poscar, sc)
     write_json(info, {"repetitions": list(reps), "n_atoms_unit": len(unit),
-                      "n_atoms": len(sc), "min_cell_A": mcfg.min_cell_A,
+                      "n_atoms": len(sc), "request": request,
                       "source": manifest.file_hash(phase.contcar)})
     log.info("MD supercell %s: reps=%s, %d atoms", phase.tag, reps, len(sc))
     return sc

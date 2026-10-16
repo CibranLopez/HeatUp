@@ -90,7 +90,7 @@ def assess_vibrational_stability(phase_dir) -> dict:
         st = (STATUS_FAIL if z >= g.zero_frac_fail else
               STATUS_WARN if z >= g.zero_frac_warn else STATUS_OK)
         q = []
-        if v["production_ps"] < g.min_production_ps:
+        if g.min_production_ps is not None and v["production_ps"] < g.min_production_ps:
             q.append(f"short run ({v['production_ps']:.1f} ps < {g.min_production_ps:g} ps)")
         if v["alias_weight_top10pct"] > 1e-3:
             q.append("aliasing near Nyquist - lower md.nblock")

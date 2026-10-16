@@ -31,9 +31,9 @@ from ase import Atoms
 
 from heatup import manifest
 from heatup.calculator import build_calculator, calculator_label, release_calculator
-from heatup.config import cfg
+from heatup.config import AUTO_MIN_LENGTH_A, cfg
 from heatup.paths import PhaseDir, read_json, write_json
-from heatup.structure import read_structure, supercell_reps
+from heatup.structure import read_structure, resolve_supercell
 
 log = logging.getLogger("heatup")
 
@@ -43,9 +43,8 @@ IOFFE_REGEL_RATIO = 0.5
 
 def fc3_supercell(atoms: Atoms) -> tuple[int, int, int]:
     c = cfg.fc3
-    if c.supercell is not None:
-        return tuple(int(x) for x in c.supercell)  # type: ignore[return-value]
-    return supercell_reps(atoms.cell.array, c.min_length_A, c.max_atoms, len(atoms))
+    return resolve_supercell(atoms.cell.array, len(atoms), supercell=c.supercell, min_length=c.min_length_A,
+                             max_atoms=c.max_atoms, auto_min_length=AUTO_MIN_LENGTH_A["fc3"], what="fc3 supercell")
 
 
 def _to_ase(sc) -> Atoms:
