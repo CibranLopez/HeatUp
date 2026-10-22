@@ -107,24 +107,26 @@ ANALYSIS_STEPS = tuple(n for n, s in STEPS.items() if s.tier == 3)
 
 #: steps whose output each gate reads (the evidence a verdict rests on)
 GATE_STEPS = {"mechanical": ("elastic",), "structural_transition": ("md",),
-              "vibrational": ("phonons", "md"), "thermodynamic": ("phonons",)}
+              "vibrational": ("phonons", "md"), "thermodynamic": ()}
+#: the hull's evidence, per free-energy method (``cfg.hull.phonon_method``), for the target AND every competing phase
+THERMO_STEPS = {"HA": ("phonons",), "QHA": ("qha",), "VDOS": ("md",)}
+
+
+def gate_steps(gate: str, method: str = "HA") -> tuple:
+    """Steps whose output *gate* reads (the hull's depend on the free-energy method)."""
+    return tuple(GATE_STEPS.get(gate, ())) + (THERMO_STEPS[method.upper()] if gate == "thermodynamic" else ())
 
 
 def steps_for(gates, method: str = "HA", role: str = "target") -> list[str]:
-    """Compute steps needed to evaluate *gates* (registry order).  Used by the one-call facade
-    ``heatup.screen``; in the notebooks the steps are chosen explicitly in ``cfg.plan``."""
-    need = {"relax"}
-    method = method.upper()
+    """Compute steps needed to evaluate *gates* with free-energy *method* (registry order).  A competing phase only
+    serves the hull, so it needs just the hull's evidence (``THERMO_STEPS``).  Used by notebook 1 and by the one-call
+    facade ``heatup.screen``; ``cfg.plan.target_steps`` / ``competitor_steps`` override it."""
+    need = {"relax"}                                      # "relax" is no gate: it is always planned (see relax.optimize)
     if role == "target":
         for g in gates:
-            need.update(GATE_STEPS[g])
+            need.update(gate_steps(g, method))
     elif "thermodynamic" in gates:
-        need.add("phonons")
-    if "thermodynamic" in gates:
-        if method == "QHA":
-            need.add("qha")
-        elif method == "VDOS":
-            need.add("md")
+        need.update(THERMO_STEPS[method.upper()])
     return [n for n in COMPUTE_STEPS if n in need]
 
 
@@ -365,7 +367,16 @@ def resolve_gates(phase, explicit: list | None = None) -> list[str]:
     if cfg.gates.enabled is not None:
         return list(cfg.gates.enabled)
     plan = read_plan(phase)
-    return list(plan.gates) if plan and plan.gates else list(GATES)
+    return [g for g in plan.gates if g in GATES] if plan and plan.gates else list(GATES)
+
+
+def phonon_method(phase, explicit: str | None = None) -> str:
+    """Free-energy method of the hull: *explicit* > ``cfg.hull.phonon_method`` > what the phase was prepared with > HA."""
+    m = explicit or cfg.hull.phonon_method
+    if m:
+        return m.upper()
+    plan = read_plan(phase)
+    return str((plan.options.get("hull.phonon_method") if plan else None) or "HA").upper()
 
 
 def operating_T(phase, default: float | None = None) -> float:

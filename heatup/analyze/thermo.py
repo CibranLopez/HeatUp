@@ -519,7 +519,7 @@ class GibbsAssembler:
 
 
 def build_assembler(method: str | None = None) -> GibbsAssembler:
-    method = (method or cfg.hull.phonon_method).upper()
+    method = (method or cfg.hull.phonon_method or "HA").upper()
     if method not in VIB_METHODS:
         raise ValueError(f"phonon method must be one of {sorted(VIB_METHODS)}, got {method!r}")
     asm = GibbsAssembler().register(f"F_vib[{method}]", VIB_METHODS[method])
@@ -535,7 +535,7 @@ def build_assembler(method: str | None = None) -> GibbsAssembler:
 def free_energy(phase_dir, temperatures, method: str | None = None) -> dict:
     """Convenience: assemble G(T) with the given vibrational method and attach quality flags."""
     phase = PhaseDir.of(phase_dir)
-    method = (method or cfg.hull.phonon_method).upper()
+    method = ledger.phonon_method(phase, method)
     res = build_assembler(method).compute(phase, temperatures)
     res["method"] = method
     flags: list[str] = []

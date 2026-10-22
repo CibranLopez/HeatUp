@@ -79,6 +79,7 @@ class ScreenOptions:
     """Everything a caller may want to vary; ``None`` = keep the HeatUp default."""
     operating_T: float | None = None                 # K, temperature of the hull judgement
     md_temperatures: list[float] | None = None       # K, MD runs evaluated by Gates 0/2 (default [operating_T])
+    relax: bool = True                               # False: the structure is already relaxed - use it as given (single point)
     mobile_species: list[str] | None = None          # e.g. ["Li"]: allowed to diffuse (Gates 0 and 2)
     thresholds: dict[str, float] | None = None       # gate thresholds, e.g. {"hull_ok_eV": 0.02}
     pre_md_hull_reject_eV: float | None = None       # pre_md: reject above this 0 K hull energy
@@ -212,17 +213,19 @@ def _plan_and_run(phase: PhaseDir, stage: str, o: ScreenOptions, T_op: float) ->
     from heatup.compute.execute import run_plan
     from heatup.prepare.plan import prepare_competitors, prepare_phase
 
-    enabled, method = _gates(), cfg.hull.phonon_method
+    enabled, method = _gates(), (cfg.hull.phonon_method or "HA")
     if stage == "pre_md":
         tsteps = ["relax"] + (["elastic"] if "mechanical" in enabled else [])
         csteps = ["relax"]
     else:
         tsteps = ledger.steps_for(enabled, method, "target")
         csteps = ledger.steps_for(enabled, method, "competitor")
+    asked = (["relax"] if o.relax else []) + enabled
     prepare_phase(phase, "target", steps=tsteps, operating_T=T_op, md_temperatures=o.md_temperatures or [T_op],
-                  gates=enabled)
+                  gates=asked)
     if "thermodynamic" in enabled:
-        prepare_competitors([phase], steps=csteps)
+        with override(**{"plan.gates": asked}):
+            prepare_competitors([phase], steps=csteps)
     rows = run_plan([phase], device=o.device, include_competing="thermodynamic" in enabled)
     return [f"{r['step']} failed: {r['detail']}".strip(": ") for r in rows
             if r["phase"] == phase.tag and r["action"] == "failed"]
@@ -336,7 +339,7 @@ def screen(sym_dir: "str | os.PathLike | PhaseDir", stage: Stage = "post_md",
 _RANK = {STATUS_OK: 0, STATUS_WARN: 1, STATUS_MISSING: 2, STATUS_FAIL: 3, "pruned": 4, "error": 5}
 
 
-def screen_many(targets: "list[str | PhaseDir]", out_dir: str | None = None, device: str | None = None,
+def screen_many(targets: "list[str | PhaseDir]", out_dir: str | None = None, device: str | None = None, relax: bool = True,
                 operating_T: float | None = None, md_temperatures: list[float] | None = None,
                 prescreen_only: bool = False, force=None, **evaluate_kw) -> list[dict]:
     """Screening funnel for *many* structures, cheapest first, every step cached::
@@ -361,11 +364,14 @@ def screen_many(targets: "list[str | PhaseDir]", out_dir: str | None = None, dev
         raise ValueError("no readable target structures")
     with _LOCK, override(**({"run.force": normalize_force(force)} if force is not None else {})):
         T_op = float(cfg.hull.operating_T if operating_T is None else operating_T)
-        enabled, method = _gates(), cfg.hull.phonon_method
+        enabled, method = _gates(), (cfg.hull.phonon_method or "HA")
+        asked = (["relax"] if relax else []) + enabled
         for t in tph:
             prepare_phase(t.phase_dir, "target", steps=ledger.steps_for(enabled, method, "target"),
-                          operating_T=T_op, md_temperatures=md_temperatures or [T_op], gates=enabled)
-        refs = prepare_competitors([t.phase_dir for t in tph], steps=ledger.steps_for(enabled, method, "competitor"))
+                          operating_T=T_op, md_temperatures=md_temperatures or [T_op], gates=asked)
+        with override(**{"plan.gates": asked}):
+            refs = prepare_competitors([t.phase_dir for t in tph],
+                                       steps=ledger.steps_for(enabled, method, "competitor"))
         log.info("screening %d target(s) against %d reference phase(s)", len(tph), len(refs))
         dirs = [t.phase_dir for t in tph]
         run_plan(dirs, device=device, steps=["relax"])        # the cheap stage of the funnel: just the relaxations

@@ -147,7 +147,7 @@ def _size(n: int) -> str:
     return f"{n} B"
 
 
-def layout(root: str, max_depth: int = 5, max_files: int = 8, hide: tuple = ("__pycache__", ".ipynb_checkpoints")) -> str:
+def layout(root: str, max_depth: int = 5, max_files: int = 8, hide: tuple = ("__pycache__", ".ipynb_checkpoints", ".DS_Store")) -> str:
     """Text tree of the database (or candidates) directory with file sizes - shows what exists and
     where each step wrote its data (``relaxation/``, ``elastic/``, ``phonons/``, ``md/<T>K/``, ``stability/``)."""
     if not os.path.isdir(root):

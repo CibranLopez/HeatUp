@@ -10,8 +10,10 @@ Notebook 1: put every structure where it is computed and write down what is to b
        Those from the candidates are copied into the database.  A phase that is already in the database is reused
        **only if its plan has the settings this project wants**; otherwise it is left untouched, reported in
        ``Prepared.refused`` with a warning, and never used in a hull (compare ``ledger.plan_conflicts``);
-    3. a ``plan.json`` next to every POSCAR (:class:`heatup.core.ledger.Plan`): the gates you asked for
-       (``cfg.plan.gates``) and the steps they need (or ``cfg.plan.target_steps`` / ``competitor_steps`` if you list
+    3. a ``plan.json`` next to every POSCAR (:class:`heatup.core.ledger.Plan`) and **the folder of every planned
+       calculation** (``relaxation/``, ``elastic/``, ``phonons/``, ``md/<T>K/``), each with a ``task_<step>.json``
+       (inputs, files to write, options): everything an outside code such as DFT needs to know.  What you asked for
+       (``cfg.plan.gates``: the gates, and ``"relax"`` unless the structures are already relaxed) decides the steps (or ``cfg.plan.target_steps`` / ``competitor_steps`` if you list
        them), the temperatures, and the resolved options of those steps.  A competitor that already has a plan keeps
        it and only gains the steps it lacks.  From then on the folders are self-describing: notebook 2 executes the
        plans, notebook 3 judges the results against them, and neither needs the calculation settings again.
@@ -31,8 +33,8 @@ import logging
 import os
 
 from heatup.core import ledger
-from heatup.core.config import AUTO_MIN_LENGTH_A, cfg
-from heatup.core.layout import PhaseDir, iter_phase_dirs, read_structure, resolve_supercell, upper_triangular
+from heatup.core.config import AUTO_MIN_LENGTH_A, REQUESTS, cfg
+from heatup.core.layout import PhaseDir, iter_phase_dirs, read_structure, resolve_supercell, upper_triangular, write_json
 from heatup.prepare.phases import Phase, find_reference_phases, locate_phase, phase_from_dir, same_structure
 
 log = logging.getLogger("heatup")
@@ -56,10 +58,59 @@ def _steps(names, what: str) -> list[str]:
     return keep
 
 
+def make_task_folders(phase_dir, plan: ledger.Plan) -> list[str]:
+    """Create the folder of every planned calculation, each with a ``task_<step>.json`` that says what to compute here:
+    inputs, the files to write, and the options.  The folders are all a calculation needs to be run **with any code**
+    (DFT, another potential): write the listed outputs (layout and fields: ``heatup.core.layout`` / notebook 03) and
+    notebook 03 accepts them (state ``external``).  ``run_plan`` (notebook 02) writes the same files itself."""
+    phase = PhaseDir.of(phase_dir)
+    rel = lambda p: os.path.relpath(p, phase.path)
+    made = []
+    for step, T in plan.tasks():
+        spec = ledger.STEPS[step]
+        d = spec.where(phase, T)
+        os.makedirs(d, exist_ok=True)
+        keys = set(ledger.plan_options([step]))
+        task = {"phase": phase.tag, "role": plan.role, "step": step, "temperature_K": T,
+                "needs": list(spec.needs), "inputs": [rel(p) for p in spec.inputs(phase, T)],
+                "outputs": [rel(os.path.join(d, o)) for o in spec.outputs],
+                "options": {k: v for k, v in sorted(plan.options.items()) if k in keys}}
+        write_json(os.path.join(d, f"task_{step}.json"), task)
+        made.append(d)
+    for step in ledger.COMPUTE_STEPS:                         # task files of steps that are no longer planned
+        if step in plan.steps:
+            continue
+        spec = ledger.STEPS[step]
+        dirs = [spec.where(phase, None)] if not spec.per_T else (
+            [os.path.join(phase.md_dir, n) for n in os.listdir(phase.md_dir)] if os.path.isdir(phase.md_dir) else [])
+        for d in dirs:
+            f = os.path.join(d, f"task_{step}.json")
+            if os.path.exists(f):
+                os.remove(f)
+    return made
+
+
+def _save(phase_dir, plan: ledger.Plan) -> None:
+    """``plan.json`` + the task folders."""
+    ledger.write_plan(phase_dir, plan)
+    make_task_folders(phase_dir, plan)
+
+
+def _method() -> str:
+    m = (cfg.hull.phonon_method or "HA").upper()
+    if m not in ledger.THERMO_STEPS:
+        raise ValueError(f"cfg.hull.phonon_method: {m!r}; choose from {list(ledger.THERMO_STEPS)}")
+    return m
+
+
 def make_plan(role: str, source: str, steps: list[str], operating_T: float | None = None,
               md_temperatures: list[float] | None = None, gates: list[str] | None = None) -> ledger.Plan:
     opts = ledger.plan_options(steps)
     opts["plan.prune_window_eV"] = cfg.plan.prune_window_eV              # project-level; analysis reads it from here
+    if gates and "thermodynamic" in gates:
+        opts["hull.phonon_method"] = _method()                           # notebook 3 follows it unless told otherwise
+    if "relax" in steps:                                                 # "relax" not asked for: structures are taken as given
+        opts["relax.optimize"] = "relax" in gates if gates else True
     md_T = sorted({float(t) for t in (md_temperatures or [])}) if "md" in steps else []
     return ledger.Plan(role=role, steps=list(steps), gates=list(gates or []), operating_T_K=operating_T,
                        md_temperatures_K=md_T, options=opts, source=source)
@@ -72,10 +123,13 @@ def prepare_phase(phase_dir, role: str = "target", steps: list[str] | None = Non
     Steps: *steps* > ``cfg.plan.<role>_steps`` > derived from the gates (*gates* > ``cfg.plan.gates``)."""
     phase = PhaseDir.of(phase_dir)
     gates = list(cfg.plan.gates if gates is None else gates)
+    bad = [g for g in gates if g not in REQUESTS]
+    if bad:
+        raise ValueError(f"cfg.plan.gates: unknown {bad}; choose from {list(REQUESTS)}")
     if steps is None:
         steps = cfg.plan.target_steps if role == "target" else cfg.plan.competitor_steps
     if steps is None:
-        steps = ledger.steps_for(gates, "HA", role)
+        steps = ledger.steps_for(gates, _method(), role)
     if role == "target":
         steps = _steps(steps, "target_steps")
         op = float(cfg.hull.operating_T if operating_T is None else operating_T)
@@ -86,7 +140,7 @@ def prepare_phase(phase_dir, role: str = "target", steps: list[str] | None = Non
         if "md" in steps and not temps:
             log.warning("competitor step 'md' planned without temperatures for %s", phase.tag)
     plan = make_plan(role, source, steps, op, temps, gates)
-    ledger.write_plan(phase, plan)
+    _save(phase, plan)
     return plan
 
 
@@ -128,11 +182,12 @@ def _refusal(ph: Phase, conflicts: dict) -> str:
 
 
 def prepare_competitors(targets, refresh_mp: bool = False, steps: list[str] | None = None,
-                        refused: dict | None = None) -> list[Phase]:
+                        refused: dict | None = None, md_temperatures: list[float] | None = None) -> list[Phase]:
     """Competing phases of *targets* (database + candidates + optional MP / generated), all in ``database_root``
     with a ``plan.json`` (``steps`` default: ``cfg.plan.competitor_steps``, else derived from ``cfg.plan.gates``).
     Phases already in the database keep their plan (and gain missing steps) if their settings match; otherwise they are
-    refused (warning, entry in *refused*) and left exactly as they are."""
+    refused (warning, entry in *refused*) and left exactly as they are.  If the competitors get an ``md`` step, it runs at
+    *md_temperatures*, else ``cfg.plan.md_temperatures``, else the MD temperatures of the targets."""
     tph = [p for p in (phase_from_dir(t, "target") for t in targets) if p]
     if not tph:
         return []
@@ -142,11 +197,16 @@ def prepare_competitors(targets, refresh_mp: bool = False, steps: list[str] | No
                                        for t in tph)]                    # the target's own structure is no competitor
     gates = list(cfg.plan.gates)
     names = steps if steps is not None else (cfg.plan.competitor_steps if cfg.plan.competitor_steps is not None
-                                              else ledger.steps_for(gates, "HA", "competitor"))
+                                              else ledger.steps_for(gates, _method(), "competitor"))
     wanted_steps = _steps(names, "competitor_steps")
+    md_T = md_temperatures if md_temperatures is not None else cfg.plan.md_temperatures
+    if "md" in wanted_steps and not md_T:                    # same temperatures as the targets (VDOS needs the same T range)
+        md_T = sorted({T for t in targets for T in (getattr(ledger.read_plan(t), "md_temperatures_K", None) or [])})
+        if not md_T:
+            log.warning("competitor step 'md' is planned but no MD temperature is known: set cfg.plan.md_temperatures")
     out = []
     for ph in refs:
-        wanted = make_plan("competitor", ph.source, wanted_steps, None, cfg.plan.md_temperatures, gates)
+        wanted = make_plan("competitor", ph.source, wanted_steps, None, md_T, gates)
         existing = ledger.read_plan(ph.phase_dir)
         merged = ledger.merge_plans(existing, wanted) if existing else wanted
         conflicts = ledger.plan_conflicts(existing, wanted.steps, wanted.options) if existing else {}
@@ -159,7 +219,7 @@ def prepare_competitors(targets, refresh_mp: bool = False, steps: list[str] | No
             if refused is not None:
                 refused[ph.tag] = conflicts
             continue
-        ledger.write_plan(ph.phase_dir, merged)
+        _save(ph.phase_dir, merged)
         out.append(ph)
     return out
 

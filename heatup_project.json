@@ -1,0 +1,6 @@
+{
+  "phases": {
+    "database_root": "database",
+    "candidates_root": "candidates"
+  }
+}

@@ -11,7 +11,9 @@ The two static calculations of a phase: ``relax`` and ``elastic``.
         spacegroup_input / spacegroup_relaxed, calculator
 
     FixSymmetry (assess *this* phase), tight default fmax, FrechetCellFilter (``ExpCellFilter`` is deprecated and
-    biases the strain coordinates), finite pressure handled properly (enthalpy).  A relaxation that does not
+    biases the strain coordinates), finite pressure handled properly (enthalpy).  ``relax.optimize = False`` (``"relax"``
+    not asked for in ``cfg.plan.gates``): the given structure is accepted as relaxed - CONTCAR is a copy of it and
+    energy.json holds its single-point energy, residual force and stress (``"optimized": false``).  A relaxation that does not
     converge is an error, **its manifest is not written** (so it is never reported as cached) and CONTCAR/energy.json
     stay for inspection.
 
@@ -82,24 +84,34 @@ def run_relaxation(phase_dir, device: str = "cpu", force: bool = False) -> None:
     sg_in = spacegroup(atoms)
     calc = build_calculator(device, material=phase.material)
     try:
-        log.info("Relaxing %s  (fmax=%g, cell=%s, P=%g GPa, %s)", phase.tag, rcfg.fmax,
-                 rcfg.relax_cell, rcfg.pressure_GPa, calculator_label(phase.material))
-        try:
-            conv, fres = relax_atoms(
-                atoms, calc, fmax=rcfg.fmax, max_steps=rcfg.max_steps,
-                relax_cell=rcfg.relax_cell, constant_volume=rcfg.constant_volume,
-                pressure_GPa=rcfg.pressure_GPa, fix_symmetry=rcfg.fix_symmetry,
-                symprec=rcfg.symprec, trajectory=os.path.join(phase.relax_dir, "run.traj"))
-        except Exception as exc:  # noqa: BLE001
-            stress_problem = any(s in str(exc) for s in
-                                 ("compute_atomic_stresses", "get_stress", "too many indices"))
-            if not (rcfg.relax_cell and stress_problem):
-                raise
-            log.warning("model cannot provide stress (%s): relaxing positions only", exc)
-            atoms = read_structure(phase.poscar)
-            conv, fres = relax_atoms(
-                atoms, calc, fmax=rcfg.fmax, max_steps=rcfg.max_steps, relax_cell=False,
-                fix_symmetry=rcfg.fix_symmetry, symprec=rcfg.symprec)
+        if rcfg.optimize:
+            log.info("Relaxing %s  (fmax=%g, cell=%s, P=%g GPa, %s)", phase.tag, rcfg.fmax,
+                     rcfg.relax_cell, rcfg.pressure_GPa, calculator_label(phase.material))
+            try:
+                conv, fres = relax_atoms(
+                    atoms, calc, fmax=rcfg.fmax, max_steps=rcfg.max_steps,
+                    relax_cell=rcfg.relax_cell, constant_volume=rcfg.constant_volume,
+                    pressure_GPa=rcfg.pressure_GPa, fix_symmetry=rcfg.fix_symmetry,
+                    symprec=rcfg.symprec, trajectory=os.path.join(phase.relax_dir, "run.traj"))
+            except Exception as exc:  # noqa: BLE001
+                stress_problem = any(s in str(exc) for s in
+                                     ("compute_atomic_stresses", "get_stress", "too many indices"))
+                if not (rcfg.relax_cell and stress_problem):
+                    raise
+                log.warning("model cannot provide stress (%s): relaxing positions only", exc)
+                atoms = read_structure(phase.poscar)
+                conv, fres = relax_atoms(
+                    atoms, calc, fmax=rcfg.fmax, max_steps=rcfg.max_steps, relax_cell=False,
+                    fix_symmetry=rcfg.fix_symmetry, symprec=rcfg.symprec)
+        else:                                # already relaxed elsewhere: energy, forces and stress at the given structure
+            log.info("Using %s as given (relax not requested): single point with %s", phase.tag,
+                     calculator_label(phase.material))
+            atoms.calc = calc
+            conv = True
+            fres = float(np.sqrt((atoms.get_forces() ** 2).sum(axis=1)).max())
+            if fres > rcfg.fmax:
+                log.warning("%s: max |F| = %.3f eV/A at the given structure (relax.fmax = %g): phonons and elastic "
+                            "constants will carry this residual force", phase.tag, fres, rcfg.fmax)
 
         atoms.set_constraint()               # constraints must not leak into CONTCAR/MD
         n = len(atoms)
@@ -117,6 +129,7 @@ def run_relaxation(phase_dir, device: str = "cpu", force: bool = False) -> None:
             "n_atoms": n,
             "pressure_GPa": rcfg.pressure_GPa,
             "converged": conv,
+            "optimized": rcfg.optimize,
             "fmax_final_eV_A": fres,
             "stress_GPa": stress,
             "spacegroup_input": list(sg_in),

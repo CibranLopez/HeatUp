@@ -180,7 +180,7 @@ def test_gates_asked_for_drive_the_plan(project):
     from heatup.compute.execute import run_plan
     from heatup.prepare.plan import prepare_project
 
-    cfg.plan.gates = ["mechanical"]
+    cfg.plan.gates = ["relax", "mechanical"]
     prep = prepare_project(project)
     target = prep.targets[0]
     assert ledger.read_plan(target).steps == ["relax", "elastic"] and prep.competitors == []   # no hull -> no competitors
@@ -225,7 +225,7 @@ def test_database_competitors_are_reused_only_with_matching_settings(project):
     from heatup.compute.execute import run_plan
     from heatup.prepare.plan import prepare_project
 
-    cfg.plan.gates = ["thermodynamic"]
+    cfg.plan.gates = ["relax", "thermodynamic"]
     cfg.plan.target_steps = cfg.plan.competitor_steps = ["relax"]
     prep = prepare_project(project)
     run_plan()
@@ -261,7 +261,7 @@ def test_fc3_step_and_report(project):
     cfg.phonon.fc_order, cfg.phonon.min_length_A = 3, 6.0
     cfg.fc3.supercell, cfg.fc3.cutoff_pair_A, cfg.fc3.kappa_mesh_length_A = (2, 2, 2), 3.0, 8.0
     cfg.fc3.temperatures, cfg.fc3.ratio_warn = [300.0], 1e-9              # any linewidth triggers the flag
-    cfg.plan.gates = ["mechanical"]
+    cfg.plan.gates = ["relax", "mechanical"]
     cfg.plan.target_steps = ["relax", "fc3"]
     target = prepare_project(project, competitors=False).targets[0]
     rows = run_plan()
@@ -272,3 +272,108 @@ def test_fc3_step_and_report(project):
     rep = evaluate(target, gates=["mechanical"], save_figure=False)
     assert rep["anharmonic"]["T_K"] == 300.0 and any("anharmonic" in f for f in rep["flags"])
     assert {r["action"] for r in run_plan()} == {"done"}                  # cached: manifest of the fc3 step is fresh
+
+
+def test_prepare_generates_the_task_folders(project):
+    """Notebook 1 creates the folder of every planned calculation, each saying what to compute (for DFT & co.)."""
+    from heatup.analyze.evaluate import status
+    from heatup.prepare.plan import prepare_project
+
+    prepare_project(project)
+    base = "database/Cu3Au/L1_2"
+    for d in ("relaxation", "elastic", "phonons", "md/300K"):
+        assert os.path.isdir(f"{base}/{d}"), d
+    md = json.load(open(f"{base}/md/300K/task_md.json"))
+    assert md["temperature_K"] == 300.0 and md["inputs"] == ["relaxation/CONTCAR"]
+    assert md["outputs"] == ["md/300K/output.traj", "md/300K/md.json"] and md["options"]["md.n_steps"] == cfg.md.n_steps
+    assert json.load(open(f"{base}/relaxation/task_relax.json"))["inputs"] == ["POSCAR"]
+    assert os.path.isdir("database/Cu/Fm-3m/phonons") and not os.path.exists("database/Cu/Fm-3m/md")   # competitor: relax + phonons
+    assert {r["state"] for r in status()} == {"pending"}                       # empty folders are not "started"
+    assert heatup.PhaseDir(base).md_temperatures(complete=False) == []
+    # asking for less removes the tasks that are no longer planned
+    cfg.plan.gates = ["relax", "mechanical"]
+    prepare_project(project, competitors=False)
+    assert os.path.exists(f"{base}/elastic/task_elastic.json") and not os.path.exists(f"{base}/md/300K/task_md.json")
+
+
+def test_relax_not_requested_uses_the_structure_as_given(project):
+    """'relax' left out of cfg.plan.gates: the structure is taken as already relaxed (single point only)."""
+    import numpy as np
+    from ase.io import read
+    from heatup.analyze.evaluate import evaluate
+    from heatup.compute.execute import run_plan
+    from heatup.prepare.plan import prepare_project
+
+    write_phase("input/candidates", "Cu3Au", "strained", l1_2("Cu", "Au", 3.90))      # not at equilibrium
+    entry = [{"material": "Cu3Au", "symmetry": "strained", "temperature": 300}]
+    cfg.plan.gates = ["mechanical"]                                    # no "relax" asked for
+    target = prepare_project(entry, competitors=False).targets[0]
+    assert ledger.read_plan(target).options["relax.optimize"] is False
+    assert {r["action"] for r in run_plan()} == {"ran"}
+    e = json.load(open(target.energy_json))
+    assert e["optimized"] is False and e["converged"] is True and e["fmax_final_eV_A"] >= 0.0
+    assert np.allclose(read(target.contcar).cell.array, read(target.poscar).cell.array)   # cell kept as given
+    assert not os.path.exists(os.path.join(target.relax_dir, "run.traj"))
+    rep = evaluate(target, save_figure=False)
+    assert rep["mechanical"]["available"] and any("residual stress" in f for f in rep["flags"])   # strain is visible
+    # asked for: the same structure is relaxed and the cell changes
+    cfg.plan.gates = ["relax", "mechanical"]
+    prepare_project(entry, competitors=False)
+    assert ledger.read_plan(target).options["relax.optimize"] is True
+    run_plan()
+    assert not np.allclose(read(target.contcar).cell.array, read(target.poscar).cell.array, atol=1e-3)
+    assert json.load(open(target.energy_json))["optimized"] is True
+
+
+def test_md_for_competing_phases_when_asked(project):
+    """Default: competitors get relax + phonons only; listing 'md' gives them md/<T>K too (targets' temperatures by default)."""
+    from heatup.prepare.plan import prepare_project
+
+    prepare_project(project)
+    assert not os.path.exists("database/Cu/Fm-3m/md")
+    cfg.plan.competitor_steps = ["relax", "phonons", "md"]
+    cfg.plan.md_temperatures = None
+    prepare_project(project)
+    assert os.path.isdir("database/Cu/Fm-3m/md/300K") and os.path.exists("database/Au/Fm-3m/md/300K/task_md.json")
+    assert ledger.read_plan("database/Cu/Fm-3m").md_temperatures_K == [300.0]
+
+
+def test_free_energy_method_decides_what_competitors_need(project):
+    """cfg.hull.phonon_method set in notebook 1 plans the right calculations (md only where the method needs it)."""
+    from heatup.prepare.plan import prepare_project
+
+    prepare_project(project)                                               # default HA: competitors relax + phonons
+    assert ledger.read_plan("database/Cu/Fm-3m").steps == ["relax", "phonons"]
+    assert not os.path.exists("database/Cu/Fm-3m/md")
+    cfg.plan.competitor_steps = None
+    cfg.hull.phonon_method = "VDOS"
+    cfg.md.n_steps, cfg.md.nblock = 600, 5
+    prep = prepare_project(project)
+    assert ledger.read_plan("database/Au/Fm-3m").steps == ["relax", "phonons", "md"]    # phonons planned earlier stay (merge)
+    assert ledger.read_plan("database/Au/Fm-3m").md_temperatures_K == [300.0]            # the queried material's temperature
+    assert os.path.exists("database/Cu/Fm-3m/md/300K/task_md.json")
+    assert ledger.read_plan(prep.targets[0]).options["hull.phonon_method"] == "VDOS"
+
+
+def test_vdos_hull_end_to_end(project):
+    """Gate 3 with anharmonic (MD-spectrum) free energies for every phase, followed from the plan by 'notebook 3'."""
+    from heatup.analyze.evaluate import evaluate, run_analysis
+    from heatup.compute.execute import run_plan
+    from heatup.prepare.plan import prepare_project
+
+    cfg.md.n_steps, cfg.md.nblock, cfg.md.min_cell_A = 1500, 5, 6.0
+    cfg.analysis.equil_ps = 0.3
+    cfg.plan.gates = ["relax", "thermodynamic"]
+    cfg.hull.phonon_method = "VDOS"
+    prep = prepare_project(project)
+    target = prep.targets[0]
+    assert ledger.read_plan(target).steps == ["relax", "md"]
+    assert all(ledger.read_plan(p.phase_dir).steps == ["relax", "md"] for p in prep.competitors)
+    rows = run_plan()
+    assert not [r for r in rows if r["action"] == "failed"], rows
+    assert {r["step"] for r in rows} == {"relax", "md"}
+    cfg.hull.phonon_method = None                                           # notebook 3 knows nothing: the plan does
+    assert all(r["ok"] for r in run_analysis())
+    th = evaluate(target, save_figure=False)["thermodynamic"]
+    assert th["available"] and th["method"] == "VDOS" and th["n_competing"] == 2, th
+    assert th["e_hull_at_T_eV"] < 0.05 and th["overlay"] is None            # a consistent VDOS hull needs no overlay

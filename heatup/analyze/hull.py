@@ -113,6 +113,11 @@ def zero_k_screen(target: Phase, competitors: list[Phase]) -> dict:
     return {"e_above_hull_0K": dist, "H0": ref}
 
 
+def THERMO_STEPS_OF(target_dir) -> tuple:
+    """The calculations whose settings must agree between target and competitor for the hull's method."""
+    return ledger.THERMO_STEPS[ledger.phonon_method(target_dir)]
+
+
 def usable_competitors(target_dir) -> tuple[list[Phase], dict[str, dict]]:
     """``(usable, refused)``: the database's competitors of *target_dir*, split by whether their calculation settings
     (plan options of the steps the hull uses) equal the target's.  ``refused = {tag: {option: (theirs, target's)}}``.
@@ -122,7 +127,7 @@ def usable_competitors(target_dir) -> tuple[list[Phase], dict[str, dict]]:
     comps = find_competing_phases(target_dir, local_only=True)
     if tplan is None:
         return comps, {}
-    hull_steps = ["relax", "phonons", "qha"] + (["md"] if cfg.hull.phonon_method.upper() == "VDOS" else [])
+    hull_steps = ["relax", *THERMO_STEPS_OF(target_dir)]
     ok, refused = [], {}
     for p in comps:
         cplan = ledger.read_plan(p.phase_dir)
@@ -205,7 +210,7 @@ def assess_thermodynamic_stability(target_dir, operating_T: float | None = None)
     stab = target_dir.stability_dir
     os.makedirs(stab, exist_ok=True)
     flags: list[str] = []
-    method = hc.phonon_method.upper()
+    method = ledger.phonon_method(target_dir)
 
     # 1. competitors on disk
     usable, refused = usable_competitors(target_dir)

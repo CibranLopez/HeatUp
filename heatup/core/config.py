@@ -122,6 +122,11 @@ class RelaxCfg(_Frozen):
     #: loosely relaxed cell (v0.2 used 0.05 eV/Å -> spurious imaginary modes).
     fmax: float = 0.005
     max_steps: int = 1000
+    #: False: the structure is used as given (already relaxed with another code/model): nothing is optimised, only
+    #: its energy, forces and stress are evaluated with the active calculator (the hull needs energies from the same
+    #: calculator as the phonons).  In notebook 1 this follows from ``"relax"`` being in ``cfg.plan.gates``.
+    optimize: bool = True
+    #: Relax the cell too (False: ions only, the given cell is kept).
     relax_cell: bool = True
     constant_volume: bool = False
     #: Keep the input space group during relaxation (assess *this* phase, do
@@ -224,6 +229,7 @@ class MDCfg(_Frozen):
 
 
 GATES = ("mechanical", "structural_transition", "vibrational", "thermodynamic")   # the one definition
+REQUESTS = ("relax", *GATES)         # what ``cfg.plan.gates`` may contain
 
 
 @dc.dataclass
@@ -309,10 +315,11 @@ class HullCfg(_Frozen):
     #: ``plan.json`` value (set in notebook 1) wins.
     operating_T: float = 300.0
     temperatures: list = dc.field(default_factory=lambda: list(range(0, 1501, 50)))
-    #: Which free-energy data the hull uses (it only *selects* among data that exist; what gets computed is
-    #: decided by ``cfg.plan``): ``"HA"`` for *every* phase (consistent, default) | ``"QHA"`` | ``"VDOS"``
-    #: (VDOS only where MD exists; the hull then mixes methods -> flagged).
-    phonon_method: str = "HA"
+    #: Free energies of the hull, the SAME method for every phase: ``"HA"`` harmonic phonons (default) | ``"QHA"`` |
+    #: ``"VDOS"`` (effective-harmonic F_vib from each phase's MD spectrum: anharmonic, needs MD for the target AND
+    #: all competitors).  None -> as prepared: notebook 1 reads it to decide which calculations the competing phases
+    #: need (and stores it in the plans); notebook 3 uses that unless you set it here.
+    phonon_method: str | None = None
     #: Extra anharmonic overlay computed for the target only (reported next to the consistent hull).
     target_overlay: str = "VDOS"
     include_electronic: bool = True
@@ -326,9 +333,11 @@ class HullCfg(_Frozen):
 class PlanCfg(_Frozen):
     """WHAT notebook 2 will compute for every phase (notebook 1).  Ask for gates and everything they need is
     planned; the settings of each calculation are the ``relax/elastic/phonon/qha/fc3/md`` sections."""
-    #: Gates you want an answer for.  They decide the calculations (``ledger.steps_for``: mechanical -> elastic,
-    #: structural_transition -> md, vibrational -> phonons + md, thermodynamic -> phonons of target and competitors).
-    gates: list = dc.field(default_factory=lambda: list(GATES))
+    #: What you ask for: the gates and/or ``"relax"``.  The gates decide the calculations (``ledger.steps_for``:
+    #: mechanical -> elastic, structural_transition -> md, vibrational -> phonons + md, thermodynamic -> phonons of
+    #: target and competitors).  Leave ``"relax"`` out when the structures are already relaxed (other code/model): they
+    #: are then used as given - only energy, forces and stress are evaluated (``relax.optimize = False``).
+    gates: list = dc.field(default_factory=lambda: list(REQUESTS))
     #: Override the derived steps (names of ``ledger.STEPS``; ``relax`` is always added), e.g. to add ``qha`` / ``fc3``
     #: or ``md`` for competitors.  None -> derived from ``gates``.
     target_steps: list | None = None
