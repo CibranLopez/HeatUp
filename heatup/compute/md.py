@@ -39,9 +39,9 @@ from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
 
 from heatup.compute.calculator import build_calculator, calculator_label, release_calculator
 from heatup.core import ledger
-from heatup.core.config import AUTO_MIN_LENGTH_A, cfg
-from heatup.core.layout import (PhaseDir, read_json, read_structure, resolve_supercell, trajectory_frames,
-                                upper_triangular, write_json, write_poscar)
+from heatup.core.config import cfg
+from heatup.core.layout import PhaseDir, read_json, trajectory_frames, write_json
+from heatup.prepare.export import build_md_cell
 
 log = logging.getLogger("heatup")
 
@@ -52,30 +52,6 @@ except ImportError:                     # pragma: no cover
     from ase.md.npt import NPT
 
 log = logging.getLogger("heatup")
-
-
-def build_md_cell(phase: PhaseDir, force: bool = False):
-    """MD supercell from the relaxed cell: ``md.supercell`` if set, else perpendicular width >= ``md.min_cell_A``."""
-    poscar = os.path.join(phase.md_dir, "POSCAR")
-    info = os.path.join(phase.md_dir, "cell.json")
-    mcfg = cfg.md
-    request = {"supercell": None if mcfg.supercell is None else list(mcfg.supercell),
-               "min_cell_A": mcfg.min_cell_A, "max_atoms": mcfg.max_atoms}
-    if os.path.exists(poscar) and not force:
-        old = read_json(info) or {}
-        if old.get("request") == request and old.get("source") == ledger.file_hash(phase.contcar):
-            return read_structure(poscar)
-    unit = upper_triangular(read_structure(phase.contcar))
-    reps = resolve_supercell(unit.cell.array, len(unit), supercell=mcfg.supercell, min_length=mcfg.min_cell_A,
-                             max_atoms=mcfg.max_atoms, auto_min_length=AUTO_MIN_LENGTH_A["md"], what="MD supercell")
-    sc = unit.repeat(reps)
-    os.makedirs(phase.md_dir, exist_ok=True)
-    write_poscar(poscar, sc)
-    write_json(info, {"repetitions": list(reps), "n_atoms_unit": len(unit),
-                      "n_atoms": len(sc), "request": request,
-                      "source": ledger.file_hash(phase.contcar)})
-    log.info("MD supercell %s: reps=%s, %d atoms", phase.tag, reps, len(sc))
-    return sc
 
 
 def barostat_bulk_modulus(phase: PhaseDir) -> float:

@@ -29,11 +29,9 @@ from ase.optimize import BFGS
 from heatup.analyze.thermo import ModeSet
 from heatup.compute.calculator import build_calculator, calculator_label, release_calculator
 from heatup.core import ledger
-from heatup.core.config import AUTO_MIN_LENGTH_A, GPA_TO_EV_A3, MEV_PER_THZ, cfg
-from heatup.core.layout import PhaseDir, read_structure, resolve_supercell, write_json
-
-log = logging.getLogger("heatup")
-
+from heatup.core.config import GPA_TO_EV_A3, MEV_PER_THZ, cfg
+from heatup.core.layout import PhaseDir, read_structure, write_json
+from heatup.prepare.export import phonon_cells, qha_scales, scaled_cell, to_ase
 
 log = logging.getLogger("heatup")
 
@@ -42,47 +40,23 @@ log = logging.getLogger("heatup")
 # helpers
 # ---------------------------------------------------------------------------
 
-def choose_supercell(atoms: Atoms) -> tuple[int, int, int]:
-    pc = cfg.phonon
-    return resolve_supercell(atoms.cell.array, len(atoms), supercell=pc.supercell, min_length=pc.min_length_A,
-                             max_atoms=pc.max_atoms, auto_min_length=AUTO_MIN_LENGTH_A["phonon"], what="phonon supercell")
-
-
-def _phonopy(atoms: Atoms, sc: tuple[int, int, int]):
-    from phonopy import Phonopy
-    from phonopy.structure.atoms import PhonopyAtoms
-    pa = PhonopyAtoms(symbols=atoms.get_chemical_symbols(), cell=atoms.cell.array,
-                      scaled_positions=atoms.get_scaled_positions())
-    return Phonopy(pa, supercell_matrix=np.diag(sc), primitive_matrix="P",   # identity: n_bands = 3 n_atoms (phonopy >= 4 defaults to "auto")
-                   symprec=cfg.phonon.symprec)
-
-
-def _to_ase(sc) -> Atoms:
-    return Atoms(sc.symbols, cell=sc.cell, scaled_positions=sc.scaled_positions, pbc=True)
-
-
 def _forces(ph, calc) -> np.ndarray:
     """Forces of all displaced supercells minus the residual force of the perfect one."""
-    ref = _to_ase(ph.supercell)
+    ref = to_ase(ph.supercell)
     ref.calc = calc
     f0 = ref.get_forces()
     out = []
     for sc in ph.supercells_with_displacements:
-        a = _to_ase(sc)
+        a = to_ase(sc)
         a.calc = calc
         out.append(a.get_forces() - f0)
         a.calc = None
     return np.array(out)
 
 
-def harmonic_modes(atoms: Atoms, calc, *, with_band: bool = False):
-    """Relaxed *atoms* -> (ModeSet, info dict, phonopy object)."""
-    sc = choose_supercell(atoms)
-    ph = _phonopy(atoms, sc)
-    ph.generate_displacements(distance=cfg.phonon.delta_A)
-    log.info("  phonopy: supercell %s (%d atoms), %d displacements",
-             sc, len(atoms) * int(np.prod(sc)), len(ph.supercells_with_displacements))
-    ph.forces = _forces(ph, calc)
+def modes_from_forces(ph, atoms: Atoms, forces: np.ndarray, sc, *, with_band: bool = False):
+    """Forces of the displaced supercells (residual of the perfect one already subtracted) -> (ModeSet, info, phonopy)."""
+    ph.forces = forces
     ph.produce_force_constants()
     ph.run_mesh(cfg.phonon.mesh_length_A, is_gamma_center=True)
     mesh = ph.mesh
@@ -98,6 +72,14 @@ def harmonic_modes(atoms: Atoms, calc, *, with_band: bool = False):
     if with_band:
         info["band"] = _band(ph, atoms)
     return modes, info, ph
+
+
+def harmonic_modes(atoms: Atoms, calc, *, with_band: bool = False):
+    """Relaxed *atoms* -> (ModeSet, info dict, phonopy object), forces from *calc*."""
+    ph, sc = phonon_cells(atoms)
+    log.info("  phonopy: supercell %s (%d atoms), %d displacements",
+             sc, len(atoms) * int(np.prod(sc)), len(ph.supercells_with_displacements))
+    return modes_from_forces(ph, atoms, _forces(ph, calc), sc, with_band=with_band)
 
 
 def _band(ph, atoms: Atoms) -> dict:
@@ -167,6 +149,15 @@ def run_ha(phase_dir, device: str = "cpu", force: bool = False) -> None:
     finally:
         release_calculator(calc)
 
+    res = _write_ha(phase, atoms, modes, info, calculator_label(phase.material))
+    ledger.record(phase, "phonons")
+    log.info("  imaginary weight %.3f%% (max %.2f meV), ZPE %.1f meV/atom",
+             100 * res["imag_fraction"], res["max_imag_meV"], 1e3 * res["zpe_eV_per_atom"])
+
+
+def _write_ha(phase: PhaseDir, atoms: Atoms, modes: ModeSet, info: dict, calculator: str) -> dict:
+    """``phonons/ha.json`` (+ plot) from reduced modes - shared by the MLIP step and by :func:`collect_ha`."""
+    os.makedirs(phase.phonon_dir, exist_ok=True)
     tol = cfg.phonon.imag_tol_meV
     res = {
         "modes": modes.to_dict(max_points=6000),
@@ -175,18 +166,40 @@ def run_ha(phase_dir, device: str = "cpu", force: bool = False) -> None:
         "imag_tol_meV": tol,
         "zpe_eV_per_atom": modes.zpe(),
         "n_atoms": len(atoms),
-        "calculator": calculator_label(phase.material),
+        "calculator": calculator,
         **{k: v for k, v in info.items() if k != "band"},
         "band": info.get("band"),
     }
-    write_json(out, res, indent=None)
+    write_json(os.path.join(phase.phonon_dir, "ha.json"), res, indent=None)
     try:
         _plot_ha(modes, info.get("band"), os.path.join(phase.phonon_dir, "phonon.png"), phase.tag)
     except Exception as exc:  # noqa: BLE001
         log.warning("phonon plot failed: %s", exc)
-    ledger.record(phase, "phonons")
-    log.info("  imaginary weight %.3f%% (max %.2f meV), ZPE %.1f meV/atom",
-             100 * res["imag_fraction"], res["max_imag_meV"], 1e3 * res["zpe_eV_per_atom"])
+    return res
+
+
+def collect_ha(phase_dir, forces, perfect_forces=None, calculator: str = "external") -> dict:
+    """``phonons/ha.json`` from forces computed with ANY code on the cells of ``phonons/ha/`` (see ``prepare.export``).
+
+    ``forces``: array (n_displacements, n_atoms_supercell, 3) in eV/A, ordered like ``disp-001, disp-002, ...`` (or a path to a
+    ``.npy``); ``perfect_forces``: the same for ``SPOSCAR`` (its residual is subtracted).  No manifest is written: the result
+    is reported ``external`` and accepted as it is.  ``calculator`` is the label shared with ``energy.json`` of the phase."""
+    phase = PhaseDir.of(phase_dir)
+    atoms = read_structure(phase.contcar)
+    ph, sc = phonon_cells(atoms)
+    load = lambda x: np.load(x) if isinstance(x, (str, os.PathLike)) else np.asarray(x, float)
+    f = load(forces)
+    if perfect_forces is not None:
+        f = f - load(perfect_forces)
+    n_atoms_sc = len(to_ase(ph.supercell))
+    if f.shape != (len(ph.supercells_with_displacements), n_atoms_sc, 3):
+        raise ValueError(f"forces have shape {f.shape}, expected {(len(ph.supercells_with_displacements), n_atoms_sc, 3)} "
+                         "(displacement cells of phonons/ha in the order disp-001, disp-002, ...)")
+    modes, info, _ = modes_from_forces(ph, atoms, f, sc, with_band=True)
+    res = _write_ha(phase, atoms, modes, info, calculator)
+    log.info("%s: HA phonons collected (%s): imaginary weight %.3f%%, ZPE %.1f meV/atom", phase.tag, calculator,
+             100 * res["imag_fraction"], 1e3 * res["zpe_eV_per_atom"])
+    return res
 
 
 # ---------------------------------------------------------------------------
@@ -209,13 +222,12 @@ def run_qha(phase_dir, device: str = "cpu", force: bool = False) -> None:
     ref = read_structure(phase.contcar)
     n = len(ref)
     V0 = ref.get_volume()
-    scales = np.linspace(1 - qc.volume_range, 1 + qc.volume_range, qc.n_volumes)
+    scales = qha_scales()
     calc = build_calculator(device, material=phase.material)
     vols, e_el, mode_dicts = [], [], []
     try:
         for i, s in enumerate(scales):
-            a = ref.copy()
-            a.set_cell(ref.cell.array * s ** (1 / 3), scale_atoms=True)
+            a = scaled_cell(ref, s)
             a.calc = calc
             if qc.relax_internal:
                 BFGS(a, logfile=None).run(fmax=cfg.relax.fmax, steps=cfg.relax.max_steps)

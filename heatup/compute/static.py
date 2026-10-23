@@ -40,6 +40,7 @@ from heatup.compute.calculator import build_calculator, calculator_label, releas
 from heatup.core import ledger
 from heatup.core.config import EV_A3_TO_GPA, GPA_TO_EV_A3, cfg
 from heatup.core.layout import PhaseDir, read_structure, spacegroup, write_json, write_poscar
+from heatup.prepare.export import VOIGT_LABELS, elastic_cells
 
 log = logging.getLogger("heatup")
 
@@ -154,39 +155,25 @@ def run_relaxation(phase_dir, device: str = "cpu", force: bool = False) -> None:
 
 log = logging.getLogger("heatup")
 
-VOIGT_LABELS = ["xx", "yy", "zz", "yz", "xz", "xy"]
-
-
-def voigt_strain(i: int, delta: float) -> np.ndarray:
-    e = np.zeros((3, 3))
-    if i < 3:
-        e[i, i] = delta
-    else:
-        a, b = {3: (1, 2), 4: (0, 2), 5: (0, 1)}[i]
-        e[a, b] = e[b, a] = delta / 2.0      # engineering shear strain = delta
-    return e
-
-
-def strained(atoms, eps: np.ndarray):
-    out = atoms.copy()
-    out.set_cell(atoms.cell.array @ (np.eye(3) + eps).T, scale_atoms=True)
-    return out
+def elastic_from_stresses(stress_GPa: dict, delta: float) -> np.ndarray:
+    """Stiffness tensor C (6x6, GPa, not symmetrised) from the stresses of the +/- strained cells: keys ``<voigt>_plus`` /
+    ``<voigt>_minus`` (xx_plus, ..., xy_minus), each a Voigt 6-vector in GPa (tension positive), ions relaxed at fixed cell."""
+    C = np.zeros((6, 6))
+    for beta, lab in enumerate(VOIGT_LABELS):
+        C[:, beta] = (np.asarray(stress_GPa[f"{lab}_plus"], float) - np.asarray(stress_GPa[f"{lab}_minus"], float)) / (2.0 * delta)
+    return C
 
 
 def elastic_tensor(atoms, calc, delta: float, relax_ions: bool, fmax: float) -> np.ndarray:
-    """Return the symmetrised 6x6 stiffness tensor in GPa."""
-    C = np.zeros((6, 6))
-    for beta in range(6):
-        sig = []
-        for sign in (+1.0, -1.0):
-            a = strained(atoms, sign * voigt_strain(beta, delta))
-            a.calc = calc
-            if relax_ions:
-                BFGS(a, logfile=None).run(fmax=fmax, steps=300)
-            sig.append(a.get_stress(voigt=True))
-            a.calc = None
-        C[:, beta] = (sig[0] - sig[1]) / (2.0 * delta)
-    return C * EV_A3_TO_GPA
+    """Stiffness tensor in GPa from the strained cells of ``prepare.export.elastic_cells`` evaluated with *calc*."""
+    stresses = {}
+    for name, a in elastic_cells(atoms, delta).items():
+        a.calc = calc
+        if relax_ions:
+            BFGS(a, logfile=None).run(fmax=fmax, steps=300)
+        stresses[name] = a.get_stress(voigt=True) * EV_A3_TO_GPA
+        a.calc = None
+    return elastic_from_stresses(stresses, delta)
 
 
 def moduli(C: np.ndarray) -> dict:
@@ -227,18 +214,35 @@ def run_elastic(phase_dir, device: str = "cpu", force: bool = False) -> None:
         sigma0 = atoms.get_stress(voigt=True) * EV_A3_TO_GPA
         atoms.calc = None
         C = elastic_tensor(atoms, calc, ecfg.strain, ecfg.relax_ions, ecfg.fmax)
-        asym = float(np.abs(C - C.T).max())
-        C = 0.5 * (C + C.T)
-        mod = moduli(C)
-        write_json(out, {
-            "C_GPa": C.tolist(), "voigt_labels": VOIGT_LABELS,
-            "moduli": mod, "asymmetry_GPa": asym, "residual_stress_GPa": sigma0.tolist(),
-            "strain": ecfg.strain, "relax_ions": ecfg.relax_ions,
-            "calculator": calculator_label(phase.material),
-        })
+        mod = _write_elastic(phase, C, sigma0, calculator_label(phase.material))
         ledger.record(phase, "elastic")
-        log.info("  B=%.1f G=%.1f E=%.1f GPa nu=%.3f", mod["bulk_hill_GPa"],
-                 mod["shear_hill_GPa"], mod["youngs_hill_GPa"], mod["poisson_hill"])
     finally:
         atoms.calc = None
         release_calculator(calc)
+
+
+def _write_elastic(phase: PhaseDir, C: np.ndarray, sigma0: np.ndarray, calculator: str) -> dict:
+    """``elastic/elastic.json`` from a raw tensor - shared by the MLIP step and by :func:`collect_elastic`."""
+    asym = float(np.abs(C - C.T).max())
+    C = 0.5 * (C + C.T)
+    mod = moduli(C)
+    write_json(phase.elastic_json, {
+        "C_GPa": C.tolist(), "voigt_labels": VOIGT_LABELS,
+        "moduli": mod, "asymmetry_GPa": asym, "residual_stress_GPa": np.asarray(sigma0, float).tolist(),
+        "strain": cfg.elastic.strain, "relax_ions": cfg.elastic.relax_ions, "calculator": calculator,
+    })
+    log.info("  B=%.1f G=%.1f E=%.1f GPa nu=%.3f", mod["bulk_hill_GPa"],
+             mod["shear_hill_GPa"], mod["youngs_hill_GPa"], mod["poisson_hill"])
+    return mod
+
+
+def collect_elastic(phase_dir, stresses_GPa: dict, residual_stress_GPa=None, calculator: str = "external") -> dict:
+    """``elastic/elastic.json`` from stresses computed with ANY code on the cells of ``elastic/strain/`` (``prepare.export``).
+
+    ``stresses_GPa``: ``{"xx_plus": [6 values], "xx_minus": ..., ..., "xy_minus": ...}`` - Voigt xx yy zz yz xz xy, GPa, tension
+    positive, ions relaxed at fixed cell; ``residual_stress_GPa``: the stress of the unstrained cell (reported by Gate 1).  No
+    manifest is written: the result is ``external``.  The strain amplitude is ``cfg.elastic.strain`` of the export."""
+    phase = PhaseDir.of(phase_dir)
+    C = elastic_from_stresses(stresses_GPa, cfg.elastic.strain)
+    mod = _write_elastic(phase, C, np.zeros(6) if residual_stress_GPa is None else residual_stress_GPa, calculator)
+    return mod

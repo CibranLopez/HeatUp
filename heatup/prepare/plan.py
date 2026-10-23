@@ -273,7 +273,10 @@ def preview_plan(prepared: Prepared | None = None) -> list[dict]:
 
 
 def save_project(path: str = "heatup_project.json") -> str:
-    """Write the folder roots to *path*; notebooks 02/03 read it with ``heatup.load_json`` (so the roots are typed once)."""
+    """Write the folder roots and the calculator settings to *path*; notebooks 02/03 read it with ``heatup.load_json`` (typed
+    once: the relaxation of notebook 1 and the steps of notebook 2 must use the same calculator)."""
     from heatup.core.layout import write_json
-    p = cfg.phases
-    return write_json(path, {"phases": {"database_root": p.database_root, "candidates_root": p.candidates_root}})
+    p, c = cfg.phases, cfg.calc
+    return write_json(path, {"phases": {"database_root": p.database_root, "candidates_root": p.candidates_root},
+                             "calc": {"backend": c.backend, "model": c.model, "model_overrides": c.model_overrides,
+                                      "dispersion": c.dispersion, "dtype": c.dtype}})

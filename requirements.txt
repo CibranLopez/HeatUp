@@ -8,3 +8,5 @@ torch_geometric
 scikit-learn
 numpy
 ase
+mace-torch
+pandas

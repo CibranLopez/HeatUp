@@ -2,5 +2,12 @@
   "phases": {
     "database_root": "database",
     "candidates_root": "candidates"
+  },
+  "calc": {
+    "backend": "mace-mp",
+    "model": "medium-mpa-0",
+    "model_overrides": {},
+    "dispersion": false,
+    "dtype": "float64"
   }
 }

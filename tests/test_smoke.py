@@ -377,3 +377,106 @@ def test_vdos_hull_end_to_end(project):
     th = evaluate(target, save_figure=False)["thermodynamic"]
     assert th["available"] and th["method"] == "VDOS" and th["n_competing"] == 2, th
     assert th["e_hull_at_T_eV"] < 0.05 and th["overlay"] is None            # a consistent VDOS hull needs no overlay
+
+
+def test_vdos_coverage_flags():
+    from heatup.analyze.hull import vdos_coverage_flags
+    assert vdos_coverage_flags(300, {"t": [300], "a": [300]}) == []
+    assert vdos_coverage_flags(600, {"t": [300, 900], "a": [300, 900]}) == []              # interpolated, same for everybody
+    f = vdos_coverage_flags(300, {"t": [300], "a": [300, 900]})
+    assert len(f) == 1 and "differ" in f[0]
+    f = vdos_coverage_flags(450, {"t": [300], "a": [300]})
+    assert len(f) == 2 and all("outside" in x for x in f)
+
+
+def test_export_inputs_and_external_roundtrip(project):
+    """Notebook 1 writes the cells for any code; forces/stresses from an outside calculator come back and reproduce
+    HeatUp's own numbers (EMT plays the role of DFT here: it is only ever called outside HeatUp)."""
+    import glob
+    import numpy as np
+    from ase.calculators.emt import EMT
+    from ase.io import read
+    from ase.optimize import BFGS
+    from heatup.compute.execute import run_plan
+    from heatup.compute.phonons import collect_ha
+    from heatup.compute.static import collect_elastic
+    from heatup.core.config import EV_A3_TO_GPA
+    from heatup.prepare.export import export_inputs
+    from heatup.prepare.plan import prepare_project
+
+    cfg.phonon.min_length_A = 6.0
+    cfg.plan.gates = ["relax", "mechanical", "vibrational"]
+    prep = prepare_project(project, competitors=False)
+    target = prep.targets[0]
+    assert export_inputs(prep)[0]["state"].startswith("skipped")           # not relaxed yet: nothing to build cells from
+    run_plan(steps=["relax"])
+    rows = {r["step"]: r for r in export_inputs(prep)}
+    assert set(rows) == {"phonons", "elastic", "md"} and {r["state"] for r in rows.values()} == {"written"}
+    base = target.path
+    assert os.path.exists(f"{base}/phonons/ha/phonopy_disp.yaml") and os.path.exists(f"{base}/phonons/ha/SPOSCAR")
+    assert len(glob.glob(f"{base}/elastic/strain/*/POSCAR")) == 12 and os.path.exists(f"{base}/md/POSCAR")
+    assert json.load(open(f"{base}/elastic/task_elastic.json"))["exported"]["n_files"] == 13
+    assert {r["state"] for r in export_inputs(prep)} == {"up to date"}
+    syms = read(f"{base}/phonons/ha/disp-001/POSCAR").get_chemical_symbols()         # species in one block each: VASP-ready
+    assert 1 + sum(a != b for a, b in zip(syms, syms[1:])) == len(set(syms))
+
+    # a code HeatUp knows nothing about computes the exported cells
+    def forces(path):
+        a = read(path)
+        a.calc = EMT()
+        return a.get_forces()
+    disp = sorted(glob.glob(f"{base}/phonons/ha/disp-*"))
+    collect_ha(target, np.array([forces(f"{d}/POSCAR") for d in disp]), perfect_forces=forces(f"{base}/phonons/ha/SPOSCAR"))
+    assert ledger.step_state(target, "phonons")[0] == "external"                      # no manifest: accepted as it is
+    ext_zpe = json.load(open(f"{base}/phonons/ha.json"))["zpe_eV_per_atom"]
+    stresses = {}
+    for d in sorted(glob.glob(f"{base}/elastic/strain/*/")):
+        a = read(d + "POSCAR")
+        a.calc = EMT()
+        BFGS(a, logfile=None).run(fmax=cfg.elastic.fmax, steps=300)                   # ions relaxed at fixed cell
+        stresses[os.path.basename(d.rstrip("/"))] = a.get_stress(voigt=True) * EV_A3_TO_GPA
+    a0 = read(target.contcar)
+    a0.calc = EMT()
+    collect_elastic(target, stresses, a0.get_stress(voigt=True) * EV_A3_TO_GPA)
+    ext_C = np.array(json.load(open(target.elastic_json))["C_GPa"])
+    assert ledger.step_state(target, "elastic")[0] == "external"
+
+    # HeatUp's own steps, forced, give the same numbers: both used the same cells
+    with override(**{"run.force": ["phonons", "elastic"]}):
+        run_plan(steps=["phonons", "elastic"])
+    assert abs(json.load(open(f"{base}/phonons/ha.json"))["zpe_eV_per_atom"] - ext_zpe) < 1e-9
+    assert np.allclose(json.load(open(target.elastic_json))["C_GPa"], ext_C, atol=1e-6)
+
+
+def test_given_structures_get_contcar_without_any_calculation(project):
+    """'relax' not asked for: CONTCAR is the given structure, the cells are exported, no calculator is involved."""
+    from ase.io import read
+    from heatup.prepare.export import export_inputs
+    from heatup.prepare.plan import prepare_project
+
+    cfg.plan.gates = ["vibrational"]
+    cfg.phonon.min_length_A = 6.0
+    prep = prepare_project(project, competitors=False)
+    target = prep.targets[0]
+    rows = export_inputs(prep)
+    assert {r["step"] for r in rows} == {"phonons", "md"}
+    assert os.path.exists(target.contcar) and not os.path.exists(target.energy_json)
+    assert (read(target.contcar).positions == read(target.poscar).positions).all() and not target.has_relaxation()
+
+
+def test_fc3_displacements_are_exported(project):
+    pytest.importorskip("phono3py")
+    import glob
+    from heatup.compute.execute import run_plan
+    from heatup.prepare.export import export_inputs
+    from heatup.prepare.plan import prepare_project
+
+    cfg.phonon.fc_order, cfg.phonon.min_length_A = 3, 6.0
+    cfg.fc3.supercell, cfg.fc3.cutoff_pair_A = (2, 2, 2), 3.0
+    cfg.plan.gates, cfg.plan.target_steps = ["relax"], ["relax", "fc3"]
+    prep = prepare_project(project, competitors=False)
+    run_plan(steps=["relax"])
+    row = export_inputs(prep)[0]
+    d = prep.targets[0].path + "/phonons/fc3"
+    assert row["state"] == "written" and os.path.exists(f"{d}/phono3py_disp.yaml")
+    assert len(glob.glob(f"{d}/disp-*/POSCAR")) >= 1
