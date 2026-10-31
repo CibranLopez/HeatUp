@@ -13,10 +13,10 @@ Canonical on-disk layout of one phase, JSON I/O, and the structure helpers share
         phonons/      ha.json [qha.json] [fc3.json] phonon.png
         md/           POSCAR (supercell) cell.json
             <T>K/     output.traj md.json                   (step ``md``; ``md.json`` is written last = run complete)
-                      analysis.json vdos.json transition.json   (analysis steps ``mdstats vdos transition``)
+                      mdstats.json vdos.json transition.json   (analysis steps ``mdstats vdos transition``)
         electronic/ magnetic/ disorder/                     optional data files (see ``analyze.thermo``)
         stability/    report_<stage>.json report_<stage>.png hull_vs_T.json zero_K_hull.json ...
-        <step dir>/   manifest_<step>.json status_<step>.json   cache validity + run state (``core.ledger``)
+        <step dir>/   POSCAR (the structure it starts from)  step_<step>.json (task / run / result / export: ``core.ledger``)
 
 Two roots only.  ``cfg.phases.candidates_root`` holds *structures* (yours, Materials Project downloads, generated
 ones); ``cfg.phases.database_root`` holds everything that is *computed* - targets and competing phases alike, told

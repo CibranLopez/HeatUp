@@ -8,7 +8,8 @@ Layout::
     md/POSCAR, md/cell.json          supercell built from relaxation/CONTCAR
     md/<T>K/output.traj              frames every ``md.nblock`` steps (positions, cell, **momenta**, energy, stress)
     md/<T>K/md.json                  parameters - written LAST: its presence means the run is complete
-    md/<T>K/manifest_md.json, status_md.json
+    md/<T>K/POSCAR                   the supercell this run starts from (written by notebook 1)
+    md/<T>K/step_md.json
 
 The run **resumes** after a wall-time kill (HPC) from the last stored frame (``resume.json`` holds the settings it
 started with; a different configuration restarts from scratch).  Any restart from scratch (forced,
@@ -65,7 +66,8 @@ def run_md(phase_dir, device: str = "cpu", force: bool = False, temperature: flo
     phase = PhaseDir.of(phase_dir)
     m = cfg.md
     sim = phase.md_run(temperature)
-    traj_path = os.path.join(sim, "output.traj")
+    traj_path = os.path.join(sim, "output.traj")                 # exists only for a COMPLETE run (so other code may rely on that)
+    work_path = traj_path + ".part"                              # frames are written here while the run is going
     expected = m.n_steps // m.nblock + 1
 
     if (not force and os.path.exists(os.path.join(sim, "md.json")) and trajectory_frames(traj_path) >= expected
@@ -80,14 +82,16 @@ def run_md(phase_dir, device: str = "cpu", force: bool = False, temperature: flo
     os.makedirs(sim, exist_ok=True)
     key = {"fingerprint": ledger.fingerprint("md", phase.material), "contcar": ledger.file_hash(phase.contcar)}
     key_file = os.path.join(sim, "resume.json")
-    if os.path.exists(traj_path):
+    if os.path.exists(traj_path) and not os.path.exists(os.path.join(sim, "md.json")) and not os.path.exists(work_path):
+        os.replace(traj_path, work_path)     # a partial trajectory written under the old convention: adopt it as the partial one
+    if os.path.exists(traj_path) or os.path.exists(work_path):
         # a finished run is judged by its manifest; an interrupted one by the key written when it started
         stale = (not ledger.is_fresh(phase, "md", temperature) if ledger.read_manifest(phase, "md", temperature)
                  else read_json(key_file) != key)
     else:
         stale = False
     if force or stale:                       # restart from scratch: nothing derived from the old run may survive
-        for f in ("output.traj", "md.json", *(ledger.STEPS[s].outputs[0] for s in ledger.ANALYSIS_STEPS)):
+        for f in ("output.traj", "output.traj.part", "md.json", *(ledger.STEPS[s].outputs[0] for s in ledger.ANALYSIS_STEPS)):
             p = os.path.join(sim, f)
             if os.path.exists(p):
                 os.remove(p)
@@ -96,11 +100,11 @@ def run_md(phase_dir, device: str = "cpu", force: bool = False, temperature: flo
 
     write_json(key_file, key)
     B = barostat_bulk_modulus(phase)
-    done_frames = trajectory_frames(traj_path) if os.path.exists(traj_path) else 0
+    done_frames = trajectory_frames(work_path) if os.path.exists(work_path) else 0
     steps_left = m.n_steps
     if done_frames > 1:
         steps_left = m.n_steps - (done_frames - 1) * m.nblock
-        atoms = ase_read(traj_path, index=-1)
+        atoms = ase_read(work_path, index=-1)
         resumed = True
         log.info("Resuming %s %dK from frame %d (%d steps left)", phase.tag, temperature,
                  done_frames, steps_left)
@@ -128,9 +132,17 @@ def run_md(phase_dir, device: str = "cpu", force: bool = False, temperature: flo
         else:
             kw.update(pfactor=None)
         dyn = NPT(atoms, timestep=dt, logfile=os.path.join(sim, f"{m.ensemble.lower()}.log"), **kw)
-        traj = Trajectory(traj_path, "a" if resumed else "w", atoms,
+        traj = Trajectory(work_path, "a" if resumed else "w", atoms,
                           properties=["energy", "stress"])
-        dyn.attach(traj.write, interval=m.nblock)
+        skip_first = [resumed]               # ASE calls its observers at the first step: on a resume that would write the last stored frame twice
+
+        def write_frame() -> None:
+            if skip_first[0]:
+                skip_first[0] = False
+                return
+            traj.write()
+
+        dyn.attach(write_frame, interval=m.nblock)
         log.info("%s MD %s %g K: %d steps x %g fs (%.1f ps), nblock=%d, B=%.0f GPa, %d atoms, %s",
                  m.ensemble, phase.tag, temperature, steps_left, m.timestep_fs,
                  steps_left * m.timestep_fs / 1e3, m.nblock, B, len(atoms),
@@ -148,6 +160,7 @@ def run_md(phase_dir, device: str = "cpu", force: bool = False, temperature: flo
         atoms.calc = None
         release_calculator(calc)
 
+    os.replace(work_path, traj_path)         # complete: only now does output.traj exist
     write_json(os.path.join(sim, "md.json"), {
         "temperature_K": temperature, "ensemble": m.ensemble, "timestep_fs": m.timestep_fs,
         "n_steps": m.n_steps, "nblock": m.nblock, "frame_dt_fs": m.timestep_fs * m.nblock,

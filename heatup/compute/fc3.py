@@ -45,9 +45,10 @@ log = logging.getLogger("heatup")
 IOFFE_REGEL_RATIO = 0.5
 
 
-def _supercell_forces(reference, displaced, calc) -> np.ndarray:
+def _supercell_forces(reference, displaced, calc, save_as: str | None = None) -> np.ndarray:
     """Forces minus the perfect-supercell residual.  ``None`` entries (pairs beyond the cutoff) get zero
-    forces, which is what phono3py expects for excluded displacements."""
+    forces, which is what phono3py expects for excluded displacements.
+    ``save_as``: path prefix; writes ``<save_as>.npy`` (what is returned) and ``<save_as>_perfect.npy``."""
     ref = to_ase(reference)
     ref.calc = calc
     f0 = ref.get_forces()
@@ -60,7 +61,12 @@ def _supercell_forces(reference, displaced, calc) -> np.ndarray:
         a.calc = calc
         out.append(a.get_forces() - f0)
         a.calc = None
-    return np.array(out)
+    out = np.array(out)
+    if save_as:
+        os.makedirs(os.path.dirname(save_as), exist_ok=True)
+        np.save(save_as + ".npy", out)
+        np.save(save_as + "_perfect.npy", f0)
+    return out
 
 
 def linewidth_statistics(freq_THz: np.ndarray, gamma_THz: np.ndarray, weights: np.ndarray,
@@ -87,19 +93,21 @@ def linewidth_statistics(freq_THz: np.ndarray, gamma_THz: np.ndarray, weights: n
             "tau_median_ps": None if not np.isfinite(tau_med) else tau_med}
 
 
-def compute_fc3(atoms: Atoms, calc) -> dict:
-    """Relaxed *atoms* -> kappa(T) and linewidth statistics (plain dict)."""
+def compute_fc3(atoms: Atoms, calc, out_dir: str | None = None) -> dict:
+    """Relaxed *atoms* -> kappa(T) and linewidth statistics (plain dict).  ``out_dir``: also save the forces there."""
     c = cfg.fc3
+    save = (lambda name: None) if out_dir is None else (lambda name: os.path.join(out_dir, name))
     ph, sc3, sc2 = fc3_cells(atoms)
     n3 = sum(1 for s in ph.supercells_with_displacements if s is not None)
     log.info("  phono3py: fc3 supercell %s (%d atoms), %d displaced cells%s", sc3, len(atoms) * int(np.prod(sc3)), n3,
              "" if c.cutoff_pair_A is None else f" (pair cutoff {c.cutoff_pair_A} A)")
-    ph.forces = _supercell_forces(ph.supercell, ph.supercells_with_displacements, calc)
+    ph.forces = _supercell_forces(ph.supercell, ph.supercells_with_displacements, calc, save("forces_fc3"))
     n2 = 0
     if sc2 is not None:
         n2 = len(ph.phonon_supercells_with_displacements)
         log.info("  phono3py: fc2 supercell %s, %d displaced cells", sc2, n2)
-        ph.phonon_forces = _supercell_forces(ph.phonon_supercell, ph.phonon_supercells_with_displacements, calc)
+        ph.phonon_forces = _supercell_forces(ph.phonon_supercell, ph.phonon_supercells_with_displacements, calc,
+                                             save("forces_fc2"))
         ph.produce_fc2()
     ph.produce_fc3()
 
@@ -147,7 +155,7 @@ def run_fc3(phase_dir, device: str = "cpu", force: bool = False) -> None:
     try:
         log.info("fc3 / thermal conductivity %s (delta=%g A, %s)", phase.tag, cfg.fc3.delta_A,
                  calculator_label(phase.material))
-        res = compute_fc3(atoms, calc)
+        res = compute_fc3(atoms, calc, out_dir=os.path.join(phase.phonon_dir, "fc3"))
     finally:
         release_calculator(calc)
     res.update({"n_atoms": len(atoms), "calculator": calculator_label(phase.material)})

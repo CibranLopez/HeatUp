@@ -5,27 +5,30 @@ The bookkeeping of the whole package, in one place:
 1. **STEPS** - the registry of every computed step: where it writes, which files prove it finished, which
    input files and which configuration keys its result depends on, which step it needs, whether it needs a
    calculator.  Nothing else in the package lists step names, directories or fingerprint keys.
-2. **manifests** - ``manifest_<step>.json`` next to each step's output: config fingerprint + input hashes.
-   *One file per step.*  (v0.3 shared a single ``manifest.json`` between ``md`` and the analysis steps; the
-   analysis overwrote the MD manifest and the next ``run_md`` discarded the finished trajectory.)
-3. **run markers** - ``status_<step>.json``: ``running`` / ``done`` / ``failed`` (+ error) written by
-   :func:`tracking`; a ``running`` marker whose process is gone means ``crashed``.
-4. **plan.json** - what *should* be computed for a phase, with the options to use (written by
+2. **the step record** - ONE file per step folder, ``step_<step>.json``, with four sections that never repeat each other
+   or the plan: ``task`` (what the step needs, reads and writes - for people and codes working in that folder),
+   ``run`` (running / done / failed + error, written by :func:`tracking`; a ``running`` record whose process is gone means
+   ``crashed``), ``result`` (provenance of the finished result: the options *actually used* + input hashes - the thing
+   a changed plan is compared with), ``export`` (cells written for outside codes).  Planned options live only in
+   ``plan.json``.  (v0.3 shared one ``manifest.json`` between ``md`` and the analysis steps; the analysis overwrote it and
+   the next ``run_md`` discarded the finished trajectory.  Older per-step ``manifest_/status_/task_/export_`` files are read
+   and folded into the record on the next write.)
+3. **plan.json** - what *should* be computed for a phase, with the options to use (written by
    ``heatup.prepare``, executed by ``heatup.compute``).
-5. **step_state / phase_rows** - the single classifier (done / stale / pending / unfinished / failed / ...)
+4. **step_state / phase_rows** - the single classifier (done / stale / pending / unfinished / failed / ...)
    used by notebook 2 (what to run) and notebook 3 (what to warn about).
 
 States
 ------
-``done``       outputs exist, manifest matches plan options and input hashes
+``done``       outputs exist, the record's ``result`` matches the plan options and the input hashes
 ``stale``      outputs exist but options or inputs changed
 ``pending``    nothing there yet
 ``running``    a live process holds the run marker
 ``crashed``    run marker says running but the process is gone (an MD run resumes from its trajectory)
 ``unfinished`` partial output (MD trajectory without ``md.json``)
-``failed``     the step raised (``status_<step>.json`` has the error) or its result is unusable (relaxation not converged)
+``failed``     the step raised (the record's ``run`` has the error) or its result is unusable (relaxation not converged)
 ``pruned``     not needed: pruned by the 0 K screen (competitors) or the screening funnel (targets)
-``external``   outputs without a HeatUp manifest (e.g. computed with DFT) - accepted as they are
+``external``   outputs without a HeatUp ``result`` (e.g. computed with DFT) - accepted as they are
 """
 
 from __future__ import annotations
@@ -90,9 +93,9 @@ STEPS: dict[str, Step] = {s.name: s for s in [
     Step("fc3", "heatup.compute.fc3:run_fc3", lambda p, T: p.phonon_dir, ("fc3.json",),
          _CONTCAR, needs=("relax",), tier=2, sections=("phonon", "fc3")),
     Step("md", "heatup.compute.md:run_md", lambda p, T: p.md_run(T), ("output.traj", "md.json"),
-         _CONTCAR, needs=("relax",), tier=2, sections=("md",), per_T=True, partial=("output.traj",)),
+         _CONTCAR, needs=("relax",), tier=2, sections=("md",), per_T=True, partial=("output.traj", "output.traj.part")),
     # analysis of a finished MD run (calculator-free; run by notebook 3, one manifest each)
-    Step("mdstats", "heatup.analyze.trajectory:run_mdstats", lambda p, T: p.md_run(T), ("analysis.json",),
+    Step("mdstats", "heatup.analyze.trajectory:run_mdstats", lambda p, T: p.md_run(T), ("mdstats.json",),
          _MD_SOURCE, needs=("md",), tier=3, calc=False, per_T=True, group="analysis",
          keys=("analysis.equil_ps", "analysis.stride")),
     Step("vdos", "heatup.analyze.trajectory:run_vdos", lambda p, T: p.md_run(T), ("vdos.json",),
@@ -131,8 +134,24 @@ def steps_for(gates, method: str = "HA", role: str = "target") -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# 2. manifests (one file per step)
+# 2. the step record (one file per step folder)
 # ---------------------------------------------------------------------------
+
+def _default(dotted: str):
+    """Default value of a dotted option (``md.integrator``) - the value a result made before the option existed implies."""
+    import dataclasses as dc
+    sec, key = dotted.split(".", 1)
+    obj = getattr(cfg, sec, None)
+    if obj is None or not dc.is_dataclass(obj):
+        return _NO_DEFAULT
+    for f in dc.fields(obj):
+        if f.name == key:
+            return f.default if f.default is not dc.MISSING else (f.default_factory() if f.default_factory is not dc.MISSING else _NO_DEFAULT)
+    return _NO_DEFAULT
+
+
+_NO_DEFAULT = object()
+
 
 def fingerprint(step: str, material: str | None = None, calc: bool = True) -> dict:
     """The part of the configuration that can change *step*'s result.  ``calc=False`` leaves the calculator out
@@ -162,43 +181,104 @@ def file_hash(path: str, nbytes: int = 1 << 24) -> str | None:
     return h.hexdigest()[:16]
 
 
-def _manifest_file(step_dir: str, step: str) -> str:
-    p = os.path.join(step_dir, f"manifest_{step}.json")
-    legacy = os.path.join(step_dir, "manifest.json")          # <= v0.3: shared file; honoured only for its own step
-    if not os.path.exists(p) and os.path.exists(legacy) and (read_json(legacy) or {}).get("step") == step:
-        return legacy
-    return p
+_LEGACY_FILES = ("manifest_{step}.json", "status_{step}.json", "task_{step}.json", "export_{step}.json")
+
+
+def _record_file(step_dir: str, step: str) -> str:
+    return os.path.join(step_dir, f"step_{step}.json")
+
+
+def _read_record_at(step_dir: str, step: str) -> dict:
+    rec = read_json(_record_file(step_dir, step))
+    if rec is not None:
+        return rec
+    rec = {}                                           # no record yet: fold in files of earlier versions, if any
+    m = read_json(os.path.join(step_dir, f"manifest_{step}.json"))
+    if m is None:
+        shared = read_json(os.path.join(step_dir, "manifest.json"))          # v0.3: one shared file, honoured only for its step
+        m = shared if shared and shared.get("step") == step else None
+    if m:
+        rec["result"] = {k: m[k] for k in ("heatup_version", "timestamp_utc", "fingerprint", "inputs", "extra") if k in m}
+    s = read_json(os.path.join(step_dir, f"status_{step}.json"))
+    if s:
+        rec["run"] = {k: v for k, v in s.items() if k not in ("step", "temperature_K")}
+    return rec
+
+
+def read_record(phase, step: str, T: float | None = None) -> dict:
+    """The step record (``{}`` if none): sections ``task``, ``run``, ``result``, ``export``."""
+    return _read_record_at(STEPS[step].where(PhaseDir.of(phase), T), step)
+
+
+def _update(phase, step: str, T: float | None, create: bool = True, **sections) -> None:
+    """Replace the given sections of the step record (``None`` removes one); the file is written atomically."""
+    phase = PhaseDir.of(phase)
+    d = STEPS[step].where(phase, T)
+    rec = _read_record_at(d, step)
+    rec.update(step=step, temperature_K=T)
+    for name, value in sections.items():
+        if value is None:
+            rec.pop(name, None)
+        else:
+            rec[name] = value
+    path = _record_file(d, step)
+    if not (rec.keys() & {"task", "run", "result", "export"}):
+        if os.path.exists(path):
+            os.remove(path)
+    elif create or os.path.exists(path):
+        write_json(path, rec)
+    for pat in _LEGACY_FILES:                          # folded into the record
+        old = os.path.join(d, pat.format(step=step))
+        if os.path.exists(old):
+            os.remove(old)
 
 
 def read_manifest(phase, step: str, T: float | None = None) -> dict | None:
-    phase = PhaseDir.of(phase)
-    return read_json(_manifest_file(STEPS[step].where(phase, T), step))
+    """The ``result`` section: options actually used + input hashes of the finished step (None: nothing recorded)."""
+    return read_record(phase, step, T).get("result")
 
 
-def record(phase, step: str, T: float | None = None, extra: dict | None = None) -> str:
-    """Write the manifest of a finished step (fingerprint under the *current* configuration + input hashes)."""
+def record(phase, step: str, T: float | None = None, extra: dict | None = None) -> None:
+    """Record a finished step: the fingerprint under the *current* configuration + input hashes."""
     phase = PhaseDir.of(phase)
     spec = STEPS[step]
-    d = spec.where(phase, T)
     m = {"heatup_version": __version__, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-         "step": step, "temperature_K": T, "fingerprint": fingerprint(step, phase.material),
+         "fingerprint": fingerprint(step, phase.material),
          "inputs": {os.path.basename(p): file_hash(p) for p in spec.inputs(phase, T)}}
     if extra:
         m["extra"] = extra
-    return write_json(os.path.join(d, f"manifest_{step}.json"), m)
+    _update(phase, step, T, result=m)
+
+
+def set_task(phase, step: str, T: float | None, task: dict) -> None:
+    _update(phase, step, T, task=task)
+
+
+def clear_task(phase, step: str, T: float | None) -> None:
+    """Drop the ``task`` section of a step that is no longer planned (the record goes if nothing else is in it)."""
+    if read_record(phase, step, T).get("task") is not None:
+        _update(phase, step, T, create=False, task=None)
+
+
+def get_export(phase, step: str, T: float | None = None) -> dict | None:
+    return read_record(phase, step, T).get("export")
+
+
+def set_export(phase, step: str, T: float | None, export: dict) -> None:
+    _update(phase, step, T, export=export)
 
 
 def diff(phase, step: str, T: float | None = None, calc: bool = True) -> dict:
     """``{key: (saved, current)}`` for everything that differs ({} = fresh)."""
     phase = PhaseDir.of(phase)
     spec = STEPS[step]
-    saved = read_json(_manifest_file(spec.where(phase, T), step))
+    saved = read_manifest(phase, step, T)
     if saved is None:
         return {"_manifest": (None, "missing")}
     diffs: dict = {}
     sf = saved.get("fingerprint", {})
     for k, v in fingerprint(step, phase.material, calc).items():
-        if sf.get(k) != v:
+        if sf.get(k) != v and not (k not in sf and v == _default(k)):      # option added after the result was made, still at its default
             diffs[k] = (sf.get(k), v)
     for p in spec.inputs(phase, T):
         name = os.path.basename(p)
@@ -215,27 +295,22 @@ def manifest_summary(phase, step: str, T: float | None = None) -> str:
     m = read_manifest(phase, step, T)
     if not m:
         return f"[no manifest for {PhaseDir.of(phase).tag}:{step}]"
-    lines = [f"step={m['step']}  heatup={m['heatup_version']}  at {m['timestamp_utc']}"]
+    lines = [f"step={step}  heatup={m['heatup_version']}  at {m['timestamp_utc']}"]
     lines += [f"  {k} = {v}" for k, v in sorted(m["fingerprint"].items())]
     lines += [f"  input {k}: {v}" for k, v in m.get("inputs", {}).items()]
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# 3. run markers
+# 3. run markers (the ``run`` section of the step record)
 # ---------------------------------------------------------------------------
 
-def _mark_file(phase: PhaseDir, step: str, T: float | None) -> str:
-    return os.path.join(STEPS[step].where(phase, T), f"status_{step}.json")
-
-
 def mark(phase, step: str, T: float | None, state: str, **extra) -> None:
-    phase = PhaseDir.of(phase)
-    write_json(_mark_file(phase, step, T), {"state": state, "step": step, "temperature_K": T, **extra})
+    _update(phase, step, T, run={"state": state, **extra})
 
 
 def read_mark(phase, step: str, T: float | None = None) -> dict | None:
-    return read_json(_mark_file(PhaseDir.of(phase), step, T))
+    return read_record(phase, step, T).get("run")
 
 
 @contextlib.contextmanager
@@ -419,7 +494,8 @@ def _relax_problem(phase: PhaseDir, T) -> str | None:
 
 
 def _md_progress(phase: PhaseDir, T) -> str:
-    n = trajectory_frames(os.path.join(phase.md_run(T), "output.traj"))
+    sim = phase.md_run(T)
+    n = max(trajectory_frames(os.path.join(sim, f)) for f in ("output.traj", "output.traj.part"))
     return f"{n} of {cfg.md.n_steps // cfg.md.nblock + 1} frames"
 
 
@@ -444,8 +520,8 @@ def step_state(phase, step: str, T: float | None = None, calc: bool = False) -> 
         return PENDING, ""
     if step == "relax" and _relax_problem(phase, T):
         return FAILED, _relax_problem(phase, T) or ""
-    if not os.path.exists(_manifest_file(d, step)):
-        return EXTERNAL, "outputs without a HeatUp manifest"
+    if read_manifest(phase, step, T) is None:
+        return EXTERNAL, "outputs without a HeatUp record"
     df = diff(phase, step, T, calc)
     if df:
         return STALE, ", ".join(sorted(df))[:200]

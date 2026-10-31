@@ -35,7 +35,7 @@ _LAZY = {
     # prepare
     "prepare_project": "heatup.prepare.plan", "preview_plan": "heatup.prepare.plan", "save_project": "heatup.prepare.plan",
     "write_phase": "heatup.prepare.phases", "locate_phase": "heatup.prepare.phases",
-    "export_inputs": "heatup.prepare.export", "collect_ha": "heatup.compute.phonons", "collect_elastic": "heatup.compute.static",
+    "export_inputs": "heatup.prepare.export", "build_md_cell": "heatup.prepare.export", "collect_ha": "heatup.compute.phonons", "collect_elastic": "heatup.compute.static",
     # compute
     "run_plan": "heatup.compute.execute", "run_step": "heatup.compute.runtime",
     "build_calculator": "heatup.compute.calculator", "default_model": "heatup.compute.calculator",

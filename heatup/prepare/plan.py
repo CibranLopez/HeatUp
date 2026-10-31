@@ -11,7 +11,7 @@ Notebook 1: put every structure where it is computed and write down what is to b
        **only if its plan has the settings this project wants**; otherwise it is left untouched, reported in
        ``Prepared.refused`` with a warning, and never used in a hull (compare ``ledger.plan_conflicts``);
     3. a ``plan.json`` next to every POSCAR (:class:`heatup.core.ledger.Plan`) and **the folder of every planned
-       calculation** (``relaxation/``, ``elastic/``, ``phonons/``, ``md/<T>K/``), each with a ``task_<step>.json``
+       calculation** (``relaxation/``, ``elastic/``, ``phonons/``, ``md/<T>K/``), each with a ``step_<step>.json``
        (inputs, files to write, options): everything an outside code such as DFT needs to know.  What you asked for
        (``cfg.plan.gates``: the gates, and ``"relax"`` unless the structures are already relaxed) decides the steps (or ``cfg.plan.target_steps`` / ``competitor_steps`` if you list
        them), the temperatures, and the resolved options of those steps.  A competitor that already has a plan keeps
@@ -34,7 +34,8 @@ import os
 
 from heatup.core import ledger
 from heatup.core.config import AUTO_MIN_LENGTH_A, REQUESTS, cfg
-from heatup.core.layout import PhaseDir, iter_phase_dirs, read_structure, resolve_supercell, upper_triangular, write_json
+from heatup.core.layout import PhaseDir, iter_phase_dirs, read_structure, resolve_supercell, upper_triangular
+from heatup.prepare.export import stage_input
 from heatup.prepare.phases import Phase, find_reference_phases, locate_phase, phase_from_dir, same_structure
 
 log = logging.getLogger("heatup")
@@ -59,34 +60,32 @@ def _steps(names, what: str) -> list[str]:
 
 
 def make_task_folders(phase_dir, plan: ledger.Plan) -> list[str]:
-    """Create the folder of every planned calculation, each with a ``task_<step>.json`` that says what to compute here:
-    inputs, the files to write, and the options.  The folders are all a calculation needs to be run **with any code**
-    (DFT, another potential): write the listed outputs (layout and fields: ``heatup.core.layout`` / notebook 03) and
-    notebook 03 accepts them (state ``external``).  ``run_plan`` (notebook 02) writes the same files itself."""
+    """Create the folder of every planned calculation with the ``task`` section of its step record (``step_<step>.json``):
+    what the step needs, reads and writes - the settings stay in ``plan.json``, which the record points to - plus the
+    ``POSCAR`` it starts from where that is known already (``relaxation/POSCAR``).  The folders are all a calculation
+    needs to be run **with any code** (DFT, another potential): write the listed outputs (layout and fields: notebook 03)
+    and notebook 03 accepts them (state ``external``); ``run_plan`` (notebook 02) writes the same files itself."""
     phase = PhaseDir.of(phase_dir)
     rel = lambda p: os.path.relpath(p, phase.path)
-    made = []
+    made, planned = [], set()
     for step, T in plan.tasks():
         spec = ledger.STEPS[step]
         d = spec.where(phase, T)
         os.makedirs(d, exist_ok=True)
-        keys = set(ledger.plan_options([step]))
-        task = {"phase": phase.tag, "role": plan.role, "step": step, "temperature_K": T,
-                "needs": list(spec.needs), "inputs": [rel(p) for p in spec.inputs(phase, T)],
-                "outputs": [rel(os.path.join(d, o)) for o in spec.outputs],
-                "options": {k: v for k, v in sorted(plan.options.items()) if k in keys}}
-        write_json(os.path.join(d, f"task_{step}.json"), task)
+        ledger.set_task(phase, step, T, {
+            "needs": list(spec.needs), "inputs": [rel(p) for p in spec.inputs(phase, T)],
+            "outputs": [rel(os.path.join(d, o)) for o in spec.outputs],
+            "settings": {"file": os.path.relpath(phase.plan_json, d), "keys": [f"{s}.*" for s in spec.sections] + list(spec.keys)}})
+        stage_input(phase, step, T)
+        planned.add((step, int(round(T)) if T is not None else None))
         made.append(d)
-    for step in ledger.COMPUTE_STEPS:                         # task files of steps that are no longer planned
-        if step in plan.steps:
-            continue
+    for step in ledger.COMPUTE_STEPS:                         # tasks that are no longer planned
         spec = ledger.STEPS[step]
-        dirs = [spec.where(phase, None)] if not spec.per_T else (
-            [os.path.join(phase.md_dir, n) for n in os.listdir(phase.md_dir)] if os.path.isdir(phase.md_dir) else [])
-        for d in dirs:
-            f = os.path.join(d, f"task_{step}.json")
-            if os.path.exists(f):
-                os.remove(f)
+        cands = [None] if not spec.per_T else (
+            [float(n[:-1]) for n in os.listdir(phase.md_dir) if n.endswith("K") and n[:-1].isdigit()] if os.path.isdir(phase.md_dir) else [])
+        for T in cands:
+            if (step, int(round(T)) if T is not None else None) not in planned:
+                ledger.clear_task(phase, step, T)
     return made
 
 
@@ -145,9 +144,9 @@ def prepare_phase(phase_dir, role: str = "target", steps: list[str] | None = Non
 
 
 def _parse_entry(e: dict) -> tuple[str, str, list[float], float | None]:
-    t = e.get("temperature")
+    t = e.get("temperature", e.get("temperatures"))          # "temperatures" (a list) is accepted as an alias; other keys are ignored
     temps = [float(x) for x in (t if isinstance(t, (list, tuple)) else [t])] if t is not None else []
-    op = e.get("operating_T", temps[0] if temps else None)
+    op = e.get("operating_T", max(temps) if "temperatures" in e and "temperature" not in e and temps else (temps[0] if temps else None))
     return e["material"], e["symmetry"], temps, None if op is None else float(op)
 
 

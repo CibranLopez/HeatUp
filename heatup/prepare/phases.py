@@ -17,7 +17,7 @@ Search order (priority for de-duplication: the first structure wins, so calculat
 
 ``database``    ``<database_root>/<formula>/<label>/POSCAR``  (targets, earlier competitors, your own calculations)
 ``candidates``  ``<candidates_root>/<formula>/<label>/POSCAR``
-``mp-api``      Materials Project: *every* chemical subsystem of the target within ``mp_max_e_above_hull`` of MP's own
+``mp-api``      Materials Project: *every* chemical subsystem of the target within ``mp_ehull_max_eV`` of MP's own
                 hull, capped per subsystem; structures and the query index are cached under ``candidates_root``
                 (v0.2 queried ``elements=[...]``, which only returns phases that contain *all* of them, so binaries and
                 elements were missing and the hull was wrong).
@@ -174,9 +174,9 @@ def scan_root(root: str, elements: frozenset, source: str) -> list[Phase]:
 
 def _mp_query(elements: frozenset) -> list:
     """Return MP summary docs of all chemical subsystems within the hull window."""
-    key = cfg.phases.mp_api_key.strip()
+    key = os.environ.get(cfg.phases.mp_api_key_env, "").strip()
     if not key:
-        log.warning("[mp-api] no API key (cfg.phases.mp_api_key / MP_API_KEY) - skipping")
+        log.warning("[mp-api] no API key in the environment variable %s (cfg.phases.mp_api_key_env) - skipping", cfg.phases.mp_api_key_env)
         return []
     try:
         from mp_api.client import MPRester
@@ -188,8 +188,8 @@ def _mp_query(elements: frozenset) -> list:
         for sys_ in subsystems(elements):
             chemsys = "-".join(sys_)
             kw: dict = {}
-            if cfg.phases.mp_max_e_above_hull is not None:
-                kw["energy_above_hull"] = (0.0, cfg.phases.mp_max_e_above_hull)
+            if cfg.phases.mp_ehull_max_eV is not None:
+                kw["energy_above_hull"] = (0.0, cfg.phases.mp_ehull_max_eV)
             res = mpr.materials.summary.search(
                 chemsys=chemsys, fields=["material_id", "structure", "energy_above_hull", "formula_pretty",
                                          "symmetry"], **kw)
@@ -205,6 +205,45 @@ def _mp_index_path(root: str, elements: frozenset) -> str:
     return os.path.join(root, "_mp_index", "-".join(sorted(elements)) + ".json")
 
 
+_MP_ID_SUFFIX = re.compile(r"_[a-z]+-\d+(?:-\w+)*$")          # '_mp-1234', '_mvc-5678', '_mp-1234-GGA'
+
+
+def spacegroup_of_label(label: str) -> str:
+    """The space-group part of a Materials Project folder label: ``'P4-mmm_mp-1234'`` -> ``'P4-mmm'`` (inverse of
+    :func:`write_mp_doc`'s naming; any other label is returned unchanged)."""
+    return _MP_ID_SUFFIX.sub("", label)
+
+
+def write_mp_doc(doc, root: str) -> str:
+    """Write one Materials Project summary document as ``<root>/<formula>/<spacegroup>_<material_id>/{POSCAR, metadata.json}``
+    (existing structures are never rewritten) and return that directory.
+
+    THE writer of Materials Project structures, for HeatUp's competing phases and for SSE-AL's whole candidate pool: one folder
+    name and one metadata layout, so the same phase can never exist twice under two names.  ``metadata.json``: ``material_id``,
+    ``formula``, ``symmetry``, ``energy_above_hull`` (+ ``energy_per_atom``, ``band_gap``, ``nsites`` when the document has
+    them), ``source``.
+    """
+    s = doc.structure
+    formula = s.composition.reduced_formula
+    try:
+        sg = str(doc.symmetry.symbol)
+    except Exception:  # noqa: BLE001
+        sg = "P1"
+    mid = str(doc.material_id)
+    d = os.path.join(root, formula, f"{sanitize_label(sg)}_{mid}")
+    if not os.path.exists(os.path.join(d, "POSCAR")):
+        from heatup.core.layout import from_pymatgen
+        os.makedirs(d, exist_ok=True)
+        write_poscar(os.path.join(d, "POSCAR"), from_pymatgen(s))
+        meta = {"material_id": mid, "formula": formula, "symmetry": sg, "source": "mp-api"}
+        for key in ("energy_above_hull", "energy_per_atom", "band_gap", "nsites"):
+            value = getattr(doc, key, None)
+            if value is not None:
+                meta[key] = float(value) if key != "nsites" else int(value)
+        write_json(os.path.join(d, "metadata.json"), meta)
+    return d
+
+
 def fetch_mp_phases(elements: frozenset, root: str, docs: list | None = None,
                     refresh: bool = False) -> list[Phase]:
     """Materials Project phases of all subsystems, written under *root* (``candidates_root``: structures only).
@@ -214,7 +253,7 @@ def fetch_mp_phases(elements: frozenset, root: str, docs: list | None = None,
     ``refresh=True`` (or a changed ``mp_max_*`` option) re-queries.
     """
     pc = cfg.phases
-    params = {"window": pc.mp_max_e_above_hull, "per_chemsys": pc.mp_max_per_chemsys}
+    params = {"window": pc.mp_ehull_max_eV, "per_chemsys": pc.mp_max_per_chemsys}
     idx_path = _mp_index_path(root, elements)
     if docs is None and not refresh:
         idx = read_json(idx_path)
@@ -227,21 +266,8 @@ def fetch_mp_phases(elements: frozenset, root: str, docs: list | None = None,
     docs = _mp_query(elements) if docs is None else docs
     out: list[Phase] = []
     for doc in docs:
-        s = doc.structure
-        atoms_formula = s.composition.reduced_formula
-        try:
-            sg = str(doc.symmetry.symbol)
-        except Exception:  # noqa: BLE001
-            sg = "P1"
+        d = write_mp_doc(doc, root)
         mid = str(doc.material_id)
-        d = os.path.join(root, atoms_formula, f"{sanitize_label(sg)}_{mid}")
-        if not os.path.exists(os.path.join(d, "POSCAR")):
-            from heatup.core.layout import from_pymatgen
-            os.makedirs(d, exist_ok=True)
-            write_poscar(os.path.join(d, "POSCAR"), from_pymatgen(s))
-            write_json(os.path.join(d, "metadata.json"), {
-                "material_id": mid, "formula": atoms_formula, "symmetry": sg,
-                "e_above_hull_MP": float(doc.energy_above_hull), "source": "mp-api"})
         ph = phase_from_dir(d, "mp-api", mid)
         if ph:
             out.append(ph)

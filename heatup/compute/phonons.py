@@ -30,8 +30,8 @@ from heatup.analyze.thermo import ModeSet
 from heatup.compute.calculator import build_calculator, calculator_label, release_calculator
 from heatup.core import ledger
 from heatup.core.config import GPA_TO_EV_A3, MEV_PER_THZ, cfg
-from heatup.core.layout import PhaseDir, read_structure, write_json
-from heatup.prepare.export import phonon_cells, qha_scales, scaled_cell, to_ase
+from heatup.core.layout import PhaseDir, read_structure, write_json, write_poscar
+from heatup.prepare.export import choose_supercell, phonon_cells, qha_scales, scaled_cell, to_ase
 
 log = logging.getLogger("heatup")
 
@@ -40,8 +40,9 @@ log = logging.getLogger("heatup")
 # helpers
 # ---------------------------------------------------------------------------
 
-def _forces(ph, calc) -> np.ndarray:
-    """Forces of all displaced supercells minus the residual force of the perfect one."""
+def _forces(ph, calc, save_dir: str | None = None) -> np.ndarray:
+    """Forces of all displaced supercells minus the residual force of the perfect one.
+    ``save_dir``: also write ``forces.npy`` (what is returned; ready for :func:`collect_ha`) and ``forces_perfect.npy``."""
     ref = to_ase(ph.supercell)
     ref.calc = calc
     f0 = ref.get_forces()
@@ -51,7 +52,12 @@ def _forces(ph, calc) -> np.ndarray:
         a.calc = calc
         out.append(a.get_forces() - f0)
         a.calc = None
-    return np.array(out)
+    out = np.array(out)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        np.save(os.path.join(save_dir, "forces.npy"), out)
+        np.save(os.path.join(save_dir, "forces_perfect.npy"), f0)
+    return out
 
 
 def modes_from_forces(ph, atoms: Atoms, forces: np.ndarray, sc, *, with_band: bool = False):
@@ -74,12 +80,14 @@ def modes_from_forces(ph, atoms: Atoms, forces: np.ndarray, sc, *, with_band: bo
     return modes, info, ph
 
 
-def harmonic_modes(atoms: Atoms, calc, *, with_band: bool = False):
-    """Relaxed *atoms* -> (ModeSet, info dict, phonopy object), forces from *calc*."""
-    ph, sc = phonon_cells(atoms)
+def harmonic_modes(atoms: Atoms, calc, *, with_band: bool = False, save_dir: str | None = None,
+                   sc: tuple[int, int, int] | None = None):
+    """Relaxed *atoms* -> (ModeSet, info dict, phonopy object), forces from *calc*.
+    ``save_dir``: also write the forces (see :func:`_forces`); ``sc``: supercell repetitions (default: chosen from *atoms*)."""
+    ph, sc = phonon_cells(atoms, sc)
     log.info("  phonopy: supercell %s (%d atoms), %d displacements",
              sc, len(atoms) * int(np.prod(sc)), len(ph.supercells_with_displacements))
-    return modes_from_forces(ph, atoms, _forces(ph, calc), sc, with_band=with_band)
+    return modes_from_forces(ph, atoms, _forces(ph, calc, save_dir), sc, with_band=with_band)
 
 
 def _band(ph, atoms: Atoms) -> dict:
@@ -145,7 +153,8 @@ def run_ha(phase_dir, device: str = "cpu", force: bool = False) -> None:
     try:
         log.info("HA phonons %s (delta=%g A, %s)", phase.tag, cfg.phonon.delta_A,
                  calculator_label(phase.material))
-        modes, info, _ = harmonic_modes(atoms, calc, with_band=True)
+        modes, info, _ = harmonic_modes(atoms, calc, with_band=True,
+                                        save_dir=os.path.join(phase.phonon_dir, "ha"))
     finally:
         release_calculator(calc)
 
@@ -223,19 +232,29 @@ def run_qha(phase_dir, device: str = "cpu", force: bool = False) -> None:
     n = len(ref)
     V0 = ref.get_volume()
     scales = qha_scales()
+    sc = choose_supercell(ref)          # chosen once, on the reference cell: the same repetitions at every volume
+    log.info("QHA %s: supercell %s at all %d volumes", phase.tag, sc, len(scales))
     calc = build_calculator(device, material=phase.material)
     vols, e_el, mode_dicts = [], [], []
     try:
         for i, s in enumerate(scales):
+            vdir = os.path.join(phase.phonon_dir, "qha", f"V{i + 1:02d}")
+            os.makedirs(vdir, exist_ok=True)
             a = scaled_cell(ref, s)
             a.calc = calc
             if qc.relax_internal:
-                BFGS(a, logfile=None).run(fmax=cfg.relax.fmax, steps=cfg.relax.max_steps)
+                BFGS(a, trajectory=os.path.join(vdir, "relax.traj"), logfile=None).run(
+                    fmax=cfg.relax.fmax, steps=cfg.relax.max_steps)
             e_el.append(a.get_potential_energy() / n)
             vols.append(a.get_volume() / n)
+            write_poscar(os.path.join(vdir, "CONTCAR"), a)
             a.calc = None
-            modes, _, _ = harmonic_modes(a, calc)
+            modes, _, _ = harmonic_modes(a, calc, save_dir=vdir, sc=sc)
             mode_dicts.append(modes.to_dict(max_points=3000))
+            write_json(os.path.join(vdir, "energy.json"), {
+                "V_over_V0": float(s), "energy_eV_per_atom": float(e_el[-1]), "volume_A3_per_atom": float(vols[-1]),
+                "supercell": list(sc), "imag_fraction": modes.imag_fraction(cfg.phonon.imag_tol_meV),
+                "relaxed_ions": bool(qc.relax_internal), "calculator": calculator_label(phase.material)})
             log.info("  QHA volume %d/%d  V/V0=%.3f  E=%.5f eV/atom  imag=%.2f%%",
                      i + 1, len(scales), s, e_el[-1], 100 * modes.imag_fraction())
     finally:
@@ -263,7 +282,7 @@ def run_qha(phase_dir, device: str = "cpu", force: bool = False) -> None:
     write_json(out, {
         "temperatures": T, "G_eV_per_atom": G, "V_eq_A3_per_atom": Veq,
         "alpha_V_1_K": alpha, "B_T_GPa": B, "valid": inside,
-        "volumes_A3_per_atom": vols, "E_el_eV_per_atom": e_el,
+        "volumes_A3_per_atom": vols, "E_el_eV_per_atom": e_el, "supercell": list(sc),
         "F_vib_eV_per_atom": Fvib, "poly_order": qc.poly_order,
         "pressure_GPa": cfg.relax.pressure_GPa, "V0_ref_A3_per_atom": V0 / n,
         "imag_fraction": [m.imag_fraction(cfg.phonon.imag_tol_meV) for m in modesets],

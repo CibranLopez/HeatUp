@@ -4,7 +4,7 @@ Everything derived from a finished MD run (``md/<T>K/output.traj`` + ``md.json``
 works on trajectories computed with another code.  Three analysis steps, each with its own manifest
 (:data:`heatup.core.ledger.STEPS`), none depending on the others:
 
-``mdstats``     thermo series (T, P, V, E_pot drift) and tracer diffusion per species -> ``analysis.json``
+``mdstats``     thermo series (T, P, V, E_pot drift) and tracer diffusion per species -> ``mdstats.json``
 ``vdos``        vibrational DOS from the stored momenta (below)                       -> ``vdos.json``
 ``transition``  Gate-0 metrics: block-mean displacement / cell change / symmetry breaking -> ``transition.json``
 
@@ -212,8 +212,9 @@ def thermo_series(td: TrajData) -> dict:
     }
 
 
-def diffusion_by_species(td: TrajData, min_msd_A2: float = 1.0) -> dict:
+def diffusion_by_species(td: TrajData, min_msd_A2: float | None = None) -> dict:
     """Tracer diffusion per species from the production part (drift-corrected)."""
+    min_msd_A2 = cfg.analysis.msd_mobile_A2 if min_msd_A2 is None else min_msd_A2
     prod = td.production()
     u = unwrap_frac(prod.frac)
     h = prod.cell.mean(axis=0)
@@ -427,10 +428,10 @@ def _cached(phase: PhaseDir, step: str, T: float, force: bool | None, compute, l
 
 
 def run_mdstats(phase_dir, temperature: float, force: bool | None = None) -> dict | None:
-    """Thermo + diffusion summary -> ``md/<T>K/analysis.json``."""
+    """Thermo + diffusion summary -> ``md/<T>K/mdstats.json`` (not ``analysis.json``: other software keeps its own there)."""
     phase = PhaseDir.of(phase_dir)
     sim = phase.md_run(temperature)
-    out = os.path.join(sim, "analysis.json")
+    out = os.path.join(sim, "mdstats.json")
 
     def compute():
         td = load_trajectory(sim)

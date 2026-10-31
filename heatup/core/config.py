@@ -70,8 +70,8 @@ STATUSES = (STATUS_OK, STATUS_WARN, STATUS_FAIL, STATUS_MISSING)
 ENV_VAR = "HEATUP_CONFIG"
 
 
-class _Frozen:
-    """Mixin: forbid creation of unknown attributes (catches typos)."""
+class Frozen:
+    """Mixin: forbid creation of unknown attributes (catches typos).  Every configuration section is a ``@dataclass`` of this kind."""
 
     def __setattr__(self, name: str, value: Any) -> None:
         if name not in {f.name for f in dc.fields(self)}:  # type: ignore[arg-type]
@@ -94,7 +94,7 @@ MODEL_ALIASES = {"mace-mpa-0-medium": "medium-mpa-0", "mace_mpa_0_medium": "medi
 
 
 @dc.dataclass
-class CalcCfg(_Frozen):
+class CalcCfg(Frozen):
     """Interatomic-potential backend."""
     #: "mace-mp" | "chgnet" | "m3gnet" | "emt" (tests only) | "custom"
     backend: str = "mace-mp"
@@ -113,11 +113,13 @@ class CalcCfg(_Frozen):
         """Model for *material*: per-material override > ``model``; legacy aliases are normalised
         (``mace-mpa-0-medium`` -> ``medium-mpa-0``) so every caller ends up with one valid name."""
         m = self.model_overrides[material] if (material and material in self.model_overrides) else self.model
+        if os.path.isfile(m):
+            return os.path.abspath(m)                     # a model FILE is always passed as a full path (the same file for every package)
         return MODEL_ALIASES.get(m, m)
 
 
 @dc.dataclass
-class RelaxCfg(_Frozen):
+class RelaxCfg(Frozen):
     #: Tight on purpose: phonons / elastic constants are meaningless on a
     #: loosely relaxed cell (v0.2 used 0.05 eV/Å -> spurious imaginary modes).
     fmax: float = 0.005
@@ -138,12 +140,15 @@ class RelaxCfg(_Frozen):
 
 
 @dc.dataclass
-class PhononCfg(_Frozen):
+class PhononCfg(Frozen):
     """Harmonic phonons (finite displacements, phonopy)."""
-    #: Sizing: every entry is ``None`` = "as needed".  An explicit ``supercell`` wins (leave ``min_length_A``
-    #: ``None``); otherwise the smallest supercell with perpendicular widths >= ``min_length_A`` is built, and
-    #: ``min_length_A = None`` means the built-in 12 A.  ``max_atoms = None`` = no limit (a number = guard).
-    supercell: tuple | None = None
+    #: Sizing.  An explicit ``supercell`` wins (leave ``min_length_A`` ``None``).  Default (3, 3, 3): it is the number of
+    #: replications that sets the commensurate q-grid on which the force constants are exact, and it is the same for
+    #: every phase and, in ``qha``, at every volume.  ``supercell = None`` = automatic: the smallest supercell with
+    #: perpendicular widths >= ``min_length_A`` (``None`` = the built-in 12 A).  ``max_atoms = None`` = no limit.
+    #: NB: a phase is computed with the options stored in its ``plan.json``, so a changed default reaches phases that
+    #: are already planned only after their plans are updated.
+    supercell: tuple | None = (3, 3, 3)
     min_length_A: float | None = None
     max_atoms: int | None = None
     delta_A: float = 0.01
@@ -161,7 +166,7 @@ class PhononCfg(_Frozen):
 
 
 @dc.dataclass
-class FC3Cfg(_Frozen):
+class FC3Cfg(Frozen):
     """Third-order force constants (phono3py) - used when ``phonon.fc_order == 3``."""
     #: Sizing, same rule as ``phonon``: explicit ``supercell`` wins; else ``min_length_A`` (None = built-in 8 A);
     #: ``max_atoms = None`` = no limit.
@@ -185,7 +190,7 @@ class FC3Cfg(_Frozen):
 
 
 @dc.dataclass
-class QHACfg(_Frozen):
+class QHACfg(Frozen):
     n_volumes: int = 7          # odd, >= 5 recommended
     volume_range: float = 0.06  # +/- fraction of V0
     #: polynomial order of the F(V) fit at each temperature
@@ -196,7 +201,7 @@ class QHACfg(_Frozen):
 
 
 @dc.dataclass
-class ElasticCfg(_Frozen):
+class ElasticCfg(Frozen):
     strain: float = 0.004
     #: Relax internal coordinates at every strained cell (relaxed-ion
     #: constants).  v0.2 used clamped ions, which over-stiffens every crystal
@@ -206,25 +211,29 @@ class ElasticCfg(_Frozen):
 
 
 @dc.dataclass
-class MDCfg(_Frozen):
+class MDCfg(Frozen):
     ensemble: str = "NPT"            # "NPT" | "NVT"
     timestep_fs: float = 1.0
     n_steps: int = 30_000
     #: Write a frame every ``nblock`` steps.  The VDOS Nyquist limit is
-    #: ``h / (2 nblock dt)``: 5 fs -> 413 meV.  (v0.2: 20 fs -> 103 meV, which
-    #: aliases every O/H/Li-containing material.)
-    nblock: int = 5
+    #: ``h / (2 nblock dt)``: 10 fs -> 207 meV (covers oxides, sulfides, halides; not O-H/N-H stretches),
+    #: 5 fs -> 413 meV.  (v0.2: 20 fs -> 103 meV, which aliases every O/H/Li-containing material.)
+    #: The same run is also the source of the diffusivity labels, which need 20 fs or finer.
+    nblock: int = 10
     ttime_fs: float = 50.0
     ptime_fs: float = 100.0
     pressure_GPa: float = 0.0
     #: Bulk modulus used to build the barostat mass ``pfactor = ptime^2 B``.
     #: Overridden by the elastic result when available.
     default_bulk_modulus_GPa: float = 100.0
-    #: Sizing, same rule as ``phonon``: explicit ``supercell`` wins; else ``min_cell_A`` (None = built-in 15 A);
-    #: ``max_atoms = None`` = no limit.
+    #: Sizing, same rule as ``phonon``: explicit ``supercell`` wins; else perpendicular widths >= ``min_cell_A``
+    #: (None = built-in 15 A).  25 A: the cell must also give converged diffusivities, not only a stability verdict.
+    #: ``max_atoms`` caps the cell (None = no limit); when the cap does not allow ``min_cell_A`` the target is lowered
+    #: in steps of 1 A down to ``min_cell_floor_A``, and only below that is the structure refused.
     supercell: tuple | None = None
-    min_cell_A: float | None = None
-    max_atoms: int | None = None
+    min_cell_A: float | None = 25.0
+    max_atoms: int | None = 1500
+    min_cell_floor_A: float | None = 12.0
     seed: int = 12345
 
 
@@ -233,7 +242,7 @@ REQUESTS = ("relax", *GATES)         # what ``cfg.plan.gates`` may contain
 
 
 @dc.dataclass
-class RunCfg(_Frozen):
+class RunCfg(Frozen):
     """Execution control."""
     #: Steps to recompute even if cached: step names of ``ledger.STEPS`` (``relax elastic phonons qha fc3 md vdos
     #: transition mdstats``), the group ``"analysis"`` (= vdos + transition + mdstats) or ``"all"``.  Applies to
@@ -262,12 +271,15 @@ def forced(step: str, explicit: bool | None = None) -> bool:
 
 
 @dc.dataclass
-class AnalysisCfg(_Frozen):
+class AnalysisCfg(Frozen):
     """How trajectories are read and reduced (notebook 3).  Changing these re-runs only the cheap analysis steps."""
     #: Equilibration discarded before analysis (ps)
     equil_ps: float = 3.0
     #: Read stride when analysing trajectories
     stride: int = 1
+    #: A species counts as mobile (diffusing) when its final mean-square displacement exceeds this (A^2).  Vibrations in
+    #: a solid give 0.1-0.5 A^2, a hop is (2-3 A)^2: a model-free criterion, independent of any assumed ionic charge.
+    msd_mobile_A2: float = 4.0
     #: length of the first/last averaging window of Gate 0 (ps)
     block_ps: float = 2.0
     #: longest VACF lag used for the VDOS (ps)
@@ -278,7 +290,7 @@ class AnalysisCfg(_Frozen):
 
 
 @dc.dataclass
-class GateCfg(_Frozen):
+class GateCfg(Frozen):
     #: Gates that are reported.  None (default) -> the gates each phase's plan asked for (``cfg.plan.gates``),
     #: else all four.  They are independent: a failing gate never prevents another from running (only a missing
     #: relaxation makes every gate "missing").
@@ -310,7 +322,7 @@ class GateCfg(_Frozen):
 
 
 @dc.dataclass
-class HullCfg(_Frozen):
+class HullCfg(Frozen):
     #: default temperature at which Gate 3 is judged (K); must lie inside ``temperatures``.  A phase's own
     #: ``plan.json`` value (set in notebook 1) wins.
     operating_T: float = 300.0
@@ -325,12 +337,21 @@ class HullCfg(_Frozen):
     include_electronic: bool = True
     include_magnetic: bool = True
     include_configurational: bool = True
+    #: Model of the configurational block (only used when ``include_configurational``): ``"ideal"`` = -TS of ideal mixing
+    #: (``disorder/site_occupancies.json``) | ``"enumerated"`` = Boltzmann ensemble of enumerated configurations
+    #: (``disorder/configurations.json``) | ``"monte_carlo"`` = lattice-model MC (``disorder/monte_carlo.json``).
+    #: One model at a time: they describe the same degrees of freedom.  See ``heatup.analyze.ensembles``.
+    configurational_model: str = "ideal"
+    #: Hindered rotors / discrete orientations of molecular ions (``disorder/rotors.json``).  Off by default.
+    include_orientational: bool = False
+    #: Composition-conserving point-defect pairs, dilute limit (``disorder/defects.json``).  Off by default.
+    include_defects: bool = False
     #: O2/N2/F2... gas-phase corrections are NOT applied; see docs/AUDIT.md.
     reference_energy_shift: dict = dc.field(default_factory=dict)
 
 
 @dc.dataclass
-class PlanCfg(_Frozen):
+class PlanCfg(Frozen):
     """WHAT notebook 2 will compute for every phase (notebook 1).  Ask for gates and everything they need is
     planned; the settings of each calculation are the ``relax/elastic/phonon/qha/fc3/md`` sections."""
     #: What you ask for: the gates and/or ``"relax"``.  The gates decide the calculations (``ledger.steps_for``:
@@ -350,14 +371,18 @@ class PlanCfg(_Frozen):
 
 
 @dc.dataclass
-class PhasesCfg(_Frozen):
+class PhasesCfg(Frozen):
     #: Where competing phases are looked for: "database" and "candidates" (always: they are the two roots) plus,
     #: optionally, "mp-api" (Materials Project; needs a key) and "generate" (random/AI structures).  The last two only
     #: *add structures to* ``candidates_root``.
     sources: list = dc.field(default_factory=lambda: ["database", "candidates", "mp-api"])
-    mp_api_key: str = os.environ.get("MP_API_KEY", "")
-    mp_max_e_above_hull: float | None = 0.15   # query window on MP's own hull; None = no window
-    mp_max_per_chemsys: int | None = 25        # None = all phases of every sub-system
+    #: NAME of the environment variable that holds the Materials Project API key.  The key itself is never part of the
+    #: configuration: it would be copied into every snapshot, report and child-process environment.
+    mp_api_key_env: str = "MP_API_KEY"
+    #: query window on MP's own hull (eV/atom); None = no window
+    mp_ehull_max_eV: float | None = 0.15
+    #: None = all phases of every sub-system
+    mp_max_per_chemsys: int | None = 25
     #: EVERYTHING that is computed: targets and competing phases alike (read/write).  A structure is copied here
     #: from ``candidates_root`` the moment it is needed; its plan, results and manifests live here.
     database_root: str = "database"
@@ -367,7 +392,7 @@ class PhasesCfg(_Frozen):
 
 
 @dc.dataclass
-class GenerationCfg(_Frozen):
+class GenerationCfg(Frozen):
     #: "pyxtal" | "matgen" (MatterGen CLI) | "custom"
     method: str = "pyxtal"
     n_per_composition: int = 20
@@ -386,8 +411,123 @@ class GenerationCfg(_Frozen):
     seed: int = 0
 
 
+class Settings(Frozen):
+    """Base of a package's global configuration object (HeatUp's ``cfg``, SSE-AL's ``cfg``): the ONE API both share.
+
+    A configuration is a dataclass whose fields are *sections* (dataclasses of :class:`Frozen`, documented option by option
+    with ``#:`` comments) and, optionally, a few plain top-level options.  What every configuration can do:
+
+    ``to_dict()`` / ``snapshot()`` / ``to_json()``  the live values (``snapshot`` is JSON-safe);
+    ``save(path)`` / ``load(path)``                  JSON file; a partial file is allowed, unknown keys raise;
+    ``update_from_dict(d)``  ``get("md.nblock")``    set / read by section;
+    ``override(**{"md.n_steps": 10})``               context manager: temporary change;
+    ``reset()``                                      factory defaults;  ``show(*sections)``  print;  ``check()``  validate.
+
+    A package can also *expose sections that belong to another package's configuration* (``_foreign``): they are looked up
+    live, are saved and loaded with this configuration, and are THE objects of the other package - one definition.
+    """
+
+    #: top-level fields that are neither sections nor plain options (callables, ...): never serialised
+    _NOT_SERIALISED: tuple = ()
+
+    # -- which fields are what ------------------------------------------------------------------
+    def _foreign(self) -> dict:
+        """``{name: section}`` of sections that belong to another package's configuration (default: none)."""
+        return {}
+
+    def _sections(self) -> dict:
+        s = {f.name: getattr(self, f.name) for f in dc.fields(self) if dc.is_dataclass(getattr(self, f.name))}
+        s.update(self._foreign())
+        return s
+
+    def _scalars(self) -> dict:
+        return {f.name: getattr(self, f.name) for f in dc.fields(self)
+                if f.name not in self._NOT_SERIALISED and not dc.is_dataclass(getattr(self, f.name))
+                and isinstance(getattr(self, f.name), (str, int, float, bool, type(None)))}
+
+    # -- serialisation --------------------------------------------------------------------------
+    def to_dict(self) -> dict:
+        return {**{n: dc.asdict(sec) for n, sec in self._sections().items()}, **self._scalars()}
+
+    def snapshot(self) -> dict:
+        return json.loads(json.dumps(self.to_dict(), default=_json_default))
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), default=_json_default)
+
+    def update_from_dict(self, d: dict) -> None:
+        sections, scalars = self._sections(), self._scalars()
+        for key, vals in d.items():
+            if key in sections:
+                section = sections[key]
+                for k, v in vals.items():
+                    cur = getattr(section, k)
+                    if isinstance(cur, tuple) and isinstance(v, list):
+                        v = tuple(v)
+                    setattr(section, k, v)
+            elif key in scalars:
+                setattr(self, key, vals)
+            else:
+                raise KeyError(f"unknown config section {key!r}")
+
+    def get(self, dotted: str) -> Any:
+        sec, key = dotted.split(".", 1)
+        return getattr(getattr(self, sec), key)
+
+    def save(self, path: str) -> str:
+        """Write the live values as JSON (e.g. next to a result, so it can be traced to the settings that made it)."""
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump(self.snapshot(), fh, indent=2)
+        return path
+
+    def load(self, path: str) -> "Settings":
+        """Apply a JSON written by :meth:`save` (or by hand; partial is fine)."""
+        with open(path) as fh:
+            self.update_from_dict(json.load(fh))
+        return self
+
+    def show(self, *sections: str) -> None:
+        d = self.snapshot()
+        print(json.dumps({s: d[s] for s in sections} if sections else d, indent=2))
+
+    def check(self) -> "Settings":
+        """Fail early on invalid values (override in a subclass); returns ``self``."""
+        return self
+
+    # -- changing --------------------------------------------------------------------------------
+    @contextlib.contextmanager
+    def override(self, **dotted: Any) -> Iterator["Settings"]:
+        """Temporarily change options: ``with cfg.override(**{"md.n_steps": 10}): ...``"""
+        saved = copy.deepcopy(self.to_dict())
+        sections, scalars = self._sections(), self._scalars()
+        extras = {f.name: getattr(self, f.name) for f in dc.fields(self) if f.name not in sections and f.name not in scalars}
+        try:
+            for k, v in dotted.items():
+                if "." not in k:
+                    setattr(self, k, v)
+                    continue
+                sec, key = k.split(".", 1)
+                section = getattr(self, sec)
+                if isinstance(getattr(section, key), tuple) and isinstance(v, list):    # JSON round trip
+                    v = tuple(v)
+                setattr(section, key, v)
+            yield self
+        finally:
+            self.update_from_dict(saved)
+            for n, v in extras.items():
+                object.__setattr__(self, n, v)
+
+    def reset(self) -> "Settings":
+        """Restore the factory defaults."""
+        fresh = type(self)()
+        for f in dc.fields(self):
+            object.__setattr__(self, f.name, getattr(fresh, f.name))
+        return self
+
+
 @dc.dataclass
-class Config(_Frozen):
+class Config(Settings):
     calc: CalcCfg = dc.field(default_factory=CalcCfg)
     relax: RelaxCfg = dc.field(default_factory=RelaxCfg)
     phonon: PhononCfg = dc.field(default_factory=PhononCfg)
@@ -404,37 +544,7 @@ class Config(_Frozen):
     generation: GenerationCfg = dc.field(default_factory=GenerationCfg)
     #: Factory ``device -> ASE calculator`` for backend="custom" (not serialised).
     custom_calc_factory: Callable | None = None
-
-    # -- serialisation -----------------------------------------------------
-    def to_dict(self) -> dict:
-        d = {}
-        for f in dc.fields(self):
-            v = getattr(self, f.name)
-            if f.name == "custom_calc_factory":
-                continue
-            d[f.name] = dc.asdict(v)
-        return d
-
-    def snapshot(self) -> dict:
-        return json.loads(json.dumps(self.to_dict(), default=_json_default))
-
-    def to_json(self) -> str:
-        return json.dumps(self.to_dict(), default=_json_default)
-
-    def update_from_dict(self, d: dict) -> None:
-        for sec, vals in d.items():
-            if not hasattr(self, sec):
-                raise KeyError(f"unknown config section {sec!r}")
-            section = getattr(self, sec)
-            for k, v in vals.items():
-                cur = getattr(section, k)
-                if isinstance(cur, tuple) and isinstance(v, list):
-                    v = tuple(v)
-                setattr(section, k, v)
-
-    def get(self, dotted: str) -> Any:
-        sec, key = dotted.split(".", 1)
-        return getattr(getattr(self, sec), key)
+    _NOT_SERIALISED = ("custom_calc_factory",)
 
 
 def _json_default(o: Any) -> Any:
@@ -473,31 +583,15 @@ def load_from_env() -> bool:
 
 
 def load_json(path: str) -> None:
-    """Load a JSON file produced by ``cfg.to_json()`` / hand-written (partial allowed)."""
-    with open(path) as fh:
-        cfg.update_from_dict(json.load(fh))
+    """Load a JSON file produced by ``cfg.save()`` / hand-written (partial allowed)."""
+    cfg.load(path)
 
 
-@contextlib.contextmanager
-def override(**dotted: Any) -> Iterator[Config]:
-    """Temporarily change options: ``with override(**{"md.n_steps": 10}): ...``"""
-    saved = copy.deepcopy(cfg.to_dict())
-    saved_factory = cfg.custom_calc_factory
-    try:
-        for k, v in dotted.items():
-            sec, key = k.split(".", 1)
-            section = getattr(cfg, sec)
-            if isinstance(getattr(section, key), tuple) and isinstance(v, list):    # JSON round trip
-                v = tuple(v)
-            setattr(section, key, v)
-        yield cfg
-    finally:
-        cfg.update_from_dict(saved)
-        cfg.custom_calc_factory = saved_factory
+def override(**dotted: Any):
+    """Temporarily change options: ``with override(**{"md.n_steps": 10}): ...``  (same as ``cfg.override``)."""
+    return cfg.override(**dotted)
 
 
 def reset() -> None:
     """Restore factory defaults (used by tests)."""
-    fresh = Config()
-    for f in dc.fields(cfg):
-        object.__setattr__(cfg, f.name, getattr(fresh, f.name))
+    cfg.reset()

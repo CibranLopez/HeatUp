@@ -16,8 +16,13 @@ What is written, from ``relaxation/CONTCAR`` (VASP ``POSCAR`` files, atom order 
     elastic/strain/ xx_plus/POSCAR xx_minus/POSCAR ... strains.json      step ``elastic``  (12 strained cells)
     md/             POSCAR  cell.json                                    step ``md``       (supercell to start from)
 
-Every export folder has an ``export_<step>.json`` (what was written, from which CONTCAR hash, with which options): exporting
-again is a no-op unless the structure or the options changed, and only the files HeatUp wrote are ever replaced.
+What was written is recorded in the ``export`` section of the step record (``step_<step>.json``: files, hash of the CONTCAR,
+digest of the options): exporting again is a no-op unless the structure or the options changed, only the files HeatUp wrote are
+ever replaced, and a folder is created only when its files could be written.
+
+Every calculation folder also gets the structure it starts from as ``POSCAR`` (:func:`stage_input`): ``relaxation/POSCAR`` the
+given structure (to compare with ``CONTCAR``), ``elastic/POSCAR`` and ``phonons/POSCAR`` the relaxed cell, ``md/<T>K/POSCAR`` the
+supercell of that run.
 
 Bringing results back (anything that writes the files notebook 3 reads is fine): ``heatup.collect_ha`` turns forces of the
 ``phonons/ha`` cells into ``ha.json``, ``heatup.collect_elastic`` turns stresses of the strained cells into ``elastic.json``;
@@ -31,8 +36,11 @@ of the given ``POSCAR`` and everything is exported from it.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
+import shutil
 
 import numpy as np
 from ase import Atoms
@@ -71,9 +79,10 @@ def to_ase(sc) -> Atoms:
     return Atoms(sc.symbols, cell=sc.cell, scaled_positions=sc.scaled_positions, pbc=True)
 
 
-def phonon_cells(atoms: Atoms):
-    """``(phonopy object with displacements generated, supercell repetitions)`` of the relaxed *atoms*."""
-    sc = choose_supercell(atoms)
+def phonon_cells(atoms: Atoms, sc: tuple[int, int, int] | None = None):
+    """``(phonopy object with displacements generated, supercell repetitions)`` of the relaxed *atoms*.
+    ``sc``: use these repetitions instead of choosing them (QHA: the same ones at every volume)."""
+    sc = tuple(sc) if sc is not None else choose_supercell(atoms)
     ph = phonopy_object(atoms, sc)
     ph.generate_displacements(distance=cfg.phonon.delta_A)
     return ph, sc
@@ -104,20 +113,39 @@ def elastic_cells(atoms: Atoms, delta: float) -> dict[str, Atoms]:
             for i, lab in enumerate(VOIGT_LABELS) for sign, name in ((+1.0, "plus"), (-1.0, "minus"))}
 
 
+def _md_repetitions(unit, mcfg) -> tuple[int, int, int]:
+    """Repetitions of the MD cell.  An explicit ``supercell`` or no ``max_atoms`` -> the common rule; otherwise the target
+    width ``min_cell_A`` is lowered in steps of 1 A (down to ``min_cell_floor_A``) until the cell respects ``max_atoms``."""
+    kw = dict(supercell=mcfg.supercell, max_atoms=mcfg.max_atoms, auto_min_length=AUTO_MIN_LENGTH_A["md"], what="MD supercell")
+    if mcfg.supercell is not None or mcfg.min_cell_A is None or mcfg.max_atoms is None or mcfg.min_cell_floor_A is None:
+        return resolve_supercell(unit.cell.array, len(unit), min_length=mcfg.min_cell_A, **kw)
+    target = float(mcfg.min_cell_A)
+    while True:
+        try:
+            reps = resolve_supercell(unit.cell.array, len(unit), min_length=target, **kw)
+            if target < mcfg.min_cell_A:
+                log.warning("MD supercell: target width lowered from %g to %g A to respect max_atoms=%d", mcfg.min_cell_A, target, mcfg.max_atoms)
+            return reps
+        except ValueError:
+            if target - 1.0 < mcfg.min_cell_floor_A:
+                raise ValueError(f"MD supercell would exceed max_atoms={mcfg.max_atoms} even at {mcfg.min_cell_floor_A:g} A: "
+                                 "not suitable for MD with this cap")
+            target -= 1.0
+
+
 def build_md_cell(phase: PhaseDir, force: bool = False):
     """MD supercell from the relaxed cell: ``md.supercell`` if set, else perpendicular width >= ``md.min_cell_A``."""
     poscar = os.path.join(phase.md_dir, "POSCAR")
     info = os.path.join(phase.md_dir, "cell.json")
     mcfg = cfg.md
     request = {"supercell": None if mcfg.supercell is None else list(mcfg.supercell),
-               "min_cell_A": mcfg.min_cell_A, "max_atoms": mcfg.max_atoms}
+               "min_cell_A": mcfg.min_cell_A, "max_atoms": mcfg.max_atoms, "min_cell_floor_A": mcfg.min_cell_floor_A}
     if os.path.exists(poscar) and not force:
         old = read_json(info) or {}
         if old.get("request") == request and old.get("source") == ledger.file_hash(phase.contcar):
             return read_structure(poscar)
     unit = upper_triangular(read_structure(phase.contcar))
-    reps = resolve_supercell(unit.cell.array, len(unit), supercell=mcfg.supercell, min_length=mcfg.min_cell_A,
-                             max_atoms=mcfg.max_atoms, auto_min_length=AUTO_MIN_LENGTH_A["md"], what="MD supercell")
+    reps = _md_repetitions(unit, mcfg)
     sc = unit.repeat(reps)
     os.makedirs(phase.md_dir, exist_ok=True)
     write_poscar(poscar, sc)
@@ -195,14 +223,14 @@ def _cells(d: str, prefix: str, cells, width: int) -> list[str]:
     return files
 
 
-def _phonons(phase: PhaseDir, atoms: Atoms, d: str) -> list[str]:
+def _phonons(phase: PhaseDir, atoms: Atoms, d: str, plan: ledger.Plan) -> list[str]:
     ph, _ = phonon_cells(atoms)
     ph.save(os.path.join(d, "phonopy_disp.yaml"))
     ase_write(os.path.join(d, "SPOSCAR"), to_ase(ph.supercell), format="vasp", direct=True)
     return ["phonopy_disp.yaml", "SPOSCAR", *_cells(d, "disp", ph.supercells_with_displacements, 3)]
 
 
-def _qha(phase: PhaseDir, atoms: Atoms, d: str) -> list[str]:
+def _qha(phase: PhaseDir, atoms: Atoms, d: str, plan: ledger.Plan) -> list[str]:
     scales = qha_scales()
     files = []
     for i, s in enumerate(scales, start=1):
@@ -213,7 +241,7 @@ def _qha(phase: PhaseDir, atoms: Atoms, d: str) -> list[str]:
     return ["volumes.json", *files]
 
 
-def _fc3(phase: PhaseDir, atoms: Atoms, d: str) -> list[str]:
+def _fc3(phase: PhaseDir, atoms: Atoms, d: str, plan: ledger.Plan) -> list[str]:
     ph, _, sc2 = fc3_cells(atoms)
     ph.save(os.path.join(d, "phono3py_disp.yaml"))
     ase_write(os.path.join(d, "SPOSCAR"), to_ase(ph.supercell), format="vasp", direct=True)
@@ -223,7 +251,7 @@ def _fc3(phase: PhaseDir, atoms: Atoms, d: str) -> list[str]:
     return files
 
 
-def _elastic(phase: PhaseDir, atoms: Atoms, d: str) -> list[str]:
+def _elastic(phase: PhaseDir, atoms: Atoms, d: str, plan: ledger.Plan) -> list[str]:
     files = []
     for name, cell in elastic_cells(atoms, cfg.elastic.strain).items():
         _write_cell(os.path.join(d, name), cell)
@@ -233,9 +261,17 @@ def _elastic(phase: PhaseDir, atoms: Atoms, d: str) -> list[str]:
     return ["strains.json", *files]
 
 
-def _md(phase: PhaseDir, atoms: Atoms, d: str) -> list[str]:
-    build_md_cell(phase, force=True)
-    return ["POSCAR", "cell.json"]
+def _md(phase: PhaseDir, atoms: Atoms, d: str, plan: ledger.Plan) -> list[str]:
+    """The supercell as the starting structure of every planned run: ``md/<T>K/POSCAR`` (``md/POSCAR`` + ``cell.json`` are
+    the cache the compute step reads)."""
+    sc = build_md_cell(phase, force=True)
+    files = []
+    for T in plan.md_temperatures_K:
+        sub = f"{int(round(T))}K"
+        os.makedirs(os.path.join(d, sub), exist_ok=True)
+        write_poscar(os.path.join(d, sub, "POSCAR"), sc)
+        files.append(f"{sub}/POSCAR")
+    return files
 
 
 #: step -> (folder relative to the phase, writer)
@@ -248,35 +284,60 @@ EXPORTERS = {
 }
 
 
+def stage_input(phase: PhaseDir, step: str, T: float | None = None) -> str | None:
+    """Put the structure *step* starts from into its folder as ``POSCAR`` (``md``: the supercell, written by the export)."""
+    if step == "md":
+        return None
+    src = phase.poscar if step == "relax" else phase.contcar
+    if not os.path.exists(src):
+        return None
+    dst = os.path.join(ledger.STEPS[step].where(phase, T), "POSCAR")
+    if not (os.path.exists(dst) and ledger.file_hash(dst) == ledger.file_hash(src)):
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copyfile(src, dst)
+    return dst
+
+
+def _digest(obj) -> str:
+    return hashlib.sha1(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _rmdir_up(folder: str, stop: str) -> None:
+    """Remove *folder* and its parents while they are empty, never *stop* or above."""
+    folder, stop = os.path.abspath(folder), os.path.abspath(stop)
+    while folder != stop and folder.startswith(stop + os.sep):
+        try:
+            os.rmdir(folder)
+        except OSError:
+            return
+        folder = os.path.dirname(folder)
+
+
 def _export(phase: PhaseDir, plan: ledger.Plan, step: str, atoms: Atoms) -> dict:
     rel_dir, writer = EXPORTERS[step]
+    spec = ledger.STEPS[step]
     d = os.path.join(phase.path, rel_dir)
     keys = set(ledger.plan_options([step]))
     key = {"source": ledger.file_hash(phase.contcar),
-           "options": {k: v for k, v in sorted(plan.options.items()) if k in keys}}
-    meta_f = os.path.join(d, f"export_{step}.json")
-    old = read_json(meta_f)
-    if old and old.get("key") == key and all(os.path.exists(os.path.join(d, f)) for f in old["files"]):
+           "options": _digest({k: v for k, v in sorted(plan.options.items()) if k in keys}),
+           "temperatures": sorted(plan.md_temperatures_K) if spec.per_T else None}
+    home = [T for s, T in plan.tasks() if s == step][0]               # the record that carries the export section
+    old = ledger.get_export(phase, step, home)
+    if old and old.get("key") == key and all(os.path.exists(os.path.join(phase.path, f)) for f in old["files"]):
         return {"phase": phase.tag, "step": step, "dir": rel_dir, "n_files": len(old["files"]), "state": "up to date"}
     for f in (old or {}).get("files", []):                       # only what HeatUp wrote before; user files are never touched
-        p = os.path.join(d, f)
+        p = os.path.join(phase.path, f)
         if os.path.exists(p):
             os.remove(p)
-        try:
-            os.removedirs(os.path.dirname(p))
-        except OSError:
-            pass
+        _rmdir_up(os.path.dirname(p), phase.path)
     os.makedirs(d, exist_ok=True)
-    with ledger.applied(plan):
-        files = writer(phase, atoms, d)
-    write_json(meta_f, {"key": key, "files": files})
-    for s, T in plan.tasks():                                    # tell the task file(s) of this step
-        if s == step:
-            tf = os.path.join(ledger.STEPS[s].where(phase, T), f"task_{s}.json")
-            task = read_json(tf)
-            if task is not None:
-                task["exported"] = {"dir": rel_dir, "n_files": len(files), "details": os.path.join(rel_dir, f"export_{step}.json")}
-                write_json(tf, task)
+    try:
+        with ledger.applied(plan):
+            files = [os.path.join(rel_dir, f) for f in writer(phase, atoms, d, plan)]
+    except BaseException:                                        # no empty folder is left behind
+        _rmdir_up(d, phase.path)
+        raise
+    ledger.set_export(phase, step, home, {"key": key, "dir": rel_dir, "files": files})
     return {"phase": phase.tag, "step": step, "dir": rel_dir, "n_files": len(files),
             "state": "updated" if old else "written"}
 
@@ -304,6 +365,8 @@ def export_inputs(prepared=None, steps: list[str] | None = None) -> list[dict]:
                          "state": "skipped: relaxation/CONTCAR missing (run the relaxation first)"})
             continue
         atoms = read_structure(phase.contcar)
+        for step, T in plan.tasks():                             # the structure each calculation starts from, in its folder
+            stage_input(phase, step, T)
         for step in plan.steps:
             if step in EXPORTERS and (steps is None or step in steps):
                 try:

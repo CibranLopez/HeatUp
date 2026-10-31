@@ -445,20 +445,15 @@ def f_mag(phase: PhaseDir, T: np.ndarray) -> np.ndarray:
     """Thermal magnetic free energy from ``magnetic/moments.json``::
 
         {"curie_temperature_K": 1043, "beta_muB": 2.2, "structure_factor_p": 0.4}
-    (p = 0.28 bcc, 0.40 otherwise).  Returns G_mag(T) - G_mag(0) per atom.
-    """
+    (p = 0.40 bcc, 0.28 fcc/hcp/other - Hillert & Jarl 1978, Dinsdale 1991).  Returns the thermal part with S(0) = 0:
+    G_mag(T) - G_mag(0) - kB T ln(beta+1)   (see ``heatup.analyze.terms``: CALPHAD books the spin-disorder entropy
+    in the paramagnetic lattice part, which phonon free energies of the ordered state do not contain)."""
     d = read_json(phase.join("magnetic", "moments.json"))
     if not d:
         return np.zeros_like(T)
-    Tc, beta, p = float(d["curie_temperature_K"]), float(d["beta_muB"]), float(d.get("structure_factor_p", 0.4))
-    if Tc <= 0 or beta <= 0:
-        return np.zeros_like(T)
-    lnb = np.log(beta + 1.0)
-    g0 = -KB_EV * lnb * 79.0 * Tc / (140.0 * p * _hjg_A(p))     # lim T->0 of kB T ln(b+1) f(T/Tc)
-    out = np.zeros_like(T)
-    for i, t in enumerate(T):
-        out[i] = 0.0 if t <= 0 else KB_EV * t * lnb * _hjg_f(t / Tc, p) - g0
-    return out
+    from heatup.analyze.terms import magnetic_free_energy
+    return magnetic_free_energy(T, float(d["curie_temperature_K"]), float(d["beta_muB"]),
+                                float(d.get("structure_factor_p", 0.4)), third_law=True)
 
 
 # ---------------------------------------------------------------------------
@@ -527,8 +522,10 @@ def build_assembler(method: str | None = None) -> GibbsAssembler:
         asm.register("F_el", f_el)
     if cfg.hull.include_magnetic:
         asm.register("F_mag", f_mag)
-    if cfg.hull.include_configurational:
+    if cfg.hull.include_configurational and cfg.hull.configurational_model == "ideal":
         asm.register("F_conf", f_conf)
+    from heatup.analyze.ensembles import register_selected     # enumerated / monte_carlo / orientational / defects
+    register_selected(asm, cfg.hull)
     return asm
 
 

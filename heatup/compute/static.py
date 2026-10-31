@@ -103,7 +103,8 @@ def run_relaxation(phase_dir, device: str = "cpu", force: bool = False) -> None:
                 atoms = read_structure(phase.poscar)
                 conv, fres = relax_atoms(
                     atoms, calc, fmax=rcfg.fmax, max_steps=rcfg.max_steps, relax_cell=False,
-                    fix_symmetry=rcfg.fix_symmetry, symprec=rcfg.symprec)
+                    fix_symmetry=rcfg.fix_symmetry, symprec=rcfg.symprec,
+                    trajectory=os.path.join(phase.relax_dir, "run.traj"))
         else:                                # already relaxed elsewhere: energy, forces and stress at the given structure
             log.info("Using %s as given (relax not requested): single point with %s", phase.tag,
                      calculator_label(phase.material))
@@ -164,14 +165,23 @@ def elastic_from_stresses(stress_GPa: dict, delta: float) -> np.ndarray:
     return C
 
 
-def elastic_tensor(atoms, calc, delta: float, relax_ions: bool, fmax: float) -> np.ndarray:
-    """Stiffness tensor in GPa from the strained cells of ``prepare.export.elastic_cells`` evaluated with *calc*."""
+def elastic_tensor(atoms, calc, delta: float, relax_ions: bool, fmax: float,
+                   out_dir: str | None = None) -> np.ndarray:
+    """Stiffness tensor in GPa from the strained cells of ``prepare.export.elastic_cells`` evaluated with *calc*.
+    ``out_dir`` (``elastic/strain``): also write ``<name>/{relax.traj, CONTCAR, stress.json}`` for every strained cell."""
     stresses = {}
     for name, a in elastic_cells(atoms, delta).items():
         a.calc = calc
+        d = None if out_dir is None else os.path.join(out_dir, name)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        conv = None                                  # None: ions not relaxed
         if relax_ions:
-            BFGS(a, logfile=None).run(fmax=fmax, steps=300)
+            conv = bool(BFGS(a, trajectory=d and os.path.join(d, "relax.traj"), logfile=None).run(fmax=fmax, steps=300))
         stresses[name] = a.get_stress(voigt=True) * EV_A3_TO_GPA
+        if d:
+            write_poscar(os.path.join(d, "CONTCAR"), a)
+            write_json(os.path.join(d, "stress.json"), {"stress_GPa": stresses[name].tolist(), "converged": conv})
         a.calc = None
     return elastic_from_stresses(stresses, delta)
 
@@ -213,7 +223,8 @@ def run_elastic(phase_dir, device: str = "cpu", force: bool = False) -> None:
         atoms.calc = calc
         sigma0 = atoms.get_stress(voigt=True) * EV_A3_TO_GPA
         atoms.calc = None
-        C = elastic_tensor(atoms, calc, ecfg.strain, ecfg.relax_ions, ecfg.fmax)
+        C = elastic_tensor(atoms, calc, ecfg.strain, ecfg.relax_ions, ecfg.fmax,
+                           out_dir=os.path.join(os.path.dirname(phase.elastic_json), "strain"))
         mod = _write_elastic(phase, C, sigma0, calculator_label(phase.material))
         ledger.record(phase, "elastic")
     finally:

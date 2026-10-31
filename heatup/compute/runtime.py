@@ -7,7 +7,7 @@ The steps themselves are listed once, in :data:`heatup.core.ledger.STEPS`.  Ever
 
 * in a child process (default; the OS then reclaims all CUDA memory - del / gc / empty_cache do not), forwarding the
   whole configuration as one JSON env var;
-* inside :func:`heatup.core.ledger.tracking`, so ``status_<step>.json`` always says running / done / failed (+ error);
+* inside :func:`heatup.core.ledger.tracking`, so the ``run`` section of ``step_<step>.json`` always says running / done / failed (+ error);
   when the child dies without writing it (OOM kill) the parent records the failure;
 * retrying on CPU when the child exits with :data:`EXIT_RETRY_CPU` (75, a *known* CUDA runtime failure) - and
   **only** then (v0.2 retried on CPU after *any* non-zero exit, re-running genuine bugs before reporting them).

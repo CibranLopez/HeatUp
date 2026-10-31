@@ -20,8 +20,18 @@ Stages
              independently of each other.  No phonons, no MD: minutes per phase.
              ``reject``: Born-unstable, or 0 K hull energy > ``pre_md_hull_reject_eV``
              (default ``gates.hull_fail_eV``).  ``accept``: "worth paying for MD".
+             ``ScreenOptions.pre_md_phonons`` adds the harmonic evidence (phonons of the target and of its competitors):
+             Gate 2 from the HA modes and the T-dependent hull (HA free energies) - slower, still no MD.
 ``post_md``  all four gates (1, then 0 and 2 from the MD, then the T-dependent hull).
              ``reject``: any gate failed.  ``accept``: every gate ok.
+
+Per temperature
+---------------
+``ScreenResult.per_T`` = ``{T: {gate: GateResult}}`` for every temperature of ``ScreenOptions.md_temperatures`` (default
+``[operating_T]``): Gates 0 and 2 from the MD run at that temperature, the hull from the curve ``E_hull(T)`` that is
+computed anyway (interpolated, same thresholds), Gate 1 (no temperature) repeated.  ``GateResult.value`` holds the number behind
+the verdict (hull distance in eV/atom, rms displacement in A, soft-mode weight).  One call gives every temperature - the
+free energies of all phases are not recomputed per temperature.
 
 ``inconclusive`` = the evidence does not decide: warnings (unless ``accept_warn``), missing
 data (hull undefined, no MD yet, a step failed) - the reasons say which.
@@ -78,7 +88,8 @@ STAGES = ("pre_md", "post_md")
 class ScreenOptions:
     """Everything a caller may want to vary; ``None`` = keep the HeatUp default."""
     operating_T: float | None = None                 # K, temperature of the hull judgement
-    md_temperatures: list[float] | None = None       # K, MD runs evaluated by Gates 0/2 (default [operating_T])
+    md_temperatures: list[float] | None = None       # K, MD runs evaluated by Gates 0/2 and reported in per_T (default [operating_T])
+    pre_md_phonons: bool = False                     # pre_md: also compute HA phonons (target + competitors) for Gate 2 / the hull(T)
     relax: bool = True                               # False: the structure is already relaxed - use it as given (single point)
     mobile_species: list[str] | None = None          # e.g. ["Li"]: allowed to diffuse (Gates 0 and 2)
     thresholds: dict[str, float] | None = None       # gate thresholds, e.g. {"hull_ok_eV": 0.02}
@@ -95,7 +106,7 @@ class ScreenOptions:
     database_root: str | None = None
     candidates_root: str | None = None               # structures (inputs, MP, generated); computed copies go to database_root
     sources: list[str] | None = None
-    mp_api_key: str | None = None
+    mp_api_key_env: str | None = None
     # run control
     compute: bool = True                             # False: evaluate cached results only
     force: bool | str | list[str] | None = None      # True/"all", or step names (step names of ledger.STEPS, or the group "analysis")
@@ -109,6 +120,7 @@ class GateResult:
     name: str
     status: str                  # ok | warn | fail | missing
     message: str
+    value: float | None = None   # the number behind the verdict (hull distance eV/atom, rms A, soft-mode weight), if any
 
 
 @dc.dataclass
@@ -128,6 +140,7 @@ class ScreenResult:
     report_file: str | None
     result_file: str | None
     complete: bool                           # every gate of this stage had its evidence
+    per_T: dict = dc.field(default_factory=dict)     # {T_K: {gate: GateResult}} for ScreenOptions.md_temperatures
 
     def to_dict(self) -> dict:
         return dc.asdict(self)
@@ -140,7 +153,7 @@ class ScreenResult:
 _DIRECT = {"gates": "gates.enabled", "operating_T": "hull.operating_T", "mobile_species": "analysis.mobile_species",
            "backend": "calc.backend", "model": "calc.model", "model_overrides": "calc.model_overrides",
            "database_root": "phases.database_root", "candidates_root": "phases.candidates_root",
-           "sources": "phases.sources", "mp_api_key": "phases.mp_api_key", "device": "calc.device"}
+           "sources": "phases.sources", "mp_api_key_env": "phases.mp_api_key_env", "device": "calc.device"}
 
 
 def _dotted(o: ScreenOptions) -> dict[str, Any]:
@@ -208,6 +221,52 @@ def _gates() -> list[str]:
     return list(cfg.gates.enabled or GATES)
 
 
+def _per_T_gates(rep: dict, temps) -> dict:
+    """``{T: {gate: GateResult}}`` from the gate results of one evaluation (see the module docstring)."""
+    import numpy as np
+    g = cfg.gates
+    out: dict = {int(round(t)): {} for t in temps}
+    missing = lambda name, msg: GateResult(name, STATUS_MISSING, msg)
+    mech = rep.get("mechanical")
+    if mech:
+        for t in out:
+            out[t]["mechanical"] = dc.replace(_gate("mechanical", mech), value=mech.get("min_eigenvalue_GPa"))
+    st = rep.get("structural_transition")
+    if st and st.get("available"):
+        by = {int(round(r["temperature_K"])): r for r in st.get("sim_results", [])}
+        for t in out:
+            r = by.get(t)
+            out[t]["structural_transition"] = (
+                GateResult("structural_transition", r["status"], "; ".join(r.get("notes") or []) or f"rms block displacement {r['rms_A']:.2f} A",
+                           r.get("rms_A")) if r else missing("structural_transition", f"no MD run at {t} K"))
+    vib = rep.get("vibrational")
+    if vib and vib.get("available"):
+        by = {int(round(r["temperature_K"])): r for r in vib.get("vdos", [])}
+        for t in out:
+            r = by.get(t)
+            if r:
+                out[t]["vibrational"] = GateResult("vibrational", r["status"], "; ".join(r.get("quality_notes") or [])
+                                                   or f"soft-mode weight {100 * r['zero_frac']:.3f}%", r.get("zero_frac"))
+            elif vib.get("evidence") == "HA":            # harmonic evidence has no temperature
+                out[t]["vibrational"] = _gate("vibrational", vib)
+            else:
+                out[t]["vibrational"] = missing("vibrational", f"no MD run at {t} K")
+    th = rep.get("thermodynamic")
+    if th and th.get("available"):
+        Ts, E = np.asarray(th["temperatures"], float), np.asarray(th["e_hull_eV"], float)
+        downgraded = th.get("status") == STATUS_WARN and th.get("e_hull_at_T_eV", 1.0) <= g.hull_ok_eV      # e.g. calculator mismatch
+        for t in out:
+            if not (Ts.min() <= t <= Ts.max()):
+                out[t]["thermodynamic"] = missing("thermodynamic", f"{t} K is outside the hull grid ({Ts.min():g}-{Ts.max():g} K)")
+                continue
+            e = float(np.interp(t, Ts, E))
+            s = STATUS_OK if e <= g.hull_ok_eV else STATUS_WARN if e <= g.hull_fail_eV else STATUS_FAIL
+            if s == STATUS_OK and downgraded:
+                s = STATUS_WARN
+            out[t]["thermodynamic"] = GateResult("thermodynamic", s, f"{1e3 * e:.1f} meV/atom above the hull at {t} K", e)
+    return out
+
+
 def _plan_and_run(phase: PhaseDir, stage: str, o: ScreenOptions, T_op: float) -> list[str]:
     """Plan the steps the enabled gates need (target + competitors), run them; returns error messages."""
     from heatup.compute.execute import run_plan
@@ -217,6 +276,13 @@ def _plan_and_run(phase: PhaseDir, stage: str, o: ScreenOptions, T_op: float) ->
     if stage == "pre_md":
         tsteps = ["relax"] + (["elastic"] if "mechanical" in enabled else [])
         csteps = ["relax"]
+        if o.pre_md_phonons:
+            if method != "HA":
+                raise ValueError(f"pre_md_phonons needs the harmonic hull (cfg.hull.phonon_method None/'HA'), got {method!r}")
+            if "vibrational" in enabled or "thermodynamic" in enabled:
+                tsteps.append("phonons")
+            if "thermodynamic" in enabled:
+                csteps.append("phonons")
     else:
         tsteps = ledger.steps_for(enabled, method, "target")
         csteps = ledger.steps_for(enabled, method, "competitor")
@@ -254,7 +320,20 @@ def _pre_md(phase: PhaseDir, o: ScreenOptions, T_op: float) -> dict:
         gates["hull_0K"] = (GateResult("hull_0K", STATUS_OK, f"{1e3 * hull0['e_hull_0K_eV']:.1f} meV/atom above the 0 K hull")
                             if hull0.get("available") else
                             GateResult("hull_0K", STATUS_MISSING, hull0.get("message", "")))
-    return {"gates": gates, "hull0": hull0, "errors": errors, "mech": mech}
+    vib = th = None
+    if o.pre_md_phonons:
+        from heatup.analyze.gates import assess_vibrational_stability
+        from heatup.analyze.hull import assess_thermodynamic_stability
+        if "vibrational" in enabled:
+            vib = assess_vibrational_stability(phase)
+            gates["vibrational"] = _gate("vibrational", vib)
+        if "thermodynamic" in enabled:
+            try:
+                th = assess_thermodynamic_stability(phase, operating_T=T_op)
+            except Exception as exc:  # noqa: BLE001  (e.g. a competitor without phonons)
+                th = {"available": False, "status": STATUS_MISSING, "message": f"harmonic hull failed: {exc}"}
+            gates["thermodynamic"] = _gate("thermodynamic", th)
+    return {"gates": gates, "hull0": hull0, "errors": errors, "mech": mech, "vib": vib, "thermo": th}
 
 
 def screen(sym_dir: "str | os.PathLike | PhaseDir", stage: Stage = "post_md",
@@ -281,6 +360,7 @@ def screen(sym_dir: "str | os.PathLike | PhaseDir", stage: Stage = "post_md",
         flags: list[str] = []
         e_T = e_0 = None
         decomp: dict = {}
+        per_T: dict = {}
         complete = False
         report_file = os.path.join(phase.stability_dir, f"report_{stage}.json")
         try:
@@ -294,6 +374,11 @@ def screen(sym_dir: "str | os.PathLike | PhaseDir", stage: Stage = "post_md",
                 flags = list(h0.get("flags", []))
                 hull_ok = bool(h0.get("available"))
                 complete = bool(gates) and all(g.status != STATUS_MISSING for g in gates.values())
+                if (r.get("thermo") or {}).get("available"):
+                    e_T = r["thermo"]["e_hull_at_T_eV"]                 # harmonic hull at the operating temperature
+                    decomp = r["thermo"].get("decomposition") or decomp
+                per_T = _per_T_gates({"mechanical": r.get("mech"), "vibrational": r.get("vib"), "thermodynamic": r.get("thermo")},
+                                     o.md_temperatures or [T_op])
                 verdict, reasons = decide("pre_md", gates, e_0, hull_ok, hull_reject_eV=hull_reject,
                                           accept_warn=o.accept_warn, errors=[e for e in errors if e])
                 os.makedirs(phase.stability_dir, exist_ok=True)
@@ -312,6 +397,7 @@ def screen(sym_dir: "str | os.PathLike | PhaseDir", stage: Stage = "post_md",
                 flags = list(rep["flags"])
                 errors = [f for f in rep["flags"] if f.startswith("[ERROR]")] + run_errors
                 complete = bool(rep["complete"])
+                per_T = _per_T_gates(rep, o.md_temperatures or [T_op])
                 verdict, reasons = decide("post_md", gates, None, True, hull_reject_eV=hull_reject,
                                           accept_warn=o.accept_warn, errors=errors)
         except Exception as exc:  # noqa: BLE001
@@ -325,7 +411,7 @@ def screen(sym_dir: "str | os.PathLike | PhaseDir", stage: Stage = "post_md",
                            phase=phase.tag, phase_dir=phase.path, model=model,
                            report_file=report_file if os.path.exists(report_file) else None,
                            result_file=os.path.join(phase.stability_dir, f"result_{stage}.json"),
-                           complete=complete)
+                           complete=complete, per_T=per_T)
         os.makedirs(phase.stability_dir, exist_ok=True)
         write_json(res.result_file, res.to_dict())
         log.info("%s [%s] -> %s (%s)", phase.tag, stage, verdict.upper(), "; ".join(reasons)[:200])

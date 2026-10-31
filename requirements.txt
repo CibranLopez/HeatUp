@@ -10,3 +10,4 @@ numpy
 ase
 mace-torch
 pandas
+phonopy

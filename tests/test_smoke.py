@@ -283,17 +283,21 @@ def test_prepare_generates_the_task_folders(project):
     base = "database/Cu3Au/L1_2"
     for d in ("relaxation", "elastic", "phonons", "md/300K"):
         assert os.path.isdir(f"{base}/{d}"), d
-    md = json.load(open(f"{base}/md/300K/task_md.json"))
-    assert md["temperature_K"] == 300.0 and md["inputs"] == ["relaxation/CONTCAR"]
-    assert md["outputs"] == ["md/300K/output.traj", "md/300K/md.json"] and md["options"]["md.n_steps"] == cfg.md.n_steps
-    assert json.load(open(f"{base}/relaxation/task_relax.json"))["inputs"] == ["POSCAR"]
+    rec = json.load(open(f"{base}/md/300K/step_md.json"))
+    md = rec["task"]
+    assert rec["temperature_K"] == 300.0 and md["inputs"] == ["relaxation/CONTCAR"]
+    assert md["outputs"] == ["md/300K/output.traj", "md/300K/md.json"]
+    assert "options" not in md and md["settings"]["file"] == "../../plan.json" and "md.*" in md["settings"]["keys"]
+    assert json.load(open(f"{base}/plan.json"))["options"]["md.n_steps"] == cfg.md.n_steps       # the one place for settings
+    assert json.load(open(f"{base}/relaxation/step_relax.json"))["task"]["inputs"] == ["POSCAR"]
+    assert open(f"{base}/relaxation/POSCAR").read() == open(f"{base}/POSCAR").read()               # input kept next to CONTCAR
     assert os.path.isdir("database/Cu/Fm-3m/phonons") and not os.path.exists("database/Cu/Fm-3m/md")   # competitor: relax + phonons
     assert {r["state"] for r in status()} == {"pending"}                       # empty folders are not "started"
     assert heatup.PhaseDir(base).md_temperatures(complete=False) == []
     # asking for less removes the tasks that are no longer planned
     cfg.plan.gates = ["relax", "mechanical"]
     prepare_project(project, competitors=False)
-    assert os.path.exists(f"{base}/elastic/task_elastic.json") and not os.path.exists(f"{base}/md/300K/task_md.json")
+    assert os.path.exists(f"{base}/elastic/step_elastic.json") and not os.path.exists(f"{base}/md/300K/step_md.json")
 
 
 def test_relax_not_requested_uses_the_structure_as_given(project):
@@ -334,7 +338,7 @@ def test_md_for_competing_phases_when_asked(project):
     cfg.plan.competitor_steps = ["relax", "phonons", "md"]
     cfg.plan.md_temperatures = None
     prepare_project(project)
-    assert os.path.isdir("database/Cu/Fm-3m/md/300K") and os.path.exists("database/Au/Fm-3m/md/300K/task_md.json")
+    assert os.path.isdir("database/Cu/Fm-3m/md/300K") and os.path.exists("database/Au/Fm-3m/md/300K/step_md.json")
     assert ledger.read_plan("database/Cu/Fm-3m").md_temperatures_K == [300.0]
 
 
@@ -351,7 +355,7 @@ def test_free_energy_method_decides_what_competitors_need(project):
     prep = prepare_project(project)
     assert ledger.read_plan("database/Au/Fm-3m").steps == ["relax", "phonons", "md"]    # phonons planned earlier stay (merge)
     assert ledger.read_plan("database/Au/Fm-3m").md_temperatures_K == [300.0]            # the queried material's temperature
-    assert os.path.exists("database/Cu/Fm-3m/md/300K/task_md.json")
+    assert os.path.exists("database/Cu/Fm-3m/md/300K/step_md.json")
     assert ledger.read_plan(prep.targets[0]).options["hull.phonon_method"] == "VDOS"
 
 
@@ -415,7 +419,7 @@ def test_export_inputs_and_external_roundtrip(project):
     base = target.path
     assert os.path.exists(f"{base}/phonons/ha/phonopy_disp.yaml") and os.path.exists(f"{base}/phonons/ha/SPOSCAR")
     assert len(glob.glob(f"{base}/elastic/strain/*/POSCAR")) == 12 and os.path.exists(f"{base}/md/POSCAR")
-    assert json.load(open(f"{base}/elastic/task_elastic.json"))["exported"]["n_files"] == 13
+    assert len(json.load(open(f"{base}/elastic/step_elastic.json"))["export"]["files"]) == 13
     assert {r["state"] for r in export_inputs(prep)} == {"up to date"}
     syms = read(f"{base}/phonons/ha/disp-001/POSCAR").get_chemical_symbols()         # species in one block each: VASP-ready
     assert 1 + sum(a != b for a, b in zip(syms, syms[1:])) == len(set(syms))
@@ -480,3 +484,69 @@ def test_fc3_displacements_are_exported(project):
     d = prep.targets[0].path + "/phonons/fc3"
     assert row["state"] == "written" and os.path.exists(f"{d}/phono3py_disp.yaml")
     assert len(glob.glob(f"{d}/disp-*/POSCAR")) >= 1
+
+
+def test_one_record_per_step_and_no_duplicated_settings(project):
+    from heatup.compute.execute import run_plan
+    from heatup.prepare.plan import prepare_project
+
+    prepare_project(project, competitors=False)
+    run_plan(steps=["relax"])
+    base = "database/Cu3Au/L1_2"
+    d = f"{base}/relaxation"
+    assert sorted(f for f in os.listdir(d) if f.endswith(".json")) == ["energy.json", "step_relax.json"]   # ONE metadata file
+    rec = json.load(open(f"{d}/step_relax.json"))
+    assert set(rec) >= {"task", "run", "result"} and rec["run"]["state"] == "done" and "options" not in rec["task"]
+    plan = json.load(open(f"{base}/plan.json"))
+    # settings: planned (plan.json) and used (the result's fingerprint) - nowhere else
+    assert plan["options"]["relax.fmax"] == cfg.relax.fmax == rec["result"]["fingerprint"]["relax.fmax"]
+    assert open(f"{d}/POSCAR").read() == open(f"{base}/POSCAR").read() and os.path.exists(f"{d}/CONTCAR")
+
+
+def test_poscar_in_every_calculation_folder(project):
+    from heatup.compute.execute import run_plan
+    from heatup.prepare.export import export_inputs
+    from heatup.prepare.plan import prepare_project
+
+    cfg.phonon.min_length_A = 6.0
+    cfg.md.min_cell_A = 6.0
+    prep = prepare_project(project, competitors=False)
+    target = prep.targets[0]
+    run_plan(steps=["relax"])
+    export_inputs(prep)
+    base = target.path
+    contcar = open(target.contcar).read()
+    assert open(f"{base}/elastic/POSCAR").read() == contcar and open(f"{base}/phonons/POSCAR").read() == contcar
+    assert open(f"{base}/md/300K/POSCAR").read() == open(f"{base}/md/POSCAR").read()
+    assert open(f"{base}/relaxation/POSCAR").read() == open(target.poscar).read()
+
+
+def test_failed_export_leaves_no_empty_folder(project):
+    from heatup.compute.execute import run_plan
+    from heatup.prepare.export import export_inputs
+    from heatup.prepare.plan import prepare_project
+
+    cfg.phonon.max_atoms = 1                                              # no phonon supercell fits
+    prep = prepare_project(project, competitors=False)
+    run_plan(steps=["relax"])
+    rows = {r["step"]: r for r in export_inputs(prep)}
+    assert rows["phonons"]["state"].startswith("failed") and rows["elastic"]["state"] == "written"
+    assert not os.path.exists(f"{prep.targets[0].path}/phonons/ha")
+
+
+def test_files_of_earlier_versions_are_still_read(project):
+    """Per-step manifest_/status_ files (earlier 0.4 builds, v0.3 manifest.json) are read and folded into the step record."""
+    from heatup.compute.execute import run_plan
+    from heatup.prepare.plan import prepare_project
+
+    target = prepare_project(project, competitors=False).targets[0]
+    run_plan(steps=["relax"])
+    rec = json.load(open(f"{target.relax_dir}/step_relax.json"))
+    os.remove(f"{target.relax_dir}/step_relax.json")
+    json.dump({"step": "relax", **rec["result"]}, open(f"{target.relax_dir}/manifest_relax.json", "w"))
+    json.dump({"step": "relax", **rec["run"]}, open(f"{target.relax_dir}/status_relax.json", "w"))
+    assert ledger.step_state(target, "relax", calc=True)[0] == "done"
+    ledger.mark(target, "relax", None, "done")                           # the next write folds them in
+    assert os.path.exists(f"{target.relax_dir}/step_relax.json")
+    assert not os.path.exists(f"{target.relax_dir}/manifest_relax.json") and not os.path.exists(f"{target.relax_dir}/status_relax.json")
+    assert ledger.step_state(target, "relax", calc=True)[0] == "done"
