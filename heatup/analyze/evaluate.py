@@ -106,7 +106,7 @@ def _incomplete(phase: PhaseDir, gates: list[str]) -> dict[str, list[str]]:
     rows = ledger.phase_rows(phase, calc=False)
     out: dict[str, list[str]] = {}
     for g in gates:
-        need = set(ledger.gate_steps(g, ledger.phonon_method(phase)))
+        need = set(ledger.gate_steps(g, ledger.phonon_method(phase), phase))
         bad = [_describe(r) for r in rows
                if r["step"] in need and r["state"] not in (*ledger.GOOD_STATES, ledger.PRUNED)]
         if bad:

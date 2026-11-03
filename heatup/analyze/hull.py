@@ -115,7 +115,7 @@ def zero_k_screen(target: Phase, competitors: list[Phase]) -> dict:
 
 def THERMO_STEPS_OF(target_dir) -> tuple:
     """The calculations whose settings must agree between target and competitor for the hull's method."""
-    return ledger.THERMO_STEPS[ledger.phonon_method(target_dir)]
+    return ledger.gate_steps("thermodynamic", ledger.phonon_method(target_dir), target_dir)
 
 
 def usable_competitors(target_dir) -> tuple[list[Phase], dict[str, dict]]:

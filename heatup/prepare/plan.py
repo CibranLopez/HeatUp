@@ -96,9 +96,11 @@ def _save(phase_dir, plan: ledger.Plan) -> None:
 
 
 def _method() -> str:
-    m = (cfg.hull.phonon_method or "HA").upper()
+    """Vibrational model of the hull (``cfg.terms.vibrational``; legacy ``cfg.hull.phonon_method``), validated."""
+    from heatup.core import contributions
+    m = contributions.resolve()["vibrational"].upper()
     if m not in ledger.THERMO_STEPS:
-        raise ValueError(f"cfg.hull.phonon_method: {m!r}; choose from {list(ledger.THERMO_STEPS)}")
+        raise ValueError(f"cfg.terms.vibrational: {m!r}; choose from {list(ledger.THERMO_STEPS)}")
     return m
 
 
@@ -107,7 +109,10 @@ def make_plan(role: str, source: str, steps: list[str], operating_T: float | Non
     opts = ledger.plan_options(steps)
     opts["plan.prune_window_eV"] = cfg.plan.prune_window_eV              # project-level; analysis reads it from here
     if gates and "thermodynamic" in gates:
-        opts["hull.phonon_method"] = _method()                           # notebook 3 follows it unless told otherwise
+        opts["hull.phonon_method"] = _method()                           # (legacy key, kept for older readers)
+        from heatup.core import contributions
+        contributions.raise_on_errors()                                  # incompatible terms stop here, before any calculation
+        opts.update(contributions.plan_options())                        # EVERY term as prepared; notebook 3 follows unless told otherwise
     if "relax" in steps:                                                 # "relax" not asked for: structures are taken as given
         opts["relax.optimize"] = "relax" in gates if gates else True
     md_T = sorted({float(t) for t in (md_temperatures or [])}) if "md" in steps else []
@@ -144,9 +149,9 @@ def prepare_phase(phase_dir, role: str = "target", steps: list[str] | None = Non
 
 
 def _parse_entry(e: dict) -> tuple[str, str, list[float], float | None]:
-    t = e.get("temperature", e.get("temperatures"))          # "temperatures" (a list) is accepted as an alias; other keys are ignored
+    t = e.get("temperature")
     temps = [float(x) for x in (t if isinstance(t, (list, tuple)) else [t])] if t is not None else []
-    op = e.get("operating_T", max(temps) if "temperatures" in e and "temperature" not in e and temps else (temps[0] if temps else None))
+    op = e.get("operating_T", temps[0] if temps else None)
     return e["material"], e["symmetry"], temps, None if op is None else float(op)
 
 

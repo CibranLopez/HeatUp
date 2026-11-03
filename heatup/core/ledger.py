@@ -92,10 +92,13 @@ STEPS: dict[str, Step] = {s.name: s for s in [
          keys=("relax.fmax", "relax.max_steps", "relax.pressure_GPa")),
     Step("fc3", "heatup.compute.fc3:run_fc3", lambda p, T: p.phonon_dir, ("fc3.json",),
          _CONTCAR, needs=("relax",), tier=2, sections=("phonon", "fc3")),
+    Step("anharmonic", "heatup.compute.anharmonic:run_anharmonic", lambda p, T: p.phonon_dir, ("anharmonic.json",),
+         _CONTCAR, needs=("relax", "qha"), tier=2, sections=("anharmonic",),
+         keys=("relax.fmax", "relax.max_steps", "relax.pressure_GPa")),
     Step("md", "heatup.compute.md:run_md", lambda p, T: p.md_run(T), ("output.traj", "md.json"),
-         _CONTCAR, needs=("relax",), tier=2, sections=("md",), per_T=True, partial=("output.traj", "output.traj.part")),
+         _CONTCAR, needs=("relax",), tier=2, sections=("md",), per_T=True, partial=("output.traj",)),
     # analysis of a finished MD run (calculator-free; run by notebook 3, one manifest each)
-    Step("mdstats", "heatup.analyze.trajectory:run_mdstats", lambda p, T: p.md_run(T), ("mdstats.json",),
+    Step("mdstats", "heatup.analyze.trajectory:run_mdstats", lambda p, T: p.md_run(T), ("analysis.json",),
          _MD_SOURCE, needs=("md",), tier=3, calc=False, per_T=True, group="analysis",
          keys=("analysis.equil_ps", "analysis.stride")),
     Step("vdos", "heatup.analyze.trajectory:run_vdos", lambda p, T: p.md_run(T), ("vdos.json",),
@@ -112,12 +115,18 @@ ANALYSIS_STEPS = tuple(n for n, s in STEPS.items() if s.tier == 3)
 GATE_STEPS = {"mechanical": ("elastic",), "structural_transition": ("md",),
               "vibrational": ("phonons", "md"), "thermodynamic": ()}
 #: the hull's evidence, per free-energy method (``cfg.hull.phonon_method``), for the target AND every competing phase
-THERMO_STEPS = {"HA": ("phonons",), "QHA": ("qha",), "VDOS": ("md",)}
+THERMO_STEPS = {"OFF": (), "ZPE": ("phonons",), "HA": ("phonons",), "QHA": ("qha",), "VDOS": ("md",)}
 
 
-def gate_steps(gate: str, method: str = "HA") -> tuple:
-    """Steps whose output *gate* reads (the hull's depend on the free-energy method)."""
-    return tuple(GATE_STEPS.get(gate, ())) + (THERMO_STEPS[method.upper()] if gate == "thermodynamic" else ())
+def gate_steps(gate: str, method: str = "HA", phase=None) -> tuple:
+    """Steps whose output *gate* reads.  The hull's are those of the selected terms (``heatup.core.contributions``):
+    the vibrational *method* plus whatever the other selected terms need (resolved for *phase* as prepared)."""
+    base = tuple(GATE_STEPS.get(gate, ()))
+    if gate != "thermodynamic":
+        return base
+    from heatup.core import contributions
+    extra = contributions.required_steps(phase=phase, exclude=("vibrational",))
+    return base + tuple(dict.fromkeys(THERMO_STEPS[method.upper()] + extra))
 
 
 def steps_for(gates, method: str = "HA", role: str = "target") -> list[str]:
@@ -129,29 +138,13 @@ def steps_for(gates, method: str = "HA", role: str = "target") -> list[str]:
         for g in gates:
             need.update(gate_steps(g, method))
     elif "thermodynamic" in gates:
-        need.update(THERMO_STEPS[method.upper()])
+        need.update(gate_steps("thermodynamic", method))
     return [n for n in COMPUTE_STEPS if n in need]
 
 
 # ---------------------------------------------------------------------------
 # 2. the step record (one file per step folder)
 # ---------------------------------------------------------------------------
-
-def _default(dotted: str):
-    """Default value of a dotted option (``md.integrator``) - the value a result made before the option existed implies."""
-    import dataclasses as dc
-    sec, key = dotted.split(".", 1)
-    obj = getattr(cfg, sec, None)
-    if obj is None or not dc.is_dataclass(obj):
-        return _NO_DEFAULT
-    for f in dc.fields(obj):
-        if f.name == key:
-            return f.default if f.default is not dc.MISSING else (f.default_factory() if f.default_factory is not dc.MISSING else _NO_DEFAULT)
-    return _NO_DEFAULT
-
-
-_NO_DEFAULT = object()
-
 
 def fingerprint(step: str, material: str | None = None, calc: bool = True) -> dict:
     """The part of the configuration that can change *step*'s result.  ``calc=False`` leaves the calculator out
@@ -278,7 +271,7 @@ def diff(phase, step: str, T: float | None = None, calc: bool = True) -> dict:
     diffs: dict = {}
     sf = saved.get("fingerprint", {})
     for k, v in fingerprint(step, phase.material, calc).items():
-        if sf.get(k) != v and not (k not in sf and v == _default(k)):      # option added after the result was made, still at its default
+        if sf.get(k) != v:
             diffs[k] = (sf.get(k), v)
     for p in spec.inputs(phase, T):
         name = os.path.basename(p)
@@ -396,8 +389,11 @@ def plan_conflicts(existing: Plan, steps, options: dict) -> dict:
     """``{key: (existing, wanted)}``: options of *steps* that *existing* also plans, with a different value.
     A phase whose results were produced with other settings must not be mixed into a hull (nor silently recomputed)."""
     common = [s for s in steps if s in existing.steps]
-    return {k: (existing.options[k], options[k]) for k in sorted(plan_options(common))
-            if k in existing.options and k in options and existing.options[k] != options[k]}
+    out = {k: (existing.options[k], options[k]) for k in sorted(plan_options(common))
+           if k in existing.options and k in options and existing.options[k] != options[k]}
+    out.update({k: (existing.options[k], options[k]) for k in sorted(options)            # the SAME terms for every phase
+                if k.startswith("terms.") and k in existing.options and existing.options[k] != options[k]})
+    return out
 
 
 def merge_plans(existing: Plan, wanted: Plan) -> Plan:
@@ -446,12 +442,10 @@ def resolve_gates(phase, explicit: list | None = None) -> list[str]:
 
 
 def phonon_method(phase, explicit: str | None = None) -> str:
-    """Free-energy method of the hull: *explicit* > ``cfg.hull.phonon_method`` > what the phase was prepared with > HA."""
-    m = explicit or cfg.hull.phonon_method
-    if m:
-        return m.upper()
-    plan = read_plan(phase)
-    return str((plan.options.get("hull.phonon_method") if plan else None) or "HA").upper()
+    """Vibrational model of the hull: *explicit* > ``cfg.terms.vibrational`` > legacy ``cfg.hull.phonon_method`` > what the
+    phase was prepared with > HA   (``heatup.core.contributions.resolve``)."""
+    from heatup.core import contributions
+    return contributions.resolve(phase, vibrational=explicit)["vibrational"].upper()
 
 
 def operating_T(phase, default: float | None = None) -> float:
@@ -494,8 +488,7 @@ def _relax_problem(phase: PhaseDir, T) -> str | None:
 
 
 def _md_progress(phase: PhaseDir, T) -> str:
-    sim = phase.md_run(T)
-    n = max(trajectory_frames(os.path.join(sim, f)) for f in ("output.traj", "output.traj.part"))
+    n = trajectory_frames(os.path.join(phase.md_run(T), "output.traj"))
     return f"{n} of {cfg.md.n_steps // cfg.md.nblock + 1} frames"
 
 

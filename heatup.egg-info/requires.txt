@@ -1,20 +1,27 @@
-numpy>=1.24
-scipy>=1.10
-matplotlib>=3.7
-pymatgen>=2023.1
+numpy
+scipy
+ase>=3.23
+phonopy>=2.20
+pymatgen
+spglib
+matplotlib
 
-[all]
-heatup[dev,generation,md]
+[fc3]
+phono3py
 
-[dev]
-pytest>=7
-pytest-cov
-ruff
-mypy
+[generate]
+pyxtal
 
-[generation]
-pyxtal>=0.6
+[mace]
+mace-torch
 
-[md]
-ase>=3.22
-mace-torch>=0.3
+[mp]
+mp-api
+
+[notebooks]
+pandas
+jupyter
+ipykernel
+
+[test]
+pytest
