@@ -45,13 +45,10 @@ from heatup.prepare.export import VOIGT_LABELS, elastic_cells
 log = logging.getLogger("heatup")
 
 
-
-
 # ---------------------------------------------------------------------------
 # relax
 # ---------------------------------------------------------------------------
 
-log = logging.getLogger("heatup")
 
 
 def relax_atoms(atoms, calc, *, fmax: float, max_steps: int, relax_cell: bool,
@@ -154,7 +151,6 @@ def run_relaxation(phase_dir, device: str = "cpu", force: bool = False) -> None:
 # elastic
 # ---------------------------------------------------------------------------
 
-log = logging.getLogger("heatup")
 
 def elastic_from_stresses(stress_GPa: dict, delta: float) -> np.ndarray:
     """Stiffness tensor C (6x6, GPa, not symmetrised) from the stresses of the +/- strained cells: keys ``<voigt>_plus`` /
@@ -225,7 +221,7 @@ def run_elastic(phase_dir, device: str = "cpu", force: bool = False) -> None:
         atoms.calc = None
         C = elastic_tensor(atoms, calc, ecfg.strain, ecfg.relax_ions, ecfg.fmax,
                            out_dir=os.path.join(os.path.dirname(phase.elastic_json), "strain"))
-        mod = _write_elastic(phase, C, sigma0, calculator_label(phase.material))
+        _write_elastic(phase, C, sigma0, calculator_label(phase.material))
         ledger.record(phase, "elastic")
     finally:
         atoms.calc = None
@@ -251,7 +247,7 @@ def collect_elastic(phase_dir, stresses_GPa: dict, residual_stress_GPa=None, cal
     """``elastic/elastic.json`` from stresses computed with ANY code on the cells of ``elastic/strain/`` (``prepare.export``).
 
     ``stresses_GPa``: ``{"xx_plus": [6 values], "xx_minus": ..., ..., "xy_minus": ...}`` - Voigt xx yy zz yz xz xy, GPa, tension
-    positive, ions relaxed at fixed cell; ``residual_stress_GPa``: the stress of the unstrained cell (reported by Gate 1).  No
+    positive, ions relaxed at fixed cell; ``residual_stress_GPa``: the stress of the unstrained cell (reported by the mechanical check).  No
     manifest is written: the result is ``external``.  The strain amplitude is ``cfg.elastic.strain`` of the export."""
     phase = PhaseDir.of(phase_dir)
     C = elastic_from_stresses(stresses_GPa, cfg.elastic.strain)

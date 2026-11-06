@@ -7,8 +7,8 @@ Notebook 3's driver: turn what is on disk into verdicts.  **Nothing here compute
                         same table (``calc=True``) to decide what to run.
 * :func:`run_analysis`  the cheap, calculator-free analysis steps of every finished MD run
                         (``mdstats``, ``vdos``, ``transition``), cached by manifest.
-* :func:`evaluate`      the enabled gates for one phase.  Gates are **independent**: a failing gate never stops
-                        another, and a gate whose evidence is absent is ``missing`` with the reason.  The verdicts
+* :func:`evaluate`      the enabled checks for one phase.  The checks are **independent and unordered**: a failing one never
+                        stops another, and one whose evidence is absent is ``missing`` with the reason.  The verdicts
                         are always recomputed from the cached step outputs; reports are written per stage
                         (``stability/report_<stage>.json``) and never read back as a result.  Evidence from steps
                         that are not ``done`` (unfinished MD, failed relaxation, ...) is flagged ``[incomplete]``;
@@ -26,7 +26,8 @@ from heatup import __version__
 from heatup.analyze.gates import (assess_mechanical_stability, assess_structural_transition,
                                   assess_vibrational_stability)
 from heatup.analyze.hull import assess_thermodynamic_stability, pruned_competitors
-from heatup.analyze.thermo import anharmonic_summary, load_fc3
+from heatup.analyze.anharmonic import collect_md_phonons
+from heatup.analyze.thermo import load_perturbative, perturbative_summary
 from heatup.core import ledger
 from heatup.core.config import (GATES, STATUS_FAIL, STATUS_MISSING, STATUS_OK, STATUS_WARN, cfg)
 from heatup.core.layout import PhaseDir, iter_phase_dirs, write_json
@@ -63,8 +64,9 @@ def status(calc: bool = False, include_competing: bool = True, problems_only: bo
 
 def run_analysis(phases=None, force=None) -> list[dict]:
     """Run ``mdstats``, ``vdos`` and ``transition`` for every finished MD run (planned temperatures) of *phases*
-    (default: everything in ``database_root``).  Cached by manifest; a failure is logged
-    and returned, never raised."""
+    (default: everything in ``database_root``): the VDOS and its figure land in ``phonons/anharmonic/<T>K/`` (with the summary
+    ``phonons/anharmonic/anharmonic.json`` and ``source.json``), the other two next to the trajectory in ``md/<T>K/``.
+    Cached by manifest; a failure is logged and returned, never raised."""
     from heatup.analyze import trajectory
     pds = [PhaseDir.of(p) for p in phases] if phases is not None else list(iter_phase_dirs(cfg.phases.database_root))
     out: list[dict] = []
@@ -79,6 +81,10 @@ def run_analysis(phases=None, force=None) -> list[dict]:
                     log.warning("%s %dK %s: %s", pd.tag, T, step, exc)
                     log.debug(traceback.format_exc())
                     out.append({"phase": pd.tag, "step": step, "T_K": T, "ok": False, "error": str(exc)})
+        try:
+            collect_md_phonons(pd)                    # phonons/anharmonic/anharmonic.json + source.json
+        except Exception as exc:  # noqa: BLE001
+            log.warning("%s: anharmonic summary failed: %s", pd.tag, exc)
     return out
 
 
@@ -106,7 +112,7 @@ def _incomplete(phase: PhaseDir, gates: list[str]) -> dict[str, list[str]]:
     rows = ledger.phase_rows(phase, calc=False)
     out: dict[str, list[str]] = {}
     for g in gates:
-        need = set(ledger.gate_steps(g, ledger.phonon_method(phase), phase))
+        need = set(ledger.gate_steps(g, ledger.vibrational_model(phase), phase))
         bad = [_describe(r) for r in rows
                if r["step"] in need and r["state"] not in (*ledger.GOOD_STATES, ledger.PRUNED)]
         if bad:
@@ -131,7 +137,7 @@ def evaluate(phase_dir, operating_T: float | None = None, gates: list[str] | Non
                     "phase_dir": phase.path, "operating_T_K": T_op, "md_temperatures_K": ledger.md_temperatures(phase),
                     "calculator": ledger.calculator_of(phase) or "?", "config": cfg.snapshot(),
                     "structural_transition": None, "mechanical": None, "vibrational": None, "thermodynamic": None,
-                    "anharmonic": None, "skipped": [g for g in GATES if g not in enabled], "enabled": enabled,
+                    "perturbative": None, "skipped": [g for g in GATES if g not in enabled], "enabled": enabled,
                     "incomplete": {}, "flags": [], "overall": STATUS_MISSING}
     log.info("=== %s  (T = %g K, gates: %s) ===", phase.tag, T_op, ", ".join(enabled))
     if not enabled:
@@ -153,7 +159,10 @@ def evaluate(phase_dir, operating_T: float | None = None, gates: list[str] | Non
                  "message": "evidence incomplete: " + "; ".join(report["incomplete"][g])}
         else:
             try:
-                r = _ASSESS[g](phase, **({"operating_T": T_op} if g == "thermodynamic" else {}))
+                kw = {"operating_T": T_op} if g == "thermodynamic" else {}
+                if g == "vibrational":                    # the figure of the selected sources follows save_figure / cfg
+                    kw["save_figure"] = None if save_figure else False
+                r = _ASSESS[g](phase, **kw)
             except Exception as exc:  # noqa: BLE001  one gate's failure is never another's
                 log.error("%s: gate %s failed: %s", phase.tag, g, exc)
                 log.debug(traceback.format_exc())
@@ -165,9 +174,9 @@ def evaluate(phase_dir, operating_T: float | None = None, gates: list[str] | Non
     unplanned = sorted(set(phase.md_temperatures()) - set(report["md_temperatures_K"]))
     if unplanned:
         report["flags"].append(f"[note] MD run(s) at {unplanned} K are not in the plan and were ignored")
-    report["anharmonic"] = anharmonic_summary(load_fc3(phase), T_op)        # diagnostic (fc3 step), never a gate
-    if report["anharmonic"] and report["anharmonic"]["flag"]:
-        report["flags"].append(report["anharmonic"]["flag"])
+    report["perturbative"] = perturbative_summary(load_perturbative(phase), T_op)    # diagnostic (fc3), never a check
+    if report["perturbative"] and report["perturbative"]["flag"]:
+        report["flags"].append(report["perturbative"]["flag"])
     return _finish(report, phase, save_figure, figure_fmt)
 
 
@@ -185,7 +194,7 @@ def _finish(report: dict, phase: PhaseDir, save_figure: bool, fmt: str) -> dict:
         for g in GATES if g not in report["skipped"])
     os.makedirs(phase.stability_dir, exist_ok=True)
     slim = dict(report)
-    slim["vibrational"] = _strip(report.get("vibrational"), ("vdos",))
+    slim["vibrational"] = _slim_vibrational(report.get("vibrational"))
     slim["thermodynamic"] = _strip(report.get("thermodynamic"), ("contributions",))
     write_json(os.path.join(phase.stability_dir, f"report_{report['stage']}.json"), slim)
     if save_figure:
@@ -198,6 +207,14 @@ def _finish(report: dict, phase: PhaseDir, save_figure: bool, fmt: str) -> dict:
             log.warning("figure failed: %s", exc)
     log.info("=== %s: OVERALL %s ===", phase.tag, report["overall"].upper())
     return report
+
+
+def _slim_vibrational(v):
+    """The vibrational result without the spectra (they are in ``phonons/<level>/``)."""
+    v = _strip(v, ("vdos",))
+    if isinstance(v, dict) and isinstance(v.get("anharmonic"), dict):
+        v["anharmonic"] = {**v["anharmonic"], "runs": [_strip(r, ("omega_meV", "weight")) for r in v["anharmonic"].get("runs", [])]}
+    return v
 
 
 def _strip(d, keys):
@@ -227,15 +244,15 @@ def evaluate_all(database_root: str | None = None, include_competing: bool = Fal
 
 
 def summary_rows(reports: "dict[str, dict] | list[dict]") -> list[dict]:
-    """Flat one-row-per-phase table (feed to ``pandas.DataFrame``)."""
+    """Flat one-row-per-phase table (feed to ``pandas.DataFrame``); one column per check, no order implied."""
     items = reports.items() if isinstance(reports, dict) else [(f"{r['material']}/{r['label']}", r) for r in reports]
     rows = []
     for tag, r in items:
         m, s, v, t = (r.get(k) or {} for k in ("mechanical", "structural_transition", "vibrational", "thermodynamic"))
         rows.append({
             "phase": tag, "overall": r.get("overall"),
-            "G1 mech": m.get("status"), "B_GPa": m.get("bulk_GPa"), "G_GPa": m.get("shear_GPa"),
-            "G0 struct": s.get("status"), "G2 vib": v.get("status"), "G3 hull": t.get("status"),
+            "mechanical": m.get("status"), "B_GPa": m.get("bulk_GPa"), "G_GPa": m.get("shear_GPa"),
+            "structural": s.get("status"), "vibrational": v.get("status"), "thermodynamic": t.get("status"),
             "E_hull_meV": None if t.get("e_hull_at_T_eV") is None else 1e3 * t["e_hull_at_T_eV"],
         })
     return rows

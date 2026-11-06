@@ -1,10 +1,10 @@
-"""heatup.analyze.terms  --  DRAFT: free-energy terms beyond HA / QHA
+"""heatup.analyze.terms  --  DRAFT: free-energy terms beyond harmonic / quasi-harmonic
 ======================================================================
 Pure functions (numpy only, units in the docstrings) plus thin adapters for ``GibbsAssembler``.  Nothing here
 reads a calculator.  Every equation carries its reference; "[verified]" = checked against the paper text during
 drafting, "[recall]" = from memory, check before citing.  Tests: ``test_terms.py``.
 
-FRAMEWORK - one nuclear term that REPLACES HA/QHA, not an extra term on top
+FRAMEWORK - one nuclear term that REPLACES harmonic/quasi-harmonic, not an extra term on top
 ----------------------------------------------------------------------------
     G(T) = U0(T) + P<V>/N  +  F_vib^Q[ w_eff(T) ]  +  dF_AH(T)      (nuclear; ONE method)
          + F_el(T) + F_mag(T)                                        (orthogonal, per phase)
@@ -155,9 +155,9 @@ def nuclear_contribution_eha(phase, T, pressure_GPa: float = 0.0):
     exact anharmonic correction at fixed volume is only +1.3 (600 K) / +2.6 (900 K).  Known biases: (a) VACF
     spectrum is ~0.016 too high in <ln w> even in the harmonic limit (+2.3..2.6 meV/atom at 600 K), (b) a 64-atom
     cell samples a coarse q-mesh (+1.4/+2.9/+4.3 meV/atom at 300/600/900 K), (c) NPT cell degrees of freedom
-    leave ~3 kT per cell inside <U> that ``u0_from_md`` does not subtract.  Prefer QHA + ``anharmonic.f_anh``.
+    leave ~3 kT per cell inside <U> that ``u0_from_md`` does not subtract.  Prefer the quasi-harmonic model until this is validated (the old fixed-cell F_anh step was removed).
 
-    Replaces ``thermo.f_vib_vdos`` (which was ``F_vib`` only: the static cost of the NPT-expanded cell was
+    Replaces ``thermo.f_vib_anharmonic`` (which was ``F_vib`` only: the static cost of the NPT-expanded cell was
     missing).  Reads ``md/<T>K/analysis.json`` (mean Epot, mean V) and ``vdos.json``.  U0 - H0 is interpolated in
     T with PCHIP through the anchor (0 K, 0); above the highest MD temperature it is extended linearly (flagged).
     """
@@ -443,14 +443,6 @@ def defect_free_energy_per_site(g_f_eV, T, degeneracy: float = 1.0) -> np.ndarra
 # =================================================================================================================
 # 8. ASSEMBLER ADAPTERS (see INTEGRATION notes in the reply)
 # =================================================================================================================
-
-def register_terms(asm, cfg) -> None:
-    """Example: in ``thermo.build_assembler`` replace the F_vib[VDOS] registration and the ad-hoc F_mag/F_el by
-
-        VIB_METHODS["VDOS"] = lambda ph, T: nuclear_contribution_eha(ph, T, cfg.relax.pressure_GPa)
-    """
-    raise NotImplementedError("see reply: wire-up snippets")
-
 
 # =================================================================================================================
 # REFERENCES

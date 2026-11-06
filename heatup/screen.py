@@ -16,20 +16,20 @@ for callers that want one call instead of three notebooks.
 
 Stages
 ------
-``pre_md``   relax -> elastic (Gate 1) and the 0 K hull (Gate 3 at 0 K) - each only if enabled, and
+``pre_md``   relax -> elastic (mechanical) and the 0 K hull (thermodynamic at 0 K) - each only if enabled, and
              independently of each other.  No phonons, no MD: minutes per phase.
              ``reject``: Born-unstable, or 0 K hull energy > ``pre_md_hull_reject_eV``
              (default ``gates.hull_fail_eV``).  ``accept``: "worth paying for MD".
              ``ScreenOptions.pre_md_phonons`` adds the harmonic evidence (phonons of the target and of its competitors):
-             Gate 2 from the HA modes and the T-dependent hull (HA free energies) - slower, still no MD.
+             the vibrational check from the harmonic modes and the T-dependent hull (harmonic free energies) - slower, still no MD.
 ``post_md``  all four gates (1, then 0 and 2 from the MD, then the T-dependent hull).
              ``reject``: any gate failed.  ``accept``: every gate ok.
 
 Per temperature
 ---------------
 ``ScreenResult.per_T`` = ``{T: {gate: GateResult}}`` for every temperature of ``ScreenOptions.md_temperatures`` (default
-``[operating_T]``): Gates 0 and 2 from the MD run at that temperature, the hull from the curve ``E_hull(T)`` that is
-computed anyway (interpolated, same thresholds), Gate 1 (no temperature) repeated.  ``GateResult.value`` holds the number behind
+``[operating_T]``): the structural-transition and vibrational checks from the MD run at that temperature, the hull from the curve ``E_hull(T)`` that is
+computed anyway (interpolated, same thresholds), mechanical (no temperature) repeated.  ``GateResult.value`` holds the number behind
 the verdict (hull distance in eV/atom, rms displacement in A, soft-mode weight).  One call gives every temperature - the
 free energies of all phases are not recomputed per temperature.
 
@@ -46,7 +46,7 @@ Guarantees
 * **Per-stage state.**  Reports are written to ``<phase>/stability/report_<stage>.json`` and the
   typed result to ``result_<stage>.json``; a stage never reads or overwrites another stage's
   files, and no report is ever *returned from cache*: verdicts are recomputed from the cached
-  *step* outputs (relax / elastic / phonons / md / vdos), each of which is invalidated by its own
+  *step* outputs (relax / elastic / harmonic / md / vdos), each of which is invalidated by its own
   manifest (config fingerprint + input hashes).  So a pre_md call never masks a later post_md one,
   and a changed option or structure is never answered with a stale verdict.
 * **Options are arguments.**  Everything is passed through :class:`ScreenOptions` (mobile
@@ -88,10 +88,10 @@ STAGES = ("pre_md", "post_md")
 class ScreenOptions:
     """Everything a caller may want to vary; ``None`` = keep the HeatUp default."""
     operating_T: float | None = None                 # K, temperature of the hull judgement
-    md_temperatures: list[float] | None = None       # K, MD runs evaluated by Gates 0/2 and reported in per_T (default [operating_T])
-    pre_md_phonons: bool = False                     # pre_md: also compute HA phonons (target + competitors) for Gate 2 / the hull(T)
+    md_temperatures: list[float] | None = None       # K, MD runs evaluated by the structural-transition and vibrational checks, reported in per_T (default [operating_T])
+    pre_md_phonons: bool = False                     # pre_md: also compute harmonic phonons (target + competitors) for the vibrational check / the hull(T)
     relax: bool = True                               # False: the structure is already relaxed - use it as given (single point)
-    mobile_species: list[str] | None = None          # e.g. ["Li"]: allowed to diffuse (Gates 0 and 2)
+    mobile_species: list[str] | None = None          # e.g. ["Li"]: allowed to diffuse (structural transition and vibrational)
     thresholds: dict[str, float] | None = None       # gate thresholds, e.g. {"hull_ok_eV": 0.02}
     pre_md_hull_reject_eV: float | None = None       # pre_md: reject above this 0 K hull energy
     accept_warn: bool = False                        # treat "warn" as acceptable
@@ -111,7 +111,7 @@ class ScreenOptions:
     compute: bool = True                             # False: evaluate cached results only
     force: bool | str | list[str] | None = None      # True/"all", or step names (step names of ledger.STEPS, or the group "analysis")
     save_figure: bool = False
-    #: any other option as ``{"md.n_steps": 20000, "phonon.delta_A": 0.02}``
+    #: any other option as ``{"md.n_steps": 20000, "harmonic.delta_A": 0.02}``
     config: dict[str, Any] | None = None
 
 
@@ -206,6 +206,12 @@ def decide(stage: str, gates: dict[str, GateResult], e_hull_0K: float | None, hu
     return "accept", reasons or ["all evaluated gates passed"]
 
 
+def _vib_model() -> str:
+    """Vibrational model of the hull for this call (``cfg.terms.vibrational``, else the term's default)."""
+    from heatup.core import contributions
+    return contributions.resolve()["vibrational"].lower()
+
+
 def _gate(name: str, r: dict | None) -> GateResult:
     if not r:
         return GateResult(name, STATUS_MISSING, "not evaluated")
@@ -247,7 +253,7 @@ def _per_T_gates(rep: dict, temps) -> dict:
             if r:
                 out[t]["vibrational"] = GateResult("vibrational", r["status"], "; ".join(r.get("quality_notes") or [])
                                                    or f"soft-mode weight {100 * r['zero_frac']:.3f}%", r.get("zero_frac"))
-            elif vib.get("evidence") == "HA":            # harmonic evidence has no temperature
+            elif vib.get("evidence") in ("harmonic", "quasiharmonic"):   # no MD temperature in this evidence
                 out[t]["vibrational"] = _gate("vibrational", vib)
             else:
                 out[t]["vibrational"] = missing("vibrational", f"no MD run at {t} K")
@@ -272,17 +278,17 @@ def _plan_and_run(phase: PhaseDir, stage: str, o: ScreenOptions, T_op: float) ->
     from heatup.compute.execute import run_plan
     from heatup.prepare.plan import prepare_competitors, prepare_phase
 
-    enabled, method = _gates(), (cfg.hull.phonon_method or "HA")
+    enabled, method = _gates(), _vib_model()
     if stage == "pre_md":
         tsteps = ["relax"] + (["elastic"] if "mechanical" in enabled else [])
         csteps = ["relax"]
         if o.pre_md_phonons:
-            if method != "HA":
-                raise ValueError(f"pre_md_phonons needs the harmonic hull (cfg.hull.phonon_method None/'HA'), got {method!r}")
+            if method != "harmonic":
+                raise ValueError(f"pre_md_phonons needs the harmonic hull (cfg.terms.vibrational 'harmonic'), got {method!r}")
             if "vibrational" in enabled or "thermodynamic" in enabled:
-                tsteps.append("phonons")
+                tsteps.append("harmonic")
             if "thermodynamic" in enabled:
-                csteps.append("phonons")
+                csteps.append("harmonic")
     else:
         tsteps = ledger.steps_for(enabled, method, "target")
         csteps = ledger.steps_for(enabled, method, "competitor")
@@ -450,7 +456,7 @@ def screen_many(targets: "list[str | PhaseDir]", out_dir: str | None = None, dev
         raise ValueError("no readable target structures")
     with _LOCK, override(**({"run.force": normalize_force(force)} if force is not None else {})):
         T_op = float(cfg.hull.operating_T if operating_T is None else operating_T)
-        enabled, method = _gates(), (cfg.hull.phonon_method or "HA")
+        enabled, method = _gates(), _vib_model()
         asked = (["relax"] if relax else []) + enabled
         for t in tph:
             prepare_phase(t.phase_dir, "target", steps=ledger.steps_for(enabled, method, "target"),

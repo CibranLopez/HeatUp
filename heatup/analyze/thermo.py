@@ -2,22 +2,24 @@
 ========================
 Free energies per atom - everything between a set of vibrational modes and ``G(T)``.
 
-1. :class:`ModeSet` - every vibrational result (harmonic phonon mesh, QHA volumes, VDOS from MD) reduced to
+1. :class:`ModeSet` - every vibrational result (harmonic phonon mesh, quasi-harmonic volumes, anharmonic = VDOS from MD) reduced to
    frequencies ``omega`` (meV, negative = imaginary) with weights ``w`` (modes **per atom**, ``sum(w) == 3``
-   for a crystal).  All F_vib then follow from one function, so HA, QHA and VDOS are comparable by construction.
-2. loaders of the cached phonon results (``load_ha``, ``load_qha``, ``load_fc3``) and the anharmonic summary of the
-   third-order result (``anharmonic_summary``: a diagnostic, never a gate).
-3. ``G(T) = H0 + F_vib(T) + F_el(T) + F_mag(T) + F_conf(T)``  [eV/atom] as a sum of independent contributions
-   (:class:`GibbsAssembler`).  ``H0`` is the relaxed enthalpy (== energy at P = 0) from ``relaxation/energy.json``.
-   Every contribution is a function ``fn(phase, T) -> array`` that returns **zeros when its optional data are
-   absent**, and raises :class:`MissingData` when the data it *needs* are not there.
+   for a crystal).  All F_vib then follow from one function, so the vibrational levels are comparable by construction.
+2. loaders of the cached results (``load_harmonic``, ``load_quasiharmonic``, ``load_perturbative``) and the summary of the
+   perturbative (fc3) result (``perturbative_summary``: a diagnostic, never a gate).
+3. ``G(T) = H0 + sum of the selected terms``  [eV/atom] as independent contributions (:class:`GibbsAssembler`).  ``H0`` is
+   the relaxed enthalpy (== energy at P = 0) from ``relaxation/energy.json``.  Which terms and models enter is declared
+   ONCE, in :mod:`heatup.core.contributions` (``cfg.terms``); :func:`free_energy` assembles from that selection.  Every
+   contribution is a function ``fn(phase, T) -> array`` that returns **zeros when its optional data are absent**, and
+   raises :class:`MissingData` when the data it *needs* are not there.
 
-Vibrational methods (``method=``)
----------------------------------
-``HA``   harmonic, ``phonons/ha.json`` (3 modes/atom, imaginary modes skipped & flagged)
-``QHA``  ``phonons/qha.json``: G(T) at V_eq(T) (E(V) + F_vib(V,T) + PV), replaces H0 + F_vib
-``VDOS`` MD spectra at the available MD temperatures, interpolated in T (temperature-renormalised
-         effective-harmonic F_vib)
+Vibrational models (``cfg.terms.vibrational``)
+----------------------------------------------
+``harmonic``       ``harmonic/harmonic.json`` (3 modes/atom, imaginary modes skipped and flagged)
+``ZPE``            only the zero-point energy of the harmonic modes
+``quasiharmonic``  ``quasiharmonic/quasiharmonic.json``: G(T) at V_eq(T) (E(V) + F_vib(V,T) + PV), replaces H0 + F_vib
+``anharmonic``     MD spectra at the available MD temperatures, interpolated in T (temperature-renormalised
+                   effective-harmonic F_vib); experimental
 
 Corrections of v0.2: DOS integrates to 3 modes per atom (was 1: every F_vib 3x too small); imaginary modes are
 kept in the ModeSet and excluded from F_vib only at evaluation time, so the amount of unreliable spectrum is always
@@ -114,7 +116,7 @@ class ModeSet:
     # -- constructors -------------------------------------------------------
     @classmethod
     def from_frequencies(cls, omega_meV, q_weights=None, n_atoms: int | None = None,
-                         source: str = "HA", **meta) -> "ModeSet":
+                         source: str = "harmonic", **meta) -> "ModeSet":
         """From a (n_q, n_branches) array of frequencies and q-point weights."""
         om = np.asarray(omega_meV, dtype=float)
         if om.ndim == 1:
@@ -129,7 +131,7 @@ class ModeSet:
 
     @classmethod
     def from_dos(cls, omega_meV, g, n_modes_per_atom: float = MODES_PER_ATOM,
-                 source: str = "VDOS", **meta) -> "ModeSet":
+                 source: str = "anharmonic", **meta) -> "ModeSet":
         """From a DOS g(omega) on a grid; rescaled so that sum(w) = n_modes_per_atom."""
         om = np.asarray(omega_meV, dtype=float)
         g = np.clip(np.asarray(g, dtype=float), 0.0, None)
@@ -270,31 +272,33 @@ def spread_warning(curves: np.ndarray, threshold: float) -> tuple[bool, float]:
 # cached phonon results
 # ---------------------------------------------------------------------------
 
-def load_ha(phase_dir) -> dict | None:
-    """Cached HA result with ``modes`` converted to a ModeSet."""
+def load_harmonic(phase_dir) -> dict | None:
+    """Cached harmonic result with ``modes`` converted to a ModeSet."""
     phase = PhaseDir.of(phase_dir)
-    d = read_json(os.path.join(phase.phonon_dir, "ha.json"))
+    d = read_json(os.path.join(phase.harmonic_dir, "harmonic.json"))
     if not d:
         return None
     d["modes"] = ModeSet.from_dict(d["modes"])
     return d
 
 
-def load_qha(phase_dir) -> dict | None:
-    return read_json(os.path.join(PhaseDir.of(phase_dir).phonon_dir, "qha.json"))
+def load_quasiharmonic(phase_dir) -> dict | None:
+    return read_json(os.path.join(PhaseDir.of(phase_dir).quasiharmonic_dir, "quasiharmonic.json"))
 
 
-def load_fc3(phase_dir) -> dict | None:
-    phase = PhaseDir.of(phase_dir)
-    return read_json(os.path.join(phase.phonon_dir, "fc3.json"))
+def load_perturbative(phase_dir) -> dict | None:
+    return read_json(os.path.join(PhaseDir.of(phase_dir).perturbative_dir, "perturbative.json"))
 
 
-def anharmonic_summary(res: dict | None, T: float, ratio_warn: float | None = None) -> dict | None:
-    """Values of a cached fc3 result at the temperature closest to *T*, plus a ``flag`` when the linewidths
+load_ha, load_qha, load_fc3 = load_harmonic, load_quasiharmonic, load_perturbative       # names of earlier versions
+
+
+def perturbative_summary(res: dict | None, T: float, ratio_warn: float | None = None) -> dict | None:
+    """Values of a cached perturbative (fc3) result at the temperature closest to *T*, plus a ``flag`` when the linewidths
     say the harmonic picture is strained there.  Pure function (unit-tested)."""
     if not res or not res.get("temperatures_K"):
         return None
-    ratio_warn = cfg.fc3.ratio_warn if ratio_warn is None else ratio_warn
+    ratio_warn = cfg.perturbative.ratio_warn if ratio_warn is None else ratio_warn
     temps = np.asarray(res["temperatures_K"], float)
     i = int(np.argmin(np.abs(temps - T)))
     ratio = res["gamma_over_nu_mean"][i]
@@ -302,19 +306,18 @@ def anharmonic_summary(res: dict | None, T: float, ratio_warn: float | None = No
            "frac_ioffe_regel": res["frac_ioffe_regel"][i], "tau_median_ps": res["tau_median_ps"][i],
            "ratio_warn": ratio_warn, "flag": None}
     if ratio is not None and ratio > ratio_warn:
-        out["flag"] = (f"[note] anharmonic: <gamma/nu> = {ratio:.3f} > {ratio_warn} at {temps[i]:g} K "
+        out["flag"] = (f"[note] perturbative: <gamma/nu> = {ratio:.3f} > {ratio_warn} at {temps[i]:g} K "
                        f"({100 * (out['frac_ioffe_regel'] or 0):.1f}% of the weight beyond the Ioffe-Regel limit): "
-                       "harmonic F_vib is less reliable here, compare with the VDOS overlay")
+                       "harmonic F_vib is less reliable here, compare with the anharmonic (MD) overlay")
     return out
+
+
+anharmonic_summary = perturbative_summary                                          # name of earlier versions
 
 
 # ---------------------------------------------------------------------------
 # G(T) of one phase
 # ---------------------------------------------------------------------------
-
-log = logging.getLogger("heatup")
-Contribution = Callable[[PhaseDir, np.ndarray], np.ndarray]
-
 
 # ---------------------------------------------------------------------------
 # reference energy
@@ -337,14 +340,23 @@ def reference_energy(phase: PhaseDir) -> float | None:
 # vibrational contributions
 # ---------------------------------------------------------------------------
 
-def f_vib_ha(phase: PhaseDir, T: np.ndarray) -> np.ndarray:
-    ha = load_ha(phase)
+def f_vib_zpe(phase: PhaseDir, T: np.ndarray) -> np.ndarray:
+    """Zero-point energy of the harmonic modes (eV/atom), the same at every temperature."""
+    ha = load_harmonic(phase)
     if not ha:
-        raise MissingData(f"{phase.tag}: phonons/ha.json missing")
+        raise MissingData(f"{phase.tag}: harmonic/harmonic.json missing")
+    return np.full(np.shape(T), float(ha["modes"].zpe()))
+
+
+def f_vib_harmonic(phase: PhaseDir, T: np.ndarray) -> np.ndarray:
+    ha = load_harmonic(phase)
+    if not ha:
+        raise MissingData(f"{phase.tag}: harmonic/harmonic.json missing")
     return np.asarray(ha["modes"].f_vib(T), float)
 
 
-def f_vib_vdos(phase: PhaseDir, T: np.ndarray) -> np.ndarray:
+def f_vib_anharmonic(phase: PhaseDir, T: np.ndarray) -> np.ndarray:
+    """Effective-harmonic F_vib from the MD spectra (phonons from MD), interpolated between the MD temperatures."""
     from heatup.analyze.trajectory import load_vdos
     sets = []
     for t in ledger.md_temperatures(phase):
@@ -356,7 +368,7 @@ def f_vib_vdos(phase: PhaseDir, T: np.ndarray) -> np.ndarray:
     return interpolate_f_vib(sets, T)
 
 
-def vdos_consistency(phase: PhaseDir, T: np.ndarray) -> tuple[bool, float]:
+def anharmonic_consistency(phase: PhaseDir, T: np.ndarray) -> tuple[bool, float]:
     from heatup.analyze.trajectory import load_vdos
     cur = []
     for t in ledger.md_temperatures(phase):
@@ -368,23 +380,20 @@ def vdos_consistency(phase: PhaseDir, T: np.ndarray) -> tuple[bool, float]:
     return spread_warning(np.array(cur), cfg.gates.fe_consistency)
 
 
-def f_vib_qha(phase: PhaseDir, T: np.ndarray) -> np.ndarray:
-    """G_QHA(T) - H0 (so that H0 + contribution = G_QHA)."""
-    q = load_qha(phase)
+def f_vib_quasiharmonic(phase: PhaseDir, T: np.ndarray) -> np.ndarray:
+    """G_quasiharmonic(T) - H0 (so that H0 + contribution = G_quasiharmonic)."""
+    q = load_quasiharmonic(phase)
     if not q:
-        raise MissingData(f"{phase.tag}: phonons/qha.json missing")
+        raise MissingData(f"{phase.tag}: quasiharmonic/quasiharmonic.json missing")
     qt = np.asarray(q["temperatures"], float)
     if T.min() < qt.min() - 1e-9 or T.max() > qt.max() + 1e-9:          # np.interp would clamp silently
-        raise MissingData(f"{phase.tag}: QHA computed for {qt.min():g}-{qt.max():g} K but the hull needs "
-                          f"{T.min():g}-{T.max():g} K (cfg.qha.temperatures, notebook 1)")
+        raise MissingData(f"{phase.tag}: quasi-harmonic computed for {qt.min():g}-{qt.max():g} K but the hull needs "
+                          f"{T.min():g}-{T.max():g} K (cfg.quasiharmonic.temperatures, notebook 1)")
     g = np.interp(T, qt, q["G_eV_per_atom"])
-    # G_QHA = E(V) + F_vib + PV is already an enthalpy-type quantity: H0 + contribution = G_QHA.  H0 carries the
+    # G = E(V) + F_vib + PV is already an enthalpy-type quantity: H0 + contribution = G.  H0 carries the
     # optional per-element shift, so the contribution is taken relative to the *unshifted* relaxed enthalpy
-    # (v0.3 subtracted E and the shift, which double-counted PV at P != 0 and dropped the shift for QHA phases).
+    # (v0.3 subtracted E and the shift, which double-counted PV at P != 0 and dropped the shift for these phases).
     return g - float((phase.energy() or {})["enthalpy_eV_per_atom"])
-
-
-VIB_METHODS = {"HA": f_vib_ha, "QHA": f_vib_qha, "VDOS": f_vib_vdos}
 
 
 # ---------------------------------------------------------------------------
@@ -513,42 +522,29 @@ class GibbsAssembler:
                 "G_eV_per_atom": G, "contributions": contrib, "problems": problems}
 
 
-def build_assembler(method: str | None = None) -> GibbsAssembler:
-    method = (method or cfg.hull.phonon_method or "HA").upper()
-    if method not in VIB_METHODS:
-        raise ValueError(f"phonon method must be one of {sorted(VIB_METHODS)}, got {method!r}")
-    asm = GibbsAssembler().register(f"F_vib[{method}]", VIB_METHODS[method])
-    if cfg.hull.include_electronic:
-        asm.register("F_el", f_el)
-    if cfg.hull.include_magnetic:
-        asm.register("F_mag", f_mag)
-    if cfg.hull.include_configurational and cfg.hull.configurational_model == "ideal":
-        asm.register("F_conf", f_conf)
-    from heatup.analyze.ensembles import register_selected     # enumerated / monte_carlo / orientational / defects
-    register_selected(asm, cfg.hull)
-    return asm
-
-
-def free_energy(phase_dir, temperatures, method: str | None = None) -> dict:
-    """Convenience: assemble G(T) with the given vibrational method and attach quality flags."""
+def free_energy(phase_dir, temperatures, model: str | None = None) -> dict:
+    """G(T) of one phase assembled from the selected terms (``cfg.terms`` / as prepared; ``heatup.core.contributions``),
+    with quality flags.  ``model`` overrides the vibrational model for this call (e.g. the anharmonic overlay)."""
+    from heatup.core import contributions
     phase = PhaseDir.of(phase_dir)
-    method = ledger.phonon_method(phase, method)
-    res = build_assembler(method).compute(phase, temperatures)
-    res["method"] = method
+    sel = contributions.resolve(phase, vibrational=model)
+    res = contributions.assemble(sel, phase).compute(phase, temperatures)
+    vib = sel["vibrational"]
+    res["method"] = vib
     flags: list[str] = []
     if res.get("available"):
-        if method in ("HA", "QHA"):
-            ha = load_ha(phase)
+        if vib in ("harmonic", "quasiharmonic", "ZPE"):
+            ha = load_harmonic(phase)
             if ha and ha["imag_fraction"] >= cfg.gates.imag_frac_fail:
-                flags.append(f"HA imaginary weight {100 * ha['imag_fraction']:.1f}% - F_vib unreliable")
-        if method == "QHA":
-            q = load_qha(phase) or {}
+                flags.append(f"harmonic imaginary weight {100 * ha['imag_fraction']:.1f}% - F_vib unreliable")
+        if vib == "quasiharmonic":
+            q = load_quasiharmonic(phase) or {}
             T_arr = np.asarray(q.get("temperatures", []), float)
             bad = T_arr[~np.asarray(q.get("valid", []), bool)] if len(T_arr) else []
             if len(bad):
-                flags.append(f"QHA equilibrium volume leaves the sampled range above {bad.min():g} K")
-        if method == "VDOS":
-            warn, spread = vdos_consistency(phase, np.asarray(temperatures, float))
+                flags.append(f"quasi-harmonic equilibrium volume leaves the sampled range above {bad.min():g} K")
+        if vib == "anharmonic":
+            warn, spread = anharmonic_consistency(phase, np.asarray(temperatures, float))
             if warn:
                 flags.append(f"F_vib differs by {100 * spread:.1f}% between MD temperatures")
     res["flags"] = flags

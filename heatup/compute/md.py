@@ -47,12 +47,6 @@ from heatup.prepare.export import build_md_cell
 log = logging.getLogger("heatup")
 
 
-try:                                    # ASE >= 3.23 renamed the class
-    from ase.md.melchionna import MelchionnaNPT as NPT
-except ImportError:                     # pragma: no cover
-    from ase.md.npt import NPT
-
-log = logging.getLogger("heatup")
 
 
 def barostat_bulk_modulus(phase: PhaseDir) -> float:
@@ -91,8 +85,11 @@ def run_md(phase_dir, device: str = "cpu", force: bool = False, temperature: flo
     else:
         stale = False
     if force or stale:                       # restart from scratch: nothing derived from the old run may survive
-        for f in ("output.traj", "output.traj.part", "md.json", *(ledger.STEPS[s].outputs[0] for s in ledger.ANALYSIS_STEPS)):
-            p = os.path.join(sim, f)
+        derived = [os.path.join(sim, f) for f in ("output.traj", "output.traj.part", "md.json")]
+        for s in ledger.ANALYSIS_STEPS:                   # analysis results live in their own folders (vdos -> phonons/anharmonic)
+            derived.append(os.path.join(ledger.STEPS[s].where(phase, temperature), ledger.STEPS[s].outputs[0]))
+        derived.append(os.path.join(phase.anharmonic_run(temperature), "vdos.png"))
+        for p in derived:
             if os.path.exists(p):
                 os.remove(p)
     elif os.path.exists(os.path.join(sim, "md.json")):       # resume of a run that was extended/interrupted

@@ -10,9 +10,9 @@ One definition of each cell, used twice:
 
 What is written, from ``relaxation/CONTCAR`` (VASP ``POSCAR`` files, atom order = phonopy/phono3py order)::
 
-    phonons/ha/     SPOSCAR  phonopy_disp.yaml  disp-001/POSCAR ...      step ``phonons``  (phonopy displacements)
-    phonons/qha/    V01/POSCAR ... volumes.json                          step ``qha``      (isotropically scaled cells)
-    phonons/fc3/    SPOSCAR  phono3py_disp.yaml  disp-00001/POSCAR ...   step ``fc3``      (phono3py displacements)
+    phonons/harmonic/       SPOSCAR  phonopy_disp.yaml  disp-001/POSCAR ...     step ``harmonic``      (phonopy displacements)
+    phonons/quasiharmonic/  V01/POSCAR ... volumes.json                         step ``quasiharmonic`` (isotropically scaled cells)
+    phonons/perturbative/   SPOSCAR  phono3py_disp.yaml  disp-00001/POSCAR ...  step ``perturbative``  (phono3py displacements)
     elastic/strain/ xx_plus/POSCAR xx_minus/POSCAR ... strains.json      step ``elastic``  (12 strained cells)
     md/             POSCAR  cell.json                                    step ``md``       (supercell to start from)
 
@@ -21,11 +21,11 @@ digest of the options): exporting again is a no-op unless the structure or the o
 ever replaced, and a folder is created only when its files could be written.
 
 Every calculation folder also gets the structure it starts from as ``POSCAR`` (:func:`stage_input`): ``relaxation/POSCAR`` the
-given structure (to compare with ``CONTCAR``), ``elastic/POSCAR`` and ``phonons/POSCAR`` the relaxed cell, ``md/<T>K/POSCAR`` the
+given structure (to compare with ``CONTCAR``), ``elastic/POSCAR``, ``phonons/harmonic/POSCAR`` (and the other phonon steps) the relaxed cell, ``md/<T>K/POSCAR`` the
 supercell of that run.
 
-Bringing results back (anything that writes the files notebook 3 reads is fine): ``heatup.collect_ha`` turns forces of the
-``phonons/ha`` cells into ``ha.json``, ``heatup.collect_elastic`` turns stresses of the strained cells into ``elastic.json``;
+Bringing results back (anything that writes the files notebook 3 reads is fine): ``heatup.collect_harmonic`` turns forces of the
+``phonons/harmonic`` cells into ``harmonic.json``, ``heatup.collect_elastic`` turns stresses of the strained cells into ``elastic.json``;
 trajectories and energies are files in the layout of ``heatup.core.layout`` (see the last cell of notebook 3).  Phonon forces:
 eV/A of every ``disp-*`` cell (and ``perfect_forces`` of ``SPOSCAR`` to subtract its residual); elastic stresses: GPa, tension
 positive, Voigt order xx yy zz yz xz xy of the cell after relaxing the ions at fixed cell.
@@ -59,10 +59,10 @@ log = logging.getLogger("heatup")
 # ---------------------------------------------------------------------------
 
 def choose_supercell(atoms: Atoms) -> tuple[int, int, int]:
-    """Phonon supercell: ``phonon.supercell`` if set, else perpendicular widths >= ``phonon.min_length_A``."""
-    pc = cfg.phonon
+    """Harmonic supercell: ``harmonic.supercell`` if set, else perpendicular widths >= ``harmonic.min_length_A``."""
+    pc = cfg.harmonic
     return resolve_supercell(atoms.cell.array, len(atoms), supercell=pc.supercell, min_length=pc.min_length_A,
-                             max_atoms=pc.max_atoms, auto_min_length=AUTO_MIN_LENGTH_A["phonon"], what="phonon supercell")
+                             max_atoms=pc.max_atoms, auto_min_length=AUTO_MIN_LENGTH_A["harmonic"], what="harmonic supercell")
 
 
 def phonopy_object(atoms: Atoms, sc: tuple[int, int, int]):
@@ -71,7 +71,7 @@ def phonopy_object(atoms: Atoms, sc: tuple[int, int, int]):
     pa = PhonopyAtoms(symbols=atoms.get_chemical_symbols(), cell=atoms.cell.array,
                       scaled_positions=atoms.get_scaled_positions())
     return Phonopy(pa, supercell_matrix=np.diag(sc), primitive_matrix="P",   # identity: n_bands = 3 n_atoms (phonopy >= 4 defaults to "auto")
-                   symprec=cfg.phonon.symprec)
+                   symprec=cfg.harmonic.symprec)
 
 
 def to_ase(sc) -> Atoms:
@@ -79,12 +79,12 @@ def to_ase(sc) -> Atoms:
     return Atoms(sc.symbols, cell=sc.cell, scaled_positions=sc.scaled_positions, pbc=True)
 
 
-def phonon_cells(atoms: Atoms, sc: tuple[int, int, int] | None = None):
+def harmonic_cells(atoms: Atoms, sc: tuple[int, int, int] | None = None):
     """``(phonopy object with displacements generated, supercell repetitions)`` of the relaxed *atoms*.
-    ``sc``: use these repetitions instead of choosing them (QHA: the same ones at every volume)."""
+    ``sc``: use these repetitions instead of choosing them (quasi-harmonic: the same ones at every volume)."""
     sc = tuple(sc) if sc is not None else choose_supercell(atoms)
     ph = phonopy_object(atoms, sc)
-    ph.generate_displacements(distance=cfg.phonon.delta_A)
+    ph.generate_displacements(distance=cfg.harmonic.delta_A)
     return ph, sc
 
 
@@ -156,9 +156,9 @@ def build_md_cell(phase: PhaseDir, force: bool = False):
     return sc
 
 
-def qha_scales() -> np.ndarray:
-    """V/V0 of the QHA volumes."""
-    qc = cfg.qha
+def quasiharmonic_scales() -> np.ndarray:
+    """V/V0 of the quasi-harmonic volumes."""
+    qc = cfg.quasiharmonic
     return np.linspace(1 - qc.volume_range, 1 + qc.volume_range, qc.n_volumes)
 
 
@@ -169,10 +169,10 @@ def scaled_cell(ref: Atoms, s: float) -> Atoms:
     return a
 
 
-def fc3_supercell(atoms: Atoms) -> tuple[int, int, int]:
-    c = cfg.fc3
+def perturbative_supercell(atoms: Atoms) -> tuple[int, int, int]:
+    c = cfg.perturbative
     return resolve_supercell(atoms.cell.array, len(atoms), supercell=c.supercell, min_length=c.min_length_A,
-                             max_atoms=c.max_atoms, auto_min_length=AUTO_MIN_LENGTH_A["fc3"], what="fc3 supercell")
+                             max_atoms=c.max_atoms, auto_min_length=AUTO_MIN_LENGTH_A["perturbative"], what="fc3 supercell")
 
 
 def phono3py_object(atoms: Atoms, sc3, sc2):
@@ -185,13 +185,13 @@ def phono3py_object(atoms: Atoms, sc3, sc2):
         warnings.simplefilter("ignore")                     # phono3py 4: primitive_matrix default notice
         return Phono3py(pa, supercell_matrix=np.diag(sc3),
                         phonon_supercell_matrix=np.diag(sc2) if sc2 is not None else None,
-                        primitive_matrix="auto", symprec=cfg.fc3.symprec)
+                        primitive_matrix="auto", symprec=cfg.perturbative.symprec)
 
 
-def fc3_cells(atoms: Atoms):
+def perturbative_cells(atoms: Atoms):
     """``(phono3py object with fc3 (and fc2) displacements generated, fc3 supercell, fc2 supercell or None)``."""
-    c = cfg.fc3
-    sc3 = fc3_supercell(atoms)
+    c = cfg.perturbative
+    sc3 = perturbative_supercell(atoms)
     sc2 = None
     if c.separate_fc2:
         sc2 = choose_supercell(atoms)
@@ -200,7 +200,7 @@ def fc3_cells(atoms: Atoms):
     ph = phono3py_object(atoms, sc3, sc2)
     ph.generate_displacements(distance=c.delta_A, cutoff_pair_distance=c.cutoff_pair_A)
     if sc2 is not None:
-        ph.generate_fc2_displacements(distance=cfg.phonon.delta_A)
+        ph.generate_fc2_displacements(distance=cfg.harmonic.delta_A)
     return ph, sc3, sc2
 
 
@@ -223,15 +223,15 @@ def _cells(d: str, prefix: str, cells, width: int) -> list[str]:
     return files
 
 
-def _phonons(phase: PhaseDir, atoms: Atoms, d: str, plan: ledger.Plan) -> list[str]:
-    ph, _ = phonon_cells(atoms)
+def _harmonic(phase: PhaseDir, atoms: Atoms, d: str, plan: ledger.Plan) -> list[str]:
+    ph, _ = harmonic_cells(atoms)
     ph.save(os.path.join(d, "phonopy_disp.yaml"))
     ase_write(os.path.join(d, "SPOSCAR"), to_ase(ph.supercell), format="vasp", direct=True)
     return ["phonopy_disp.yaml", "SPOSCAR", *_cells(d, "disp", ph.supercells_with_displacements, 3)]
 
 
-def _qha(phase: PhaseDir, atoms: Atoms, d: str, plan: ledger.Plan) -> list[str]:
-    scales = qha_scales()
+def _quasiharmonic(phase: PhaseDir, atoms: Atoms, d: str, plan: ledger.Plan) -> list[str]:
+    scales = quasiharmonic_scales()
     files = []
     for i, s in enumerate(scales, start=1):
         _write_cell(os.path.join(d, f"V{i:02d}"), scaled_cell(atoms, s))
@@ -241,8 +241,8 @@ def _qha(phase: PhaseDir, atoms: Atoms, d: str, plan: ledger.Plan) -> list[str]:
     return ["volumes.json", *files]
 
 
-def _fc3(phase: PhaseDir, atoms: Atoms, d: str, plan: ledger.Plan) -> list[str]:
-    ph, _, sc2 = fc3_cells(atoms)
+def _perturbative(phase: PhaseDir, atoms: Atoms, d: str, plan: ledger.Plan) -> list[str]:
+    ph, _, sc2 = perturbative_cells(atoms)
     ph.save(os.path.join(d, "phono3py_disp.yaml"))
     ase_write(os.path.join(d, "SPOSCAR"), to_ase(ph.supercell), format="vasp", direct=True)
     files = ["phono3py_disp.yaml", "SPOSCAR", *_cells(d, "disp", ph.supercells_with_displacements, 5)]
@@ -276,9 +276,9 @@ def _md(phase: PhaseDir, atoms: Atoms, d: str, plan: ledger.Plan) -> list[str]:
 
 #: step -> (folder relative to the phase, writer)
 EXPORTERS = {
-    "phonons": (os.path.join("phonons", "ha"), _phonons),
-    "qha": (os.path.join("phonons", "qha"), _qha),
-    "fc3": (os.path.join("phonons", "fc3"), _fc3),
+    "harmonic": (os.path.join("phonons", "harmonic"), _harmonic),
+    "quasiharmonic": (os.path.join("phonons", "quasiharmonic"), _quasiharmonic),
+    "perturbative": (os.path.join("phonons", "perturbative"), _perturbative),
     "elastic": (os.path.join("elastic", "strain"), _elastic),
     "md": ("md", _md),
 }

@@ -85,23 +85,20 @@ STEPS: dict[str, Step] = {s.name: s for s in [
          lambda p, T: [p.poscar], tier=1, sections=("relax",)),
     Step("elastic", "heatup.compute.static:run_elastic", lambda p, T: p.elastic_dir, ("elastic.json",),
          _CONTCAR, needs=("relax",), tier=1, sections=("elastic",)),
-    Step("phonons", "heatup.compute.phonons:run_ha", lambda p, T: p.phonon_dir, ("ha.json",),
-         _CONTCAR, needs=("relax",), tier=2, sections=("phonon",), keys=("relax.pressure_GPa",)),
-    Step("qha", "heatup.compute.phonons:run_qha", lambda p, T: p.phonon_dir, ("qha.json",),
-         _CONTCAR, needs=("relax",), tier=2, sections=("phonon", "qha"),
+    Step("harmonic", "heatup.compute.harmonic:run_harmonic", lambda p, T: p.harmonic_dir, ("harmonic.json",),
+         _CONTCAR, needs=("relax",), tier=2, sections=("harmonic",), keys=("relax.pressure_GPa",)),
+    Step("quasiharmonic", "heatup.compute.quasiharmonic:run_quasiharmonic", lambda p, T: p.quasiharmonic_dir,
+         ("quasiharmonic.json",), _CONTCAR, needs=("relax",), tier=2, sections=("harmonic", "quasiharmonic"),
          keys=("relax.fmax", "relax.max_steps", "relax.pressure_GPa")),
-    Step("fc3", "heatup.compute.fc3:run_fc3", lambda p, T: p.phonon_dir, ("fc3.json",),
-         _CONTCAR, needs=("relax",), tier=2, sections=("phonon", "fc3")),
-    Step("anharmonic", "heatup.compute.anharmonic:run_anharmonic", lambda p, T: p.phonon_dir, ("anharmonic.json",),
-         _CONTCAR, needs=("relax", "qha"), tier=2, sections=("anharmonic",),
-         keys=("relax.fmax", "relax.max_steps", "relax.pressure_GPa")),
+    Step("perturbative", "heatup.compute.perturbative:run_perturbative", lambda p, T: p.perturbative_dir,
+         ("perturbative.json",), _CONTCAR, needs=("relax",), tier=2, sections=("harmonic", "perturbative")),
     Step("md", "heatup.compute.md:run_md", lambda p, T: p.md_run(T), ("output.traj", "md.json"),
          _CONTCAR, needs=("relax",), tier=2, sections=("md",), per_T=True, partial=("output.traj",)),
     # analysis of a finished MD run (calculator-free; run by notebook 3, one manifest each)
-    Step("mdstats", "heatup.analyze.trajectory:run_mdstats", lambda p, T: p.md_run(T), ("analysis.json",),
+    Step("mdstats", "heatup.analyze.trajectory:run_mdstats", lambda p, T: p.md_run(T), ("mdstats.json",),
          _MD_SOURCE, needs=("md",), tier=3, calc=False, per_T=True, group="analysis",
          keys=("analysis.equil_ps", "analysis.stride")),
-    Step("vdos", "heatup.analyze.trajectory:run_vdos", lambda p, T: p.md_run(T), ("vdos.json",),
+    Step("vdos", "heatup.analyze.trajectory:run_vdos", lambda p, T: p.anharmonic_run(T), ("vdos.json",),
          _MD_SOURCE, needs=("md",), tier=3, calc=False, per_T=True, group="analysis",
          keys=("analysis.equil_ps", "analysis.stride", "analysis.vdos_max_lag_ps")),
     Step("transition", "heatup.analyze.trajectory:run_transition", lambda p, T: p.md_run(T), ("transition.json",),
@@ -111,34 +108,47 @@ STEPS: dict[str, Step] = {s.name: s for s in [
 COMPUTE_STEPS = tuple(n for n, s in STEPS.items() if s.tier < 3)
 ANALYSIS_STEPS = tuple(n for n, s in STEPS.items() if s.tier == 3)
 
-#: steps whose output each gate reads (the evidence a verdict rests on)
-GATE_STEPS = {"mechanical": ("elastic",), "structural_transition": ("md",),
-              "vibrational": ("phonons", "md"), "thermodynamic": ()}
-#: the hull's evidence, per free-energy method (``cfg.hull.phonon_method``), for the target AND every competing phase
-THERMO_STEPS = {"OFF": (), "ZPE": ("phonons",), "HA": ("phonons",), "QHA": ("qha",), "VDOS": ("md",)}
+#: step that produces each level of vibrational evidence (``cfg.vibrational.sources`` names the levels)
+LEVEL_STEPS = {"harmonic": "harmonic", "quasiharmonic": "quasiharmonic", "anharmonic": "md"}
+#: steps whose output the gates read (``vibrational`` follows ``cfg.vibrational.sources``; ``thermodynamic`` the selected terms)
+GATE_STEPS = {"mechanical": ("elastic",), "structural_transition": ("md",), "thermodynamic": ()}
+#: the hull's evidence per vibrational model (``cfg.terms.vibrational``), for the target AND every competing phase
+THERMO_STEPS = {"off": (), "zpe": ("harmonic",), "harmonic": ("harmonic",), "quasiharmonic": ("quasiharmonic",),
+                "anharmonic": ("md",)}
 
 
-def gate_steps(gate: str, method: str = "HA", phase=None) -> tuple:
+def vibrational_steps(sources=None) -> tuple:
+    """Compute steps behind the vibrational evidence *sources* (default ``cfg.vibrational.sources``)."""
+    sources = cfg.vibrational.sources if sources is None else sources
+    bad = [x for x in sources if x not in LEVEL_STEPS]
+    if bad:
+        raise ValueError(f"cfg.vibrational.sources: unknown {bad}; choose from {list(LEVEL_STEPS)}")
+    return tuple(dict.fromkeys(LEVEL_STEPS[x] for x in sources))
+
+
+def gate_steps(gate: str, model: str = "harmonic", phase=None) -> tuple:
     """Steps whose output *gate* reads.  The hull's are those of the selected terms (``heatup.core.contributions``):
-    the vibrational *method* plus whatever the other selected terms need (resolved for *phase* as prepared)."""
+    the vibrational *model* plus whatever the other selected terms need (resolved for *phase* as prepared)."""
+    if gate == "vibrational":
+        return vibrational_steps()
     base = tuple(GATE_STEPS.get(gate, ()))
     if gate != "thermodynamic":
         return base
     from heatup.core import contributions
     extra = contributions.required_steps(phase=phase, exclude=("vibrational",))
-    return base + tuple(dict.fromkeys(THERMO_STEPS[method.upper()] + extra))
+    return base + tuple(dict.fromkeys(THERMO_STEPS[model.lower()] + extra))
 
 
-def steps_for(gates, method: str = "HA", role: str = "target") -> list[str]:
-    """Compute steps needed to evaluate *gates* with free-energy *method* (registry order).  A competing phase only
+def steps_for(gates, model: str = "harmonic", role: str = "target") -> list[str]:
+    """Compute steps needed to evaluate *gates* with vibrational *model* (registry order).  A competing phase only
     serves the hull, so it needs just the hull's evidence (``THERMO_STEPS``).  Used by notebook 1 and by the one-call
     facade ``heatup.screen``; ``cfg.plan.target_steps`` / ``competitor_steps`` override it."""
     need = {"relax"}                                      # "relax" is no gate: it is always planned (see relax.optimize)
     if role == "target":
         for g in gates:
-            need.update(gate_steps(g, method))
+            need.update(gate_steps(g, model))
     elif "thermodynamic" in gates:
-        need.update(gate_steps("thermodynamic", method))
+        need.update(gate_steps("thermodynamic", model))
     return [n for n in COMPUTE_STEPS if n in need]
 
 
@@ -349,7 +359,7 @@ class Plan:
     role: str = "target"                                 # "target" | "competitor"
     steps: list = dc.field(default_factory=list)         # names of compute steps, in execution order
     gates: list = dc.field(default_factory=list)         # gates this phase was prepared for (what notebook 3 reports)
-    operating_T_K: float | None = None                   # temperature at which Gate 3 judges this phase
+    operating_T_K: float | None = None                   # temperature at which the thermodynamic check judges this phase
     md_temperatures_K: list = dc.field(default_factory=list)
     options: dict = dc.field(default_factory=dict)       # dotted config values of the planned steps (no calculator)
     source: str = ""                                     # database | candidates | mp-api | generate | ...
@@ -411,6 +421,10 @@ def read_plan(phase) -> Plan | None:
     d = read_json(PhaseDir.of(phase).plan_json)
     if not d:
         return None
+    old = [s for s in d.get("steps", []) if s not in STEPS]
+    if old:
+        raise RuntimeError(f"{PhaseDir.of(phase).tag}: plan.json lists steps of an earlier version {old}.  Run "
+                           "heatup.core.migrate.migrate_database() once (renames the folders and records; nothing is recomputed).")
     known = {f.name for f in dc.fields(Plan)}
     return Plan(**{k: v for k, v in d.items() if k in known})
 
@@ -441,11 +455,14 @@ def resolve_gates(phase, explicit: list | None = None) -> list[str]:
     return [g for g in plan.gates if g in GATES] if plan and plan.gates else list(GATES)
 
 
-def phonon_method(phase, explicit: str | None = None) -> str:
-    """Vibrational model of the hull: *explicit* > ``cfg.terms.vibrational`` > legacy ``cfg.hull.phonon_method`` > what the
-    phase was prepared with > HA   (``heatup.core.contributions.resolve``)."""
+def vibrational_model(phase, explicit: str | None = None) -> str:
+    """Vibrational model of the hull: *explicit* > ``cfg.terms.vibrational`` > what the phase was prepared with > the
+    default of the term (``heatup.core.contributions.resolve``).  One of ``off zpe harmonic quasiharmonic anharmonic``."""
     from heatup.core import contributions
-    return contributions.resolve(phase, vibrational=explicit)["vibrational"].upper()
+    return contributions.resolve(phase, vibrational=explicit)["vibrational"].lower()
+
+
+phonon_method = vibrational_model                      # name of earlier versions (kept for callers not updated yet)
 
 
 def operating_T(phase, default: float | None = None) -> float:
@@ -466,7 +483,7 @@ def prune_window(phase) -> float | None:
 
 def md_temperatures(phase) -> list[int]:
     """The MD runs evidence is taken from: finished runs on disk, restricted to the planned temperatures when
-    the plan lists any (a stray older run never silently enters Gates 0 and 2)."""
+    the plan lists any (a stray older run never silently enters the structural-transition and vibrational checks)."""
     phase = PhaseDir.of(phase)
     found = phase.md_temperatures()
     plan = read_plan(phase)

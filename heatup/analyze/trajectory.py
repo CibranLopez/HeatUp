@@ -5,8 +5,8 @@ works on trajectories computed with another code.  Three analysis steps, each wi
 (:data:`heatup.core.ledger.STEPS`), none depending on the others:
 
 ``mdstats``     thermo series (T, P, V, E_pot drift) and tracer diffusion per species -> ``mdstats.json``
-``vdos``        vibrational DOS from the stored momenta (below)                       -> ``vdos.json``
-``transition``  Gate-0 metrics: block-mean displacement / cell change / symmetry breaking -> ``transition.json``
+``vdos``        vibrational DOS from the stored momenta (below)  -> ``phonons/anharmonic/<T>K/vdos.json``
+``transition``  structural-transition metrics: block-mean displacement / cell change / symmetry breaking -> ``transition.json``
 
 Only *metrics* are cached.  Verdicts (thresholds) are applied by :mod:`heatup.analyze.gates` on every call, so
 changing a threshold never needs a rerun.  Reading options live in ``cfg.analysis`` (``equil_ps``, ``stride``,
@@ -57,7 +57,6 @@ log = logging.getLogger("heatup")
 # trajectory loading, MSD, thermo series
 # ---------------------------------------------------------------------------
 
-log = logging.getLogger("heatup")
 
 
 @dc.dataclass
@@ -245,7 +244,6 @@ def diffusion_by_species(td: TrajData, min_msd_A2: float | None = None) -> dict:
 # VDOS
 # ---------------------------------------------------------------------------
 
-log = logging.getLogger("heatup")
 
 
 def _vacf_spectrum(x: np.ndarray, dt_fs: float, max_lag: int, pad: int = 4):
@@ -288,7 +286,7 @@ def compute_vdos(td: TrajData, max_lag_ps: float | None = None) -> dict:
     step = max(resolution / 4.0, 0.1)
     grid = np.arange(0.0, om.max(), step)
     g = np.interp(grid, om, S)
-    ms = ModeSet.from_dos(grid, g, source="VDOS", T_md=p.T_target)
+    ms = ModeSet.from_dos(grid, g, source="anharmonic", T_md=p.T_target)
 
     top = (grid > 0.9 * nyq)
     alias_frac = float(ms.weight[top].sum() / ms.weight.sum())
@@ -297,13 +295,12 @@ def compute_vdos(td: TrajData, max_lag_ps: float | None = None) -> dict:
         m = p.species_mask(sp)
         om_s, S_s = _vacf_spectrum(x[:, m, :].reshape(p.n_frames, -1), p.dt_fs, max_lag)
         g_s = np.interp(grid, om_s[om_s <= nyq * 0.999], S_s[om_s <= nyq * 0.999])
-        pm = ModeSet.from_dos(grid, g_s, source=f"VDOS:{sp}")
+        pm = ModeSet.from_dos(grid, g_s, source=f"anharmonic:{sp}")
         lo = grid <= LOW_REGION_MEV
         partial[sp] = {"n_atoms": int(m.sum()),
-                       "low_omega_meV": grid[lo], "low_weight": pm.weight[lo],   # full resolution, for Gate 2
+                       "low_omega_meV": grid[lo], "low_weight": pm.weight[lo],   # full resolution, for the vibrational check
                        "total_weight": float(pm.weight.sum()),
-                       "omega_meV": grid[:: max(1, len(grid) // 400)],
-                       "weight": pm.weight[:: max(1, len(grid) // 400)] * max(1, len(grid) // 400)}
+                       "omega_meV": _rebin(grid, "mean"), "weight": _rebin(pm.weight, "sum")}
     Tk = p.kinetic_temperature()
     return {
         "modes": ms, "partial": partial, "resolution_meV": float(resolution),
@@ -316,10 +313,9 @@ def compute_vdos(td: TrajData, max_lag_ps: float | None = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Gate-0 metrics
+# structural-transition metrics
 # ---------------------------------------------------------------------------
 
-log = logging.getLogger("heatup")
 
 
 def symmetry_break(f_mean: np.ndarray, f_ref: np.ndarray, cell: np.ndarray,
@@ -450,27 +446,51 @@ def run_mdstats(phase_dir, temperature: float, force: bool | None = None) -> dic
     return _cached(phase, "mdstats", temperature, force, compute, lambda: read_json(out))
 
 
+def _rebin(a: np.ndarray, how: str, nmax: int = 400) -> np.ndarray:
+    """Coarsen *a* to about *nmax* points by block mean (frequencies) or block sum (weights): no aliasing, weight conserved."""
+    k = max(1, len(a) // nmax)
+    b = np.asarray(a, float)[: len(a) // k * k].reshape(-1, k)
+    return b.mean(axis=1) if how == "mean" else b.sum(axis=1)
+
+
+def _vdos_figure(phase: PhaseDir, temperature: float, v: dict) -> None:
+    """``phonons/anharmonic/<T>K/vdos.png`` next to the data (``cfg.vibrational.save_figures``); a failing plot never fails the analysis."""
+    if not cfg.vibrational.save_figures:
+        return
+    try:
+        from heatup.analyze.vibrations import plot_vdos_run
+        plot_vdos_run(v, temperature, os.path.join(phase.anharmonic_run(temperature), "vdos.png"), phase.tag)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("%s %dK: VDOS figure failed: %s", phase.tag, temperature, exc)
+
+
 def run_vdos(phase_dir, temperature: float, force: bool | None = None) -> dict | None:
-    """Compute (or load) ``md/<T>K/vdos.json``; the result holds ``modes`` as a ModeSet."""
+    """Compute (or load) ``phonons/anharmonic/<T>K/vdos.json`` (from the run ``md/<T>K``); the result holds ``modes`` as a ModeSet."""
     phase = PhaseDir.of(phase_dir)
-    out = os.path.join(phase.md_run(temperature), "vdos.json")
+    out = os.path.join(phase.anharmonic_run(temperature), "vdos.json")
 
     def compute():
         res = compute_vdos(load_trajectory(phase.md_run(temperature)))
         d = dict(res)
         d["modes"] = res["modes"].to_dict(max_points=3000)
         write_json(out, d, indent=None)
+        _vdos_figure(phase, temperature, res)
         if res["alias_weight_top10pct"] > 1e-3:
             log.warning("%s %dK: %.2f%% of VDOS weight near the Nyquist limit (%.0f meV) - decrease md.nblock",
                         phase.tag, temperature, 100 * res["alias_weight_top10pct"], res["nyquist_meV"])
         return res
 
-    return _cached(phase, "vdos", temperature, force, compute, lambda: load_vdos(phase, temperature))
+    def load():
+        v = load_vdos(phase, temperature)
+        if v and not os.path.exists(os.path.join(phase.anharmonic_run(temperature), "vdos.png")):
+            _vdos_figure(phase, temperature, v)                  # results from before the figure existed
+        return v
+
+    return _cached(phase, "vdos", temperature, force, compute, load)
 
 
 def load_vdos(phase_dir, temperature: float) -> dict | None:
-    sim = PhaseDir.of(phase_dir).md_run(temperature)
-    d = read_json(os.path.join(sim, "vdos.json"))
+    d = read_json(os.path.join(PhaseDir.of(phase_dir).anharmonic_run(temperature), "vdos.json"))
     if not d:
         return None
     d["modes"] = ModeSet.from_dict(d["modes"])
@@ -478,7 +498,7 @@ def load_vdos(phase_dir, temperature: float) -> dict | None:
 
 
 def run_transition(phase_dir, temperature: float, force: bool | None = None) -> dict | None:
-    """Gate-0 metrics -> ``md/<T>K/transition.json`` (no verdict inside: see ``gates.transition_verdict``)."""
+    """Structural-transition metrics -> ``md/<T>K/transition.json`` (no verdict inside: see ``gates.transition_verdict``)."""
     phase = PhaseDir.of(phase_dir)
     out = os.path.join(phase.md_run(temperature), "transition.json")
 

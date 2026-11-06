@@ -1,6 +1,6 @@
 """heatup.analyze.hull
 ======================
-Gate 3 - temperature-dependent convex hull, from cached results only.
+Thermodynamic check - temperature-dependent convex hull, from cached results only.
 
 Workflow
 --------
@@ -16,8 +16,8 @@ Workflow
    makes the hull distance depend on the method offset, not on chemistry);
 4. hull at every temperature; the target's *signed* distance to the hull of its competitors (negative = stable
    with margin) at the phase's operating temperature;
-5. optional anharmonic overlay: dF_anh(T) = F_VDOS(T) - F_HA(T) of the target is added to its distance (an
-   estimate, reported next to - never instead of - the consistent number).
+5. optional anharmonic overlay: F(anharmonic, MD spectra) - F(selected harmonic or quasi-harmonic model) of the target is
+   added to its distance (an estimate, reported next to - never instead of - the consistent number).
 
 Not included (documented limitations): gas-phase corrections for O2/N2/F2 references, spin/orbital contributions
 beyond ``magnetic/moments.json``, finite-size / charged defects.
@@ -36,9 +36,6 @@ from heatup.core import ledger
 from heatup.core.config import STATUS_FAIL, STATUS_MISSING, STATUS_OK, STATUS_WARN, cfg
 from heatup.core.layout import PhaseDir, write_json
 from heatup.prepare.phases import Phase, find_competing_phases, phase_from_dir
-
-log = logging.getLogger("heatup")
-
 
 log = logging.getLogger("heatup")
 
@@ -115,7 +112,7 @@ def zero_k_screen(target: Phase, competitors: list[Phase]) -> dict:
 
 def THERMO_STEPS_OF(target_dir) -> tuple:
     """The calculations whose settings must agree between target and competitor for the hull's method."""
-    return ledger.gate_steps("thermodynamic", ledger.phonon_method(target_dir), target_dir)
+    return ledger.gate_steps("thermodynamic", ledger.vibrational_model(target_dir), target_dir)
 
 
 def usable_competitors(target_dir) -> tuple[list[Phase], dict[str, dict]]:
@@ -194,7 +191,7 @@ def pruned_competitors(target_dirs=None) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def assess_thermodynamic_stability(target_dir, operating_T: float | None = None) -> dict:
-    """Gate 3 for one target.  ``operating_T=None`` -> the phase's own value from ``plan.json``."""
+    """Thermodynamic check for one target.  ``operating_T=None`` -> the phase's own value from ``plan.json``."""
     target_dir = PhaseDir.of(target_dir)
     hc = cfg.hull
     T = np.asarray(hc.temperatures, float)
@@ -210,7 +207,7 @@ def assess_thermodynamic_stability(target_dir, operating_T: float | None = None)
     stab = target_dir.stability_dir
     os.makedirs(stab, exist_ok=True)
     flags: list[str] = []
-    method = ledger.phonon_method(target_dir)
+    method = ledger.vibrational_model(target_dir)
 
     # 1. competitors on disk
     usable, refused = usable_competitors(target_dir)
@@ -265,17 +262,17 @@ def assess_thermodynamic_stability(target_dir, operating_T: float | None = None)
 
     # 5. anharmonic overlay for the target
     overlay = None
-    if hc.target_overlay.upper() == "VDOS" and method != "VDOS":
+    if hc.target_overlay.lower() == "anharmonic" and method in ("harmonic", "quasiharmonic"):
         try:
-            gv = free_energy(target_dir, T, "VDOS")
+            gv = free_energy(target_dir, T, "anharmonic")
             if gv.get("available"):
-                # dF_anh (HA subtracted *with the same ZPE/T grid*)
+                # dF_anh (the selected model subtracted *with the same terms and T grid*)
                 dF = gv["G_eV_per_atom"] - gt["G_eV_per_atom"]
                 overlay = {"dF_anh_eV": dF, "e_hull_eV": scan["e_hull_eV"] + dF,
                            "e_hull_at_T_eV": float(np.interp(op, T, scan["e_hull_eV"] + dF)),
                            "md_temperatures": ledger.md_temperatures(target_dir)}
         except Exception as exc:  # noqa: BLE001
-            flags.append(f"VDOS overlay failed: {exc}")
+            flags.append(f"anharmonic overlay failed: {exc}")
 
     if len(comps) < len(target.elements):
         flags.append("few competing phases - hull may be incomplete")

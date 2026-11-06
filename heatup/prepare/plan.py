@@ -11,7 +11,7 @@ Notebook 1: put every structure where it is computed and write down what is to b
        **only if its plan has the settings this project wants**; otherwise it is left untouched, reported in
        ``Prepared.refused`` with a warning, and never used in a hull (compare ``ledger.plan_conflicts``);
     3. a ``plan.json`` next to every POSCAR (:class:`heatup.core.ledger.Plan`) and **the folder of every planned
-       calculation** (``relaxation/``, ``elastic/``, ``phonons/``, ``md/<T>K/``), each with a ``step_<step>.json``
+       calculation** (``relaxation/``, ``elastic/``, ``harmonic/``, ``quasiharmonic/``, ``perturbative/``, ``md/<T>K/``), each with a ``step_<step>.json``
        (inputs, files to write, options): everything an outside code such as DFT needs to know.  What you asked for
        (``cfg.plan.gates``: the gates, and ``"relax"`` unless the structures are already relaxed) decides the steps (or ``cfg.plan.target_steps`` / ``competitor_steps`` if you list
        them), the temperatures, and the resolved options of those steps.  A competitor that already has a plan keeps
@@ -19,7 +19,7 @@ Notebook 1: put every structure where it is computed and write down what is to b
        plans, notebook 3 judges the results against them, and neither needs the calculation settings again.
 
 Temperatures: ``cfg.plan.md_temperatures`` (if set) gives every target's MD runs, else the ``temperature`` of its run-list
-entry (scalar or list).  The operating temperature (where Gate 3 judges the phase) is the entry's ``operating_T`` if
+entry (scalar or list).  The operating temperature (where the thermodynamic check judges the phase) is the entry's ``operating_T`` if
 given, else its first temperature, else ``cfg.hull.operating_T``.
 
 Nothing here needs a calculator or a GPU (the Materials-Project query needs ``MP_API_KEY`` and a network).
@@ -54,8 +54,9 @@ def _steps(names, what: str) -> list[str]:
     if bad:
         raise ValueError(f"cfg.plan.{what}: unknown step(s) {bad}; choose from {list(ledger.COMPUTE_STEPS)}")
     keep = [s for s in ledger.COMPUTE_STEPS if s in names or s == "relax"]       # everything starts with the relaxation
-    if "fc3" in keep and cfg.phonon.fc_order != 3:
-        log.warning("'fc3' is planned but cfg.phonon.fc_order = %s: set it to 3", cfg.phonon.fc_order)
+    if "perturbative" in keep and cfg.perturbative.order != 3:
+        log.warning("'perturbative' is planned but cfg.perturbative.order = %s: only 3 (fc3) is implemented",
+                    cfg.perturbative.order)
     return keep
 
 
@@ -79,6 +80,10 @@ def make_task_folders(phase_dir, plan: ledger.Plan) -> list[str]:
         stage_input(phase, step, T)
         planned.add((step, int(round(T)) if T is not None else None))
         made.append(d)
+    if "md" in plan.steps and plan.md_temperatures_K and (
+            "anharmonic" in plan.options.get("vibrational.sources", []) or plan.options.get("terms.vibrational") == "anharmonic"):
+        from heatup.analyze.anharmonic import write_source_marker      # phonons/anharmonic/ has no calculation: say where it comes from
+        write_source_marker(phase, plan.md_temperatures_K)
     for step in ledger.COMPUTE_STEPS:                         # tasks that are no longer planned
         spec = ledger.STEPS[step]
         cands = [None] if not spec.per_T else (
@@ -96,9 +101,9 @@ def _save(phase_dir, plan: ledger.Plan) -> None:
 
 
 def _method() -> str:
-    """Vibrational model of the hull (``cfg.terms.vibrational``; legacy ``cfg.hull.phonon_method``), validated."""
+    """Vibrational model of the hull (``cfg.terms.vibrational``), validated."""
     from heatup.core import contributions
-    m = contributions.resolve()["vibrational"].upper()
+    m = contributions.resolve()["vibrational"].lower()
     if m not in ledger.THERMO_STEPS:
         raise ValueError(f"cfg.terms.vibrational: {m!r}; choose from {list(ledger.THERMO_STEPS)}")
     return m
@@ -108,8 +113,10 @@ def make_plan(role: str, source: str, steps: list[str], operating_T: float | Non
               md_temperatures: list[float] | None = None, gates: list[str] | None = None) -> ledger.Plan:
     opts = ledger.plan_options(steps)
     opts["plan.prune_window_eV"] = cfg.plan.prune_window_eV              # project-level; analysis reads it from here
+    if gates and "vibrational" in gates:
+        opts["vibrational.sources"] = list(cfg.vibrational.sources)      # the evidence the vibrational check reads
+        ledger.vibrational_steps()                                       # validates the names
     if gates and "thermodynamic" in gates:
-        opts["hull.phonon_method"] = _method()                           # (legacy key, kept for older readers)
         from heatup.core import contributions
         contributions.raise_on_errors()                                  # incompatible terms stop here, before any calculation
         opts.update(contributions.plan_options())                        # EVERY term as prepared; notebook 3 follows unless told otherwise
@@ -239,8 +246,10 @@ def supercell_preview(phase_dir, steps=None) -> dict[str, str]:
     steps = steps if steps is not None else (plan.steps if plan else [])
     atoms = read_structure(phase.poscar)
     cell, n = atoms.cell.array, len(atoms)
-    cases = {"phonons": ("phonon", cfg.phonon.supercell, cfg.phonon.min_length_A, cfg.phonon.max_atoms),
-             "fc3": ("fc3", cfg.fc3.supercell, cfg.fc3.min_length_A, cfg.fc3.max_atoms),
+    cases = {"harmonic": ("harmonic", cfg.harmonic.supercell, cfg.harmonic.min_length_A, cfg.harmonic.max_atoms),
+             "quasiharmonic": ("harmonic", cfg.harmonic.supercell, cfg.harmonic.min_length_A, cfg.harmonic.max_atoms),
+             "perturbative": ("perturbative", cfg.perturbative.supercell, cfg.perturbative.min_length_A,
+                              cfg.perturbative.max_atoms),
              "md": ("md", cfg.md.supercell, cfg.md.min_cell_A, cfg.md.max_atoms)}
     out: dict[str, str] = {}
     for step, (key, sc, ml, mx) in cases.items():
@@ -249,7 +258,7 @@ def supercell_preview(phase_dir, steps=None) -> dict[str, str]:
         cell_ = upper_triangular(atoms).cell.array if step == "md" else cell
         try:
             reps = resolve_supercell(cell_, n, supercell=sc, min_length=ml, max_atoms=mx,
-                                     auto_min_length=AUTO_MIN_LENGTH_A.get(key, AUTO_MIN_LENGTH_A["phonon"]),
+                                     auto_min_length=AUTO_MIN_LENGTH_A.get(key, AUTO_MIN_LENGTH_A["harmonic"]),
                                      what=f"{step} supercell")
             out[step] = "x".join(map(str, reps)) + f" ({n * reps[0] * reps[1] * reps[2]} atoms)"
         except ValueError as exc:

@@ -10,12 +10,18 @@ Canonical on-disk layout of one phase, JSON I/O, and the structure helpers share
         plan.json                         WHAT to compute here and with which options - written by ``prepare``
         relaxation/   CONTCAR energy.json run.traj          (step ``relax``)
         elastic/      elastic.json                          (step ``elastic``)
-        phonons/      ha.json [qha.json] [fc3.json] phonon.png
+        phonons/      ONE folder per vibrational level, everything of that level inside it
+            harmonic/       harmonic.json phonon.png  (+ SPOSCAR, disp-*/, forces.npy)      (step ``harmonic``)
+            quasiharmonic/  quasiharmonic.json quasiharmonic.png V01/ ... V07/              (step ``quasiharmonic``)
+            perturbative/   perturbative.json perturbative.png (+ SPOSCAR, disp-*/, forces_fc3.npy)  (step ``perturbative``)
+            anharmonic/     no calculation of its own: the phonons come from ``md/<T>K/``.  Holds the post-processing
+                            (analysis step ``vdos``) and says where it comes from:
+                            anharmonic.json (summary + ``source``)  source.json  <T>K/vdos.json  <T>K/vdos.png
         md/           POSCAR (supercell) cell.json
             <T>K/     output.traj md.json                   (step ``md``; ``md.json`` is written last = run complete)
-                      mdstats.json vdos.json transition.json   (analysis steps ``mdstats vdos transition``)
+                      mdstats.json transition.json         (analysis steps ``mdstats transition``; ``vdos`` -> phonons/anharmonic/)
         electronic/ magnetic/ disorder/                     optional data files (see ``analyze.thermo``)
-        stability/    report_<stage>.json report_<stage>.png hull_vs_T.json zero_K_hull.json ...
+        stability/    report_<stage>.json report_<stage>.png vibrational.png hull_vs_T.json zero_K_hull.json ...
         <step dir>/   POSCAR (the structure it starts from)  step_<step>.json (task / run / result / export: ``core.ledger``)
 
 Two roots only.  ``cfg.phases.candidates_root`` holds *structures* (yours, Materials Project downloads, generated
@@ -148,7 +154,29 @@ class PhaseDir:
     # -- other steps ----------------------------------------------------------
     @property
     def phonon_dir(self) -> str:
+        """Parent of the folders of the vibrational levels (each level keeps ALL its files in its own folder)."""
         return self.join("phonons")
+
+    @property
+    def harmonic_dir(self) -> str:
+        return self.join("phonons", "harmonic")
+
+    @property
+    def quasiharmonic_dir(self) -> str:
+        return self.join("phonons", "quasiharmonic")
+
+    @property
+    def perturbative_dir(self) -> str:
+        return self.join("phonons", "perturbative")
+
+    @property
+    def anharmonic_dir(self) -> str:
+        """Post-processing of the phonons that come from MD (no calculation here: see ``source.json``)."""
+        return self.join("phonons", "anharmonic")
+
+    def anharmonic_run(self, T: float) -> str:
+        """``phonons/anharmonic/<T>K``: the VDOS of the MD run ``md/<T>K``."""
+        return os.path.join(self.anharmonic_dir, f"{int(round(T))}K")
 
     @property
     def elastic_dir(self) -> str:

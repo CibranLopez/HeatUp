@@ -10,7 +10,7 @@ object.  Nothing physical is hard-coded elsewhere::
     cfg.calc.model = "medium-mpa-0"
     cfg.calc.model_overrides = {"BaTiO3": "BTO_MACE.model"}
     cfg.md.n_steps = 40_000
-    cfg.gates.mobile_species = ["Li"]
+    cfg.analysis.mobile_species = ["Li"]
 
 Why a dataclass tree and not module globals (v0.2)?
 
@@ -27,9 +27,10 @@ Who owns which section (the three notebooks)
 ============  ==========================================================  =========
 notebook      sections                                                    stored in
 ============  ==========================================================  =========
-1 prepare     ``relax elastic phonon qha fc3 md plan phases generation``  ``plan.json`` of every phase
+1 prepare     ``relax elastic harmonic quasiharmonic perturbative md``    ``plan.json`` of every phase
+              ``vibrational terms plan phases generation``
 2 compute     ``calc`` (MLIP, device) ``run``                             manifests / ``energy.json``
-3 analyze     ``analysis gates hull``                                     reports
+3 analyze     ``analysis gates hull`` (+ ``terms`` / ``vibrational`` as prepared)  reports
 ============  ==========================================================  =========
 Notebook 2 applies the options stored in each ``plan.json`` (``ledger.applied``), so the calculation
 settings are written down exactly once.
@@ -88,7 +89,7 @@ class Frozen:
 
 #: names that circulate in notebooks / other repos -> the valid ``mace_mp`` name
 #: what ``min_length_A = None`` / ``min_cell_A = None`` mean for each step (A)
-AUTO_MIN_LENGTH_A = {"phonon": 12.0, "fc3": 8.0, "md": 15.0}
+AUTO_MIN_LENGTH_A = {"harmonic": 12.0, "perturbative": 8.0, "md": 15.0}
 
 MODEL_ALIASES = {"mace-mpa-0-medium": "medium-mpa-0", "mace_mpa_0_medium": "medium-mpa-0"}
 
@@ -140,11 +141,12 @@ class RelaxCfg(Frozen):
 
 
 @dc.dataclass
-class PhononCfg(Frozen):
-    """Harmonic phonons (finite displacements, phonopy)."""
+class HarmonicCfg(Frozen):
+    """HARMONIC level: second-order force constants at the relaxed 0 K cell (finite displacements, phonopy).  The same
+    settings (supercell, displacement, q-mesh) are used by the quasi-harmonic level at every volume."""
     #: Sizing.  An explicit ``supercell`` wins (leave ``min_length_A`` ``None``).  Default (3, 3, 3): it is the number of
     #: replications that sets the commensurate q-grid on which the force constants are exact, and it is the same for
-    #: every phase and, in ``qha``, at every volume.  ``supercell = None`` = automatic: the smallest supercell with
+    #: every phase and, in ``quasiharmonic``, at every volume.  ``supercell = None`` = automatic: the smallest supercell with
     #: perpendicular widths >= ``min_length_A`` (``None`` = the built-in 12 A).  ``max_atoms = None`` = no limit.
     #: NB: a phase is computed with the options stored in its ``plan.json``, so a changed default reaches phases that
     #: are already planned only after their plans are updated.
@@ -160,15 +162,16 @@ class PhononCfg(Frozen):
     symprec: float = 1e-4
     #: Imaginary modes shallower than this (meV, absolute) are treated as numerical noise
     imag_tol_meV: float = 0.5
-    #: 2 = harmonic only; 3 = also compute third-order force constants (phono3py, step ``fc3``): kappa(T)
-    #: and phonon linewidths for the target, see ``cfg.fc3``.  Needs ``pip install phono3py``.
-    fc_order: int = 2
 
 
 @dc.dataclass
-class FC3Cfg(Frozen):
-    """Third-order force constants (phono3py) - used when ``phonon.fc_order == 3``."""
-    #: Sizing, same rule as ``phonon``: explicit ``supercell`` wins; else ``min_length_A`` (None = built-in 8 A);
+class PerturbativeCfg(Frozen):
+    """PERTURBATIVE ANHARMONIC level: higher-order force constants on top of the harmonic crystal (step ``perturbative``).
+    Implemented: third order (phono3py) -> kappa(T) and phonon linewidths, a DIAGNOSTIC.  Fourth order is reserved (a
+    free-energy correction needs fc3 AND fc4 at the same order of perturbation theory)."""
+    #: highest order of the force constants.  3 = fc3 (implemented); 4 = fc4 (not implemented yet: raises).
+    order: int = 3
+    #: Sizing, same rule as ``harmonic``: explicit ``supercell`` wins; else ``min_length_A`` (None = built-in 8 A);
     #: ``max_atoms = None`` = no limit.
     supercell: tuple | None = None
     min_length_A: float | None = None
@@ -177,7 +180,7 @@ class FC3Cfg(Frozen):
     delta_A: float = 0.03
     #: ignore atom pairs farther apart than this (A) -> far fewer displaced cells; None = no cutoff
     cutoff_pair_A: float | None = None
-    #: compute fc2 on the harmonic supercell (``cfg.phonon``) instead of the small fc3 supercell
+    #: compute fc2 on the harmonic supercell (``cfg.harmonic``) instead of the small fc3 supercell
     separate_fc2: bool = True
     #: q-mesh density for kappa: n_i = ceil(kappa_mesh_length_A / |a_i|)
     kappa_mesh_length_A: float = 30.0
@@ -190,13 +193,14 @@ class FC3Cfg(Frozen):
 
 
 @dc.dataclass
-class QHACfg(Frozen):
+class QuasiHarmonicCfg(Frozen):
+    """QUASI-HARMONIC level: the harmonic fc2 at several volumes (ions relaxed at each), F(V,T) minimised at every T."""
     n_volumes: int = 7          # odd, >= 5 recommended
     volume_range: float = 0.06  # +/- fraction of V0
     #: polynomial order of the F(V) fit at each temperature
     poly_order: int = 4
     relax_internal: bool = True # relax ions at every fixed volume (required for QHA)
-    #: temperature grid of G(T) stored in ``qha.json``.  The hull grid (``cfg.hull.temperatures``) must lie inside it.
+    #: temperature grid of G(T) stored in ``quasiharmonic.json``.  The hull grid (``cfg.hull.temperatures``) must lie inside it.
     temperatures: list = dc.field(default_factory=lambda: list(range(0, 1501, 50)))
 
 
@@ -226,7 +230,7 @@ class MDCfg(Frozen):
     #: Bulk modulus used to build the barostat mass ``pfactor = ptime^2 B``.
     #: Overridden by the elastic result when available.
     default_bulk_modulus_GPa: float = 100.0
-    #: Sizing, same rule as ``phonon``: explicit ``supercell`` wins; else perpendicular widths >= ``min_cell_A``
+    #: Sizing, same rule as ``harmonic``: explicit ``supercell`` wins; else perpendicular widths >= ``min_cell_A``
     #: (None = built-in 15 A).  25 A: the cell must also give converged diffusivities, not only a stability verdict.
     #: ``max_atoms`` caps the cell (None = no limit); when the cap does not allow ``min_cell_A`` the target is lowered
     #: in steps of 1 A down to ``min_cell_floor_A``, and only below that is the structure refused.
@@ -244,8 +248,8 @@ REQUESTS = ("relax", *GATES)         # what ``cfg.plan.gates`` may contain
 @dc.dataclass
 class RunCfg(Frozen):
     """Execution control."""
-    #: Steps to recompute even if cached: step names of ``ledger.STEPS`` (``relax elastic phonons qha fc3 md vdos
-    #: transition mdstats``), the group ``"analysis"`` (= vdos + transition + mdstats) or ``"all"``.  Applies to
+    #: Steps to recompute even if cached: step names of ``ledger.STEPS`` (``relax elastic harmonic quasiharmonic
+    #: perturbative md vdos transition mdstats``), the group ``"analysis"`` (= vdos + transition + mdstats) or ``"all"``.  Applies to
     #: every phase of the database (targets and competing phases).  Downstream steps follow automatically: they are invalidated
     #: when the input they consume changes (manifest hashes).
     force: list = dc.field(default_factory=list)
@@ -280,41 +284,41 @@ class AnalysisCfg(Frozen):
     #: A species counts as mobile (diffusing) when its final mean-square displacement exceeds this (A^2).  Vibrations in
     #: a solid give 0.1-0.5 A^2, a hop is (2-3 A)^2: a model-free criterion, independent of any assumed ionic charge.
     msd_mobile_A2: float = 4.0
-    #: length of the first/last averaging window of Gate 0 (ps)
+    #: length of the first/last averaging window of the structural-transition check (ps)
     block_ps: float = 2.0
     #: longest VACF lag used for the VDOS (ps)
     vdos_max_lag_ps: float = 10.0
-    #: Species allowed to diffuse (superionic conductors).  Excluded from the displacement test (Gate 0) and
-    #: from the soft-mode test (Gate 2).
+    #: Species allowed to diffuse (superionic conductors).  Excluded from the displacement test (structural transition)
+    #: and from the soft-mode test (vibrational).
     mobile_species: list = dc.field(default_factory=list)
 
 
 @dc.dataclass
 class GateCfg(Frozen):
     #: Gates that are reported.  None (default) -> the gates each phase's plan asked for (``cfg.plan.gates``),
-    #: else all four.  They are independent: a failing gate never prevents another from running (only a missing
-    #: relaxation makes every gate "missing").
+    #: else all four.  They are independent and unordered: any one can be asked for alone, a failing gate never
+    #: prevents another from running (only a missing relaxation makes every gate "missing").
     enabled: list | None = None
-    # Gate 0 - structural transition (block-averaged structure comparison)
+    # structural transition (block-averaged structure comparison)
     transition_rms_A: float = 0.30    # rms displacement of block-mean positions
     transition_max_A: float = 0.80    # largest single-atom displacement
     cell_shape_strain: float = 0.04   # max |eps_ij| of deviatoric strain (first -> last block)
     cell_volume_change: float = 0.10  # |dV/V|
     symmetry_break_A: float = 0.06    # rms symmetry-breaking of block-mean structure -> warn
-    # Gate 1 - mechanical
+    # mechanical
     born_min_eigenvalue_GPa: float = 0.0
     bulk_warn_GPa: float = 10.0
     bulk_fail_GPa: float = 0.0
     shear_warn_GPa: float = 5.0
-    # Gate 2 - vibrational
+    # vibrational
     zero_window_meV: float = 2.0
     zero_frac_warn: float = 0.01
     zero_frac_fail: float = 0.05
     min_production_ps: float | None = 10.0     # None -> no minimum-length warning
-    #: HA: fraction of mode weight that is imaginary (> imag_tol) -> warn / fail
+    #: harmonic / quasi-harmonic: fraction of mode weight that is imaginary (> imag_tol) -> warn / fail
     imag_frac_warn: float = 0.002
     imag_frac_fail: float = 0.02
-    # Gate 3 - thermodynamic
+    # thermodynamic
     hull_ok_eV: float = 0.010
     hull_fail_eV: float = 0.100
     #: Spread of F_vib(T) between MD temperatures that triggers a warning
@@ -323,50 +327,84 @@ class GateCfg(Frozen):
 
 @dc.dataclass
 class HullCfg(Frozen):
-    #: default temperature at which Gate 3 is judged (K); must lie inside ``temperatures``.  A phase's own
-    #: ``plan.json`` value (set in notebook 1) wins.
+    """The temperature-dependent hull.  WHICH free-energy terms enter it is ``cfg.terms`` (one place)."""
+    #: default temperature at which the thermodynamic check is judged (K); must lie inside ``temperatures``.  A phase's
+    #: own ``plan.json`` value (set in notebook 1) wins.
     operating_T: float = 300.0
     temperatures: list = dc.field(default_factory=lambda: list(range(0, 1501, 50)))
-    #: Free energies of the hull, the SAME method for every phase: ``"HA"`` harmonic phonons (default) | ``"QHA"`` |
-    #: ``"VDOS"`` (effective-harmonic F_vib from each phase's MD spectrum: anharmonic, needs MD for the target AND
-    #: all competitors).  None -> as prepared: notebook 1 reads it to decide which calculations the competing phases
-    #: need (and stores it in the plans); notebook 3 uses that unless you set it here.
-    phonon_method: str | None = None
-    #: Extra anharmonic overlay computed for the target only (reported next to the consistent hull).
-    target_overlay: str = "VDOS"
-    include_electronic: bool = True
-    include_magnetic: bool = True
-    include_configurational: bool = True
-    #: Model of the configurational block (only used when ``include_configurational``): ``"ideal"`` = -TS of ideal mixing
-    #: (``disorder/site_occupancies.json``) | ``"enumerated"`` = Boltzmann ensemble of enumerated configurations
-    #: (``disorder/configurations.json``) | ``"monte_carlo"`` = lattice-model MC (``disorder/monte_carlo.json``).
-    #: One model at a time: they describe the same degrees of freedom.  See ``heatup.analyze.ensembles``.
-    configurational_model: str = "ideal"
-    #: Hindered rotors / discrete orientations of molecular ions (``disorder/rotors.json``).  Off by default.
-    include_orientational: bool = False
-    #: Composition-conserving point-defect pairs, dilute limit (``disorder/defects.json``).  Off by default.
-    include_defects: bool = False
+    #: Extra anharmonic overlay computed for the target only (reported next to the consistent hull): ``"anharmonic"``
+    #: (needs MD of the target) | ``"off"``.  It is an ESTIMATE, never the verdict.
+    target_overlay: str = "anharmonic"
     #: O2/N2/F2... gas-phase corrections are NOT applied; see docs/AUDIT.md.
     reference_energy_shift: dict = dc.field(default_factory=dict)
+
+
+#: the terms of the free energy (``heatup.core.contributions`` declares their models, steps, files and rules)
+TERM_KEYS = ("vibrational", "electronic", "magnetic", "configurational", "orientational", "defects")
+
+
+@dc.dataclass
+class TermsCfg(Frozen):
+    """Which terms make up G(T) = H0 + sum of the selected terms.  ``None`` = as prepared in notebook 1 (stored in each
+    ``plan.json``), and if nothing was prepared, the default of the term (``contributions.TERMS``).  ONE model per term,
+    the SAME for every phase of a hull.
+
+    ``vibrational``: ``"off"`` static 0 K hull | ``"ZPE"`` zero-point energy only | ``"harmonic"`` | ``"quasiharmonic"``
+    | ``"anharmonic"`` (effective-harmonic F from the MD spectra; experimental).  Old names ``HA`` / ``QHA`` / ``VDOS`` are
+    still read."""
+    vibrational: str | None = None
+    electronic: str | None = None        # "off" | "dos"
+    magnetic: str | None = None          # "off" | "ihj"
+    configurational: str | None = None   # "off" | "ideal" | "enumerated" | "monte_carlo"
+    orientational: str | None = None     # "off" | "rotors"
+    defects: str | None = None           # "off" | "pairs"
+
+    def only(self, **on: str) -> "TermsCfg":
+        """The listed terms on (with the given model), every other term off:  ``cfg.terms.only(configurational="ideal")``."""
+        bad = [k for k in on if k not in TERM_KEYS]
+        if bad:
+            raise ValueError(f"unknown term(s) {bad}; terms: {list(TERM_KEYS)}")
+        for k in TERM_KEYS:
+            setattr(self, k, on.get(k, "off"))
+        return self
+
+    def show(self) -> None:
+        """Print the selection with what it needs (same as ``heatup.core.contributions.show()``)."""
+        from heatup.core import contributions
+        contributions.show()
+
+
+@dc.dataclass
+class VibrationalCfg(Frozen):
+    """The vibrational check (stability against soft / imaginary modes): WHICH evidence it reads, plans and plots.
+    Choose any of ``"harmonic"`` (phonon bands / mesh at 0 K), ``"quasiharmonic"`` (the same at the volumes the crystal
+    visits), ``"anharmonic"`` (VDOS of the MD runs).  They are listed in order of increasing physical completeness: when
+    several are available the most complete one decides and the others are reported as information (a 0 K harmonic
+    instability is not a failure if the finite-temperature evidence is clean)."""
+    sources: list = dc.field(default_factory=lambda: ["harmonic", "anharmonic"])
+    #: Save the figures of the vibrational analysis as PNG next to the data: ``phonons/anharmonic/<T>K/vdos.png`` (every VDOS), the figure of each level in its phonons folder and
+    #: ``stability/vibrational.png`` (bands / volumes / VDOS of the selected sources, imaginary parts in red).  Switch off to
+    #: analyse without matplotlib.  Display-only: never makes a result stale.
+    save_figures: bool = True
 
 
 @dc.dataclass
 class PlanCfg(Frozen):
     """WHAT notebook 2 will compute for every phase (notebook 1).  Ask for gates and everything they need is
-    planned; the settings of each calculation are the ``relax/elastic/phonon/qha/fc3/md`` sections."""
+    planned; the settings of each calculation are the ``relax/elastic/harmonic/quasiharmonic/perturbative/md`` sections."""
     #: What you ask for: the gates and/or ``"relax"``.  The gates decide the calculations (``ledger.steps_for``:
-    #: mechanical -> elastic, structural_transition -> md, vibrational -> phonons + md, thermodynamic -> phonons of
-    #: target and competitors).  Leave ``"relax"`` out when the structures are already relaxed (other code/model): they
+    #: mechanical -> elastic, structural_transition -> md, vibrational -> the steps of ``cfg.vibrational.sources``,
+    #: thermodynamic -> the steps of the selected ``cfg.terms.vibrational`` model for target and competitors).  Leave ``"relax"`` out when the structures are already relaxed (other code/model): they
     #: are then used as given - only energy, forces and stress are evaluated (``relax.optimize = False``).
     gates: list = dc.field(default_factory=lambda: list(REQUESTS))
-    #: Override the derived steps (names of ``ledger.STEPS``; ``relax`` is always added), e.g. to add ``qha`` / ``fc3``
-    #: or ``md`` for competitors.  None -> derived from ``gates``.
+    #: Override the derived steps (names of ``ledger.STEPS``; ``relax`` is always added), e.g. to add
+    #: ``quasiharmonic`` / ``perturbative`` or ``md`` for competitors.  None -> derived from ``gates``.
     target_steps: list | None = None
     competitor_steps: list | None = None
     #: MD temperatures of the targets, K.  None -> the ``temperature`` of each run-list entry.
     md_temperatures: list | None = None
     #: Opt-in cost saver: competitors whose 0 K enthalpy lies more than this (eV/atom) above the 0 K hull get no
-    #: phonons / MD and are left out of the hull.  None (default) -> every competitor is computed.
+    #: harmonic / MD steps and are left out of the hull.  None (default) -> every competitor is computed.
     prune_window_eV: float | None = None
 
 
@@ -530,9 +568,9 @@ class Settings(Frozen):
 class Config(Settings):
     calc: CalcCfg = dc.field(default_factory=CalcCfg)
     relax: RelaxCfg = dc.field(default_factory=RelaxCfg)
-    phonon: PhononCfg = dc.field(default_factory=PhononCfg)
-    qha: QHACfg = dc.field(default_factory=QHACfg)
-    fc3: FC3Cfg = dc.field(default_factory=FC3Cfg)
+    harmonic: HarmonicCfg = dc.field(default_factory=HarmonicCfg)
+    quasiharmonic: QuasiHarmonicCfg = dc.field(default_factory=QuasiHarmonicCfg)
+    perturbative: PerturbativeCfg = dc.field(default_factory=PerturbativeCfg)
     elastic: ElasticCfg = dc.field(default_factory=ElasticCfg)
     md: MDCfg = dc.field(default_factory=MDCfg)
     plan: PlanCfg = dc.field(default_factory=PlanCfg)
@@ -540,6 +578,8 @@ class Config(Settings):
     gates: GateCfg = dc.field(default_factory=GateCfg)
     run: RunCfg = dc.field(default_factory=RunCfg)
     hull: HullCfg = dc.field(default_factory=HullCfg)
+    terms: TermsCfg = dc.field(default_factory=TermsCfg)
+    vibrational: VibrationalCfg = dc.field(default_factory=VibrationalCfg)
     phases: PhasesCfg = dc.field(default_factory=PhasesCfg)
     generation: GenerationCfg = dc.field(default_factory=GenerationCfg)
     #: Factory ``device -> ASE calculator`` for backend="custom" (not serialised).

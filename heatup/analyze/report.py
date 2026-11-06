@@ -15,7 +15,8 @@ import numpy as np
 import matplotlib.pyplot as plt  # noqa: E402
 
 from heatup.analyze.evaluate import summary_rows  # noqa: E402
-from heatup.analyze.thermo import load_fc3, load_ha  # noqa: E402
+from heatup.analyze.thermo import load_harmonic, load_perturbative  # noqa: E402
+from heatup.analyze.vibrations import plot_vibrational  # noqa: E402,F401
 from heatup.core import ledger  # noqa: E402
 from heatup.core.config import STATUS_FAIL, STATUS_MISSING, STATUS_OK, STATUS_WARN, cfg  # noqa: E402
 
@@ -46,8 +47,9 @@ def vibrational_table(reports: dict, tags=None):
         if not v.get("available"):
             continue
         rows.append({"phase": tag, "status": v["status"], "evidence": v["evidence"],
+                     "imaginary branches": (v.get("harmonic") or {}).get("n_unstable_branches", np.nan),
                      "soft-mode weight %": 100 * max((r["zero_frac"] for r in v.get("vdos", [])), default=np.nan),
-                     "HA imaginary %": 100 * v["ha"]["imag_fraction"] if v.get("ha") else np.nan,
+                     "harmonic imaginary %": 100 * v["ha"]["imag_fraction"] if v.get("ha") else np.nan,
                      "message": v["message"]})
     return pd.DataFrame(rows).set_index("phase").round(3)
 
@@ -128,7 +130,7 @@ def plot_free_energy_terms(report: dict):
 
 
 def plot_vdos(report: dict, ax=None):
-    """HA DOS and MD VDOS of one report on common axes."""
+    """Harmonic DOS and MD VDOS of one report on common axes (the full vibrational figure: ``plot_vibrational``)."""
     if ax is None:
         _, ax = plt.subplots(figsize=(6, 3.5))
     _vdos(ax, report)
@@ -149,7 +151,7 @@ def _size(n: int) -> str:
 
 def layout(root: str, max_depth: int = 5, max_files: int = 8, hide: tuple = ("__pycache__", ".ipynb_checkpoints", ".DS_Store")) -> str:
     """Text tree of the database (or candidates) directory with file sizes - shows what exists and
-    where each step wrote its data (``relaxation/``, ``elastic/``, ``phonons/``, ``md/<T>K/``, ``stability/``)."""
+    where each step wrote its data (``relaxation/``, ``elastic/``, ``harmonic/``, ``md/<T>K/``, ``stability/``)."""
     if not os.path.isdir(root):
         return f"{root}/  (does not exist yet)"
     lines = [root.rstrip("/") + "/"]
@@ -185,25 +187,20 @@ def print_layout(root: str, **kw) -> None:
     print(layout(root, **kw))
 
 
-def plot_fc3(report: dict, axes=None):
-    """kappa_RTA(T) and <gamma/nu>(T) of the target (needs ``cfg.phonon.fc_order = 3``)."""
-    res = load_fc3(report["phase_dir"])
+def plot_perturbative(report: dict, axes=None):
+    """kappa_RTA(T) and <gamma/nu>(T) of the target (needs the ``perturbative`` step, third order)."""
+    from heatup.analyze.vibrations import plot_perturbative as _draw
+    res = load_perturbative(report["phase_dir"])
     if not res:
-        raise ValueError("no fc3 result: set cfg.phonon.fc_order = 3 and run the 'fc3' step")
-    if axes is None:
-        _, axes = plt.subplots(1, 2, figsize=(8, 3.2))
-    T = res["temperatures_K"]
-    axes[0].plot(T, res["kappa_W_mK"], "o-")
-    axes[0].set_xlabel("T (K)"); axes[0].set_ylabel("kappa_RTA (W/m/K)"); axes[0].set_yscale("log")
-    ratio = [np.nan if r is None else r for r in res["gamma_over_nu_mean"]]
-    axes[1].plot(T, ratio, "o-", color="C3")
-    axes[1].axhline(cfg_ratio_warn(), color="0.5", ls="--", lw=0.8, label="warn")
-    axes[1].set_xlabel("T (K)"); axes[1].set_ylabel("<gamma / nu>"); axes[1].legend()
-    return axes
+        raise ValueError("no perturbative result: put 'perturbative' in cfg.plan.target_steps and run the step")
+    return _draw(res, axes)
+
+
+plot_fc3 = plot_perturbative                          # name of earlier versions
 
 
 def cfg_ratio_warn() -> float:
-    return cfg.fc3.ratio_warn
+    return cfg.perturbative.ratio_warn
 
 # ---------------------------------------------------------------------------
 # project status (what is computed, what is not)
@@ -255,8 +252,8 @@ def show_status(rows: list[dict] | None = None) -> None:
 
 COLORS = {STATUS_OK: "#2a9d5c", STATUS_WARN: "#e0a100", STATUS_FAIL: "#c0392b", STATUS_MISSING: "#8a8f98"}
 MARK = {STATUS_OK: "pass", STATUS_WARN: "warn", STATUS_FAIL: "FAIL", STATUS_MISSING: "n/a"}
-TITLES = {"structural_transition": "Gate 0  structure", "mechanical": "Gate 1  Born",
-          "vibrational": "Gate 2  vibrational", "thermodynamic": "Gate 3  hull"}
+TITLES = {"structural_transition": "structure", "mechanical": "mechanical (Born)",
+          "vibrational": "vibrational", "thermodynamic": "thermodynamic (hull)"}
 
 
 def _wrap(s: str, n: int = 58) -> str:
@@ -294,10 +291,10 @@ def _vdos(ax, report: dict) -> None:
     ax.set_xlabel("energy (meV)")
     ax.set_ylabel("DOS (modes / atom / meV)")
     ax.set_title("Vibrational DOS", loc="left", fontsize=10)
-    ha = load_ha(report["phase_dir"]) if report.get("phase_dir") else None
+    ha = load_harmonic(report["phase_dir"]) if report.get("phase_dir") else None
     if ha:
         sm = ha["modes"].smooth_dos(sigma_meV=1.0)
-        ax.fill_between(sm[0], sm[1], color="#b0c4de", alpha=0.6, label="HA (0 K)")
+        ax.fill_between(sm[0], sm[1], color="#b0c4de", alpha=0.6, label="harmonic (0 K)")
     cols = plt.cm.viridis(np.linspace(0.15, 0.85, max(1, len(vib.get("vdos", [])))))
     for c, r in zip(cols, vib.get("vdos", [])):
         w, o = np.asarray(r["weight"]), np.asarray(r["omega_meV"])

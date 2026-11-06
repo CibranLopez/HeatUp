@@ -5,7 +5,7 @@ Notebook 2: execute the plans.
 :func:`run_plan` runs **everything the plans list** - for every phase with a ``plan.json`` (targets and competitors,
 ``database_root``; the role in the plan tells targets from competitors) - in dependency order::
 
-    relax -> elastic -> phonons -> qha -> fc3 -> md          (each for all phases before the next step)
+    relax -> elastic -> harmonic -> quasiharmonic -> perturbative -> md    (each for all phases before the next step)
 
 Nothing about the calculations is configured here, only the calculator (``cfg.calc``) and the device: the options
 of each task are the ones stored in its plan (``ledger.applied``).  A task is run when its state

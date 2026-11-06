@@ -1,23 +1,36 @@
-"""heatup.compute.fc3
-=====================
-Third-order force constants (phono3py) -> anharmonic phonon diagnostics (step ``fc3``).
+"""heatup.compute.perturbative
+==========================
+PERTURBATIVE ANHARMONIC level (vocabulary: ``heatup.core.provenance``): higher-order force constants on top of the harmonic
+crystal, treated by perturbation theory.  Implemented: THIRD order (phono3py).  Not implemented: fourth order.
 
-Step ``fc3`` (:func:`run_fc3`)  ->  ``phonons/fc3.json``
+Why fc3 gives no free energy.  The lowest-order anharmonic free energy is of second order in the anharmonic expansion:
+a first-order term in the QUARTIC force constants (fc4, positive: the "loop" diagram) plus a second-order term in the CUBIC
+ones (fc3, negative: the "bubble").  They are of the same order and partly cancel, so fc3 alone is an unbalanced half of
+the correction.  fc3 does give the three-phonon self-energy: linewidths and kappa_RTA, which is what is computed here.
+The expansion is also about the harmonic crystal, so it is unreliable with imaginary modes or strong anharmonicity - the
+regime the MD level is for.  ``cfg.perturbative.order = 4`` is reserved for an fc4 implementation and raises.
+
+Here fc3 AND fc2 are both evaluated at the relaxed 0 K cell and the frequencies are the harmonic ones, so the temperature
+enters only through the phonon occupation numbers and there is no thermal expansion; fc2/fc3 at V(T) is NOT implemented.
+The result is a DIAGNOSTIC (gamma/nu, kappa_RTA): never a gate, never a free-energy term.  ``perturbative/perturbative.json``
+states this in its ``"meta"`` block.
+
+Step ``perturbative`` (:func:`run_perturbative`)  ->  ``phonons/perturbative/perturbative.json`` (+ ``perturbative.png``)
     * fc3 from finite displacements of a (smaller) supercell, forces from the active calculator with the
       residual force of the perfect supercell subtracted (same convention as the harmonic step);
-    * fc2 from the harmonic supercell (``fc3.separate_fc2``) or from the fc3 supercell;
+    * fc2 from the harmonic supercell (``perturbative.separate_fc2``) or from the fc3 supercell;
     * single-mode relaxation-time (RTA) lattice thermal conductivity kappa(T) on a q-mesh;
     * phonon linewidths -> ``gamma/nu`` (HWHM over frequency) per temperature: the quantitative statement of
       "how harmonic is this crystal at T".  ``omega*tau = nu / (2 gamma) < 1`` is the Ioffe-Regel limit.
 
-It is planned like any step: put ``"fc3"`` in ``cfg.plan.target_steps`` (notebook 1; ``cfg.phonon.fc_order`` must be 3)
-or call ``run_step("fc3", phase_dir)``.  It is a *diagnostic*: it never changes a gate verdict.  Notebook 3 reads
-its result (:func:`heatup.analyze.thermo.load_fc3`, ``anharmonic_summary``) into ``report["anharmonic"]`` and adds a
-flag when ``gamma/nu`` at the operating temperature exceeds ``cfg.fc3.ratio_warn`` (the harmonic F_vib of Gate 3 is then
-less trustworthy: compare with the VDOS overlay).
+It is planned like any step: put ``"perturbative"`` in ``cfg.plan.target_steps`` (notebook 1) or call
+``run_step("perturbative", phase_dir)``.  Notebook 3 reads its result (:func:`heatup.analyze.thermo.load_perturbative`,
+``perturbative_summary``) into ``report["perturbative"]`` and adds a flag when ``gamma/nu`` at the operating temperature
+exceeds ``cfg.perturbative.ratio_warn`` (the harmonic F_vib of the hull is then less trustworthy: compare with the
+anharmonic overlay).
 
 Cost: the number of fc3 displacements grows quickly with supercell size and falls with symmetry.  Start with
-``cfg.fc3.supercell = (2, 2, 2)`` and ``cfg.fc3.cutoff_pair_A`` (e.g. 4-5 A) and converge from there.
+``cfg.perturbative.supercell = (2, 2, 2)`` and ``cfg.perturbative.cutoff_pair_A`` (e.g. 4-5 A) and converge from there.
 """
 
 from __future__ import annotations
@@ -25,19 +38,15 @@ from __future__ import annotations
 import logging
 import math
 import os
-import warnings
 
 import numpy as np
 from ase import Atoms
 
 from heatup.compute.calculator import build_calculator, calculator_label, release_calculator
-from heatup.core import ledger
+from heatup.core import ledger, provenance
 from heatup.core.config import cfg
 from heatup.core.layout import PhaseDir, read_structure, write_json
-from heatup.prepare.export import fc3_cells, to_ase
-
-log = logging.getLogger("heatup")
-
+from heatup.prepare.export import perturbative_cells, to_ase
 
 log = logging.getLogger("heatup")
 
@@ -95,9 +104,9 @@ def linewidth_statistics(freq_THz: np.ndarray, gamma_THz: np.ndarray, weights: n
 
 def compute_fc3(atoms: Atoms, calc, out_dir: str | None = None) -> dict:
     """Relaxed *atoms* -> kappa(T) and linewidth statistics (plain dict).  ``out_dir``: also save the forces there."""
-    c = cfg.fc3
+    c = cfg.perturbative
     save = (lambda name: None) if out_dir is None else (lambda name: os.path.join(out_dir, name))
-    ph, sc3, sc2 = fc3_cells(atoms)
+    ph, sc3, sc2 = perturbative_cells(atoms)
     n3 = sum(1 for s in ph.supercells_with_displacements if s is not None)
     log.info("  phono3py: fc3 supercell %s (%d atoms), %d displaced cells%s", sc3, len(atoms) * int(np.prod(sc3)), n3,
              "" if c.cutoff_pair_A is None else f" (pair cutoff {c.cutoff_pair_A} A)")
@@ -137,30 +146,38 @@ def compute_fc3(atoms: Atoms, calc, out_dir: str | None = None) -> dict:
     }
 
 
-def run_fc3(phase_dir, device: str = "cpu", force: bool = False) -> None:
+def run_perturbative(phase_dir, device: str = "cpu", force: bool = False) -> None:
     phase = PhaseDir.of(phase_dir)
-    out = os.path.join(phase.phonon_dir, "fc3.json")
-    if not force and os.path.exists(out) and ledger.is_fresh(phase, "fc3"):
-        log.info("[cached] %s/fc3 (up to date, not recomputed)", phase.tag)
+    out = os.path.join(phase.perturbative_dir, "perturbative.json")
+    if not force and os.path.exists(out) and ledger.is_fresh(phase, "perturbative"):
+        log.info("[cached] %s/perturbative (up to date, not recomputed)", phase.tag)
         return
     if not phase.has_relaxation():
         raise FileNotFoundError(f"{phase.tag}: converged relaxation required first")
+    if cfg.perturbative.order != 3:
+        raise NotImplementedError(f"cfg.perturbative.order = {cfg.perturbative.order}: only third order (fc3) is implemented")
     import importlib.util
     if importlib.util.find_spec("phono3py") is None:
         raise ImportError("the fc3 step needs phono3py:  pip install phono3py")
 
-    os.makedirs(phase.phonon_dir, exist_ok=True)
+    os.makedirs(phase.perturbative_dir, exist_ok=True)
     atoms = read_structure(phase.contcar)
     calc = build_calculator(device, material=phase.material)
     try:
-        log.info("fc3 / thermal conductivity %s (delta=%g A, %s)", phase.tag, cfg.fc3.delta_A,
+        log.info("perturbative (fc3) / thermal conductivity %s (delta=%g A, %s)", phase.tag, cfg.perturbative.delta_A,
                  calculator_label(phase.material))
-        res = compute_fc3(atoms, calc, out_dir=os.path.join(phase.phonon_dir, "fc3"))
+        res = compute_fc3(atoms, calc, out_dir=phase.perturbative_dir)
     finally:
         release_calculator(calc)
-    res.update({"n_atoms": len(atoms), "calculator": calculator_label(phase.material)})
+    res.update({"n_atoms": len(atoms), "calculator": calculator_label(phase.material),
+                "meta": provenance.stamp("perturbative", order=3, fc3_supercell=res["fc3_supercell"], fc2_supercell=res["fc2_supercell"])})
     write_json(out, res)
-    ledger.record(phase, "fc3")
+    try:
+        from heatup.analyze.vibrations import plot_perturbative_result
+        plot_perturbative_result(res, os.path.join(phase.perturbative_dir, "perturbative.png"), phase.tag)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("perturbative plot failed: %s", exc)
+    ledger.record(phase, "perturbative")
     i = int(np.argmin(np.abs(np.array(res["temperatures_K"]) - ledger.operating_T(phase))))
     log.info("  kappa_RTA(%g K) = %.3g W/mK, <gamma/nu> = %s", res["temperatures_K"][i], res["kappa_W_mK"][i],
              "n/a" if res["gamma_over_nu_mean"][i] is None else f"{res['gamma_over_nu_mean'][i]:.3f}")

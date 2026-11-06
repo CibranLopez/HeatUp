@@ -4,8 +4,7 @@
 
 Every term is a row of ``TERMS`` with a handful of selectable MODELS.  The selection is one string per term::
 
-    cfg.terms.vibrational     = "QHA"            # "off" | "ZPE" | "HA" | "QHA" | "VDOS"
-    cfg.terms.anharmonic      = "off"            # "off" | "isochore"
+    cfg.terms.vibrational     = "quasiharmonic"  # "off" | "ZPE" | "harmonic" | "quasiharmonic" | "anharmonic"
     cfg.terms.electronic      = "off"            # "off" | "dos"
     cfg.terms.magnetic        = "off"            # "off" | "ihj"
     cfg.terms.configurational = "ideal"          # "off" | "ideal" | "enumerated" | "monte_carlo"
@@ -24,7 +23,8 @@ What a selection drives (all from this table, so no term is special):
     * ``show`` / ``inventory``   -> what is selected, what it needs, and which phases have it
 
 Static energy and "finite-T energy": H0 is always the base.  The thermal part of the *energy* belongs to the nuclear
-model, not to a separate switch: HA keeps the 0 K cell, QHA contains E0(V_T), the effective-harmonic route contains U0(T).
+model, not to a separate switch: harmonic keeps the 0 K cell, quasi-harmonic contains E0(V_T), the effective-harmonic
+(anharmonic) route would contain U0(T).
 ``vibrational = "off"`` is the static (0 K) hull; ``"ZPE"`` adds only the zero-point energy; at T = 0 every other term
 vanishes.
 
@@ -71,6 +71,7 @@ class Term:
     doc: str = ""
 
     def model(self, name: str) -> Model:
+        name = ALIASES.get(str(name).lower(), name) if self.key == "vibrational" else name
         for m in self.models:
             if m.name.lower() == str(name).lower():
                 return m
@@ -79,27 +80,24 @@ class Term:
 
 _OFF = lambda why: Model("off", doc=why)
 
-TERMS: dict[str, Term] = {t.key: t for t in [
-    Term("vibrational", "Lattice vibrations (nuclear free energy)", "HA", (
-        _OFF("static hull: G = H0 (relaxed 0 K enthalpy)"),
-        Model("ZPE", "heatup.analyze.thermo:f_vib_zpe", "F_vib[ZPE]", steps=("phonons",), settings=("phonon",),
-              doc="zero-point energy of the harmonic phonons, temperature independent"),
-        Model("HA", "heatup.analyze.thermo:f_vib_ha", "F_vib[HA]", steps=("phonons",), settings=("phonon",),
-              doc="harmonic phonons at the 0 K cell"),
-        Model("QHA", "heatup.analyze.thermo:f_vib_qha", "F_vib[QHA]", steps=("qha",), settings=("phonon", "qha"),
-              doc="quasi-harmonic: E0(V) + F_vib(V,T), volume minimised at every T (contains thermal expansion)"),
-        Model("VDOS", "heatup.analyze.thermo:f_vib_vdos", "F_vib[VDOS]", steps=("md",), settings=("md", "analysis"),
-              status="experimental",
-              doc="effective-harmonic F_vib from the MD velocity spectrum; NOT validated (VACF bias, finite q-mesh, "
-                  "see heatup_terms/validation)"),
-    ), "The nuclear free energy: ONE model per phase; they approximate the same quantity and replace each other."),
+#: names of earlier versions, still read from old ``plan.json`` files and notebooks
+ALIASES = {"ha": "harmonic", "qha": "quasiharmonic", "vdos": "anharmonic"}
 
-    Term("anharmonic", "Explicit anharmonic free energy (classical, fixed cell)", "off", (
-        _OFF("harmonic (or quasi-harmonic) only"),
-        Model("isochore", "heatup.compute.anharmonic:f_anh", "F_anh", steps=("anharmonic",), settings=("anharmonic",),
-              requires=(("vibrational", ("QHA",)),),
-              doc="F_true - F_harm at the QHA cell from NVT runs, temperature integration of the equipartition estimator"),
-    ), "Added to QHA only: it is defined relative to the harmonic crystal at the same cell."),
+TERMS: dict[str, Term] = {t.key: t for t in [
+    Term("vibrational", "Lattice vibrations (nuclear free energy)", "harmonic", (
+        _OFF("static hull: G = H0 (relaxed 0 K enthalpy)"),
+        Model("ZPE", "heatup.analyze.thermo:f_vib_zpe", "F_vib[ZPE]", steps=("harmonic",), settings=("harmonic",),
+              doc="zero-point energy of the harmonic phonons, temperature independent"),
+        Model("harmonic", "heatup.analyze.thermo:f_vib_harmonic", "F_vib[harmonic]", steps=("harmonic",),
+              settings=("harmonic",), doc="second-order force constants at the 0 K cell"),
+        Model("quasiharmonic", "heatup.analyze.thermo:f_vib_quasiharmonic", "F_vib[quasiharmonic]",
+              steps=("quasiharmonic",), settings=("harmonic", "quasiharmonic"),
+              doc="E0(V) + F_vib(V,T) with the volume minimised at every T (contains thermal expansion)"),
+        Model("anharmonic", "heatup.analyze.thermo:f_vib_anharmonic", "F_vib[anharmonic]", steps=("md",),
+              settings=("md", "analysis"), status="experimental",
+              doc="effective-harmonic F_vib from the MD velocity spectra (phonons from MD); NOT validated: VACF bias, "
+                  "finite q-mesh, no explicit anharmonic term (see analyze.terms)"),
+    ), "The nuclear free energy: ONE model per phase; they approximate the same quantity and replace each other."),
 
     Term("electronic", "Electronic excitations (Mermin)", "dos", (
         _OFF("no electronic entropy"),
@@ -143,14 +141,9 @@ TERMS: dict[str, Term] = {t.key: t for t in [
 # selection
 # =================================================================================================================
 
-#: legacy ``cfg.hull`` switches (kept working): ``False`` means "off" when ``cfg.terms.<term>`` is None
-_LEGACY_OFF = {"electronic": "include_electronic", "magnetic": "include_magnetic",
-               "configurational": "include_configurational"}
-
-
 def resolve(phase=None, **explicit) -> dict[str, str]:
-    """The model chosen for every term:  explicit argument > ``cfg.terms.<term>`` > legacy ``cfg.hull`` switch >
-    what *phase* was prepared with (``plan.json``) > the term's default."""
+    """The model chosen for every term:  explicit argument > ``cfg.terms.<term>`` > what *phase* was prepared with
+    (``plan.json``) > the term's default."""
     opts: dict = {}
     if phase is not None:
         from heatup.core import ledger
@@ -164,14 +157,8 @@ def resolve(phase=None, **explicit) -> dict[str, str]:
         v = explicit.get(key)
         if v is None:
             v = getattr(cfg.terms, key)
-        if v is None and key == "vibrational":
-            v = cfg.hull.phonon_method
-        if v is None and key in _LEGACY_OFF and getattr(cfg.hull, _LEGACY_OFF[key]) is False:
-            v = "off"
         if v is None:
             v = opts.get(f"terms.{key}")
-        if v is None and key == "vibrational":
-            v = opts.get("hull.phonon_method")
         sel[key] = term.model(term.default if v is None else v).name
     return sel
 
