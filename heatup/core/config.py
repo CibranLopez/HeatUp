@@ -91,8 +91,6 @@ class Frozen:
 #: what ``min_length_A = None`` / ``min_cell_A = None`` mean for each step (A)
 AUTO_MIN_LENGTH_A = {"harmonic": 12.0, "perturbative": 8.0, "md": 15.0}
 
-MODEL_ALIASES = {"mace-mpa-0-medium": "medium-mpa-0", "mace_mpa_0_medium": "medium-mpa-0"}
-
 
 @dc.dataclass
 class CalcCfg(Frozen):
@@ -116,7 +114,7 @@ class CalcCfg(Frozen):
         m = self.model_overrides[material] if (material and material in self.model_overrides) else self.model
         if os.path.isfile(m):
             return os.path.abspath(m)                     # a model FILE is always passed as a full path (the same file for every package)
-        return MODEL_ALIASES.get(m, m)
+        return m
 
 
 @dc.dataclass
