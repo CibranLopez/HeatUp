@@ -41,17 +41,23 @@ def gate_table(reports: dict):
 
 def vibrational_table(reports: dict, tags=None):
     import pandas as pd
+    cols = ["phase", "status", "evidence", "imaginary branches", "soft-mode weight %", "harmonic imaginary %", "message"]
     rows = []
     for tag in tags or reports:
         v = (reports[tag] or {}).get("vibrational") or {}
-        if not v.get("available"):
+        if not v:                                    # check not enabled / not evaluated for this phase
+            rows.append({"phase": tag, "status": "skipped", "message": "vibrational check not evaluated"})
+            continue
+        if not v.get("available"):                   # no evidence yet: say why instead of dropping the phase
+            rows.append({"phase": tag, "status": v.get("status", "missing"), "message": v.get("message", "")})
             continue
         rows.append({"phase": tag, "status": v["status"], "evidence": v["evidence"],
                      "imaginary branches": (v.get("harmonic") or {}).get("n_unstable_branches", np.nan),
                      "soft-mode weight %": 100 * max((r["zero_frac"] for r in v.get("vdos", [])), default=np.nan),
                      "harmonic imaginary %": 100 * v["ha"]["imag_fraction"] if v.get("ha") else np.nan,
                      "message": v["message"]})
-    return pd.DataFrame(rows).set_index("phase").round(3)
+    df = pd.DataFrame(rows, columns=cols)            # explicit columns: never a KeyError on 'phase', even with no rows
+    return df.set_index("phase").round(3)
 
 
 def hull_table(reports: dict, tags=None):
@@ -97,7 +103,7 @@ def plot_hull_vs_T(reports: dict, tags=None, ax=None, overlay: bool = True):
         if not th.get("available"):
             continue
         T = np.asarray(th["temperatures"])
-        line, = ax.plot(T, 1e3 * np.asarray(th["e_hull_eV"]), label=f"{tag} ({th['method']})")
+        line, = ax.plot(T, 1e3 * np.asarray(th["e_hull_eV"]), label=f"{tag} ({th['method'] or 'static'})")
         if overlay and th.get("overlay"):
             ax.plot(T, 1e3 * np.asarray(th["overlay"]["e_hull_eV"]), "--", color=line.get_color(), lw=1)
     ax.axhline(0, c="k", lw=0.5)
@@ -114,7 +120,7 @@ def plot_free_energy_terms(report: dict):
         return None
     T = np.asarray(th["temperatures"])
     fig, ax = plt.subplots(1, 2, figsize=(11, 3.8))
-    ax[0].plot(T, 1e3 * np.asarray(th["e_hull_eV"]), label=f"{th['method']} (consistent)")
+    ax[0].plot(T, 1e3 * np.asarray(th["e_hull_eV"]), label=f"{th['method'] or 'static'} (consistent)")
     if th.get("overlay"):
         ax[0].plot(T, 1e3 * np.asarray(th["overlay"]["e_hull_eV"]), "--", label="+ anharmonic overlay")
     ax[0].axhline(0, c="k", lw=0.5)
@@ -320,7 +326,7 @@ def _hull(ax, report: dict) -> None:
     ax.axhspan(-1e3, 1e3 * g.hull_ok_eV, color=COLORS[STATUS_OK], alpha=0.12)
     ax.axhspan(1e3 * g.hull_ok_eV, 1e3 * g.hull_fail_eV, color=COLORS[STATUS_WARN], alpha=0.12)
     ax.axhspan(1e3 * g.hull_fail_eV, 1e4, color=COLORS[STATUS_FAIL], alpha=0.12)
-    ax.plot(T, e, color="#1f3a6e", lw=1.8, label=f"{th['method']} (consistent)")
+    ax.plot(T, e, color="#1f3a6e", lw=1.8, label=f"{th['method'] or 'static'} (consistent)")
     if th.get("overlay"):
         ax.plot(T, 1e3 * np.asarray(th["overlay"]["e_hull_eV"]), "--", color="#7a3e9d",
                 label="+ anharmonic overlay")

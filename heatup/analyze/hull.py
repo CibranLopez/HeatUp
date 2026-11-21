@@ -223,7 +223,7 @@ def assess_thermodynamic_stability(target_dir, operating_T: float | None = None)
         return {"available": False, "status": STATUS_MISSING, "flags": flags,
                 "message": f"0 K hull could not be built: {exc}" + (f" ({len(refused)} competitor(s) refused: other settings)" if refused else "")}
     log.info("0 K pruning (%s): %d kept, %d dropped",
-             "off" if window is None else f"> {1e3 * window:.0f} meV", len(keep), len(dropped))
+             "no window" if window is None else f"> {1e3 * window:.0f} meV", len(keep), len(dropped))
     write_json(os.path.join(stab, "zero_K_hull.json"), {
         "prune_window_eV": window, "e_above_hull_0K": z["e_above_hull_0K"],
         "kept": [p.tag for p in keep], "dropped": [p.tag for p in dropped]})
@@ -262,7 +262,8 @@ def assess_thermodynamic_stability(target_dir, operating_T: float | None = None)
 
     # 5. anharmonic overlay for the target
     overlay = None
-    if hc.target_overlay.lower() == "anharmonic" and method in ("harmonic", "quasiharmonic"):
+    overlay_on = hc.target_overlay is not False and str(hc.target_overlay).lower() == "anharmonic"   # False (or the old "off") = no overlay
+    if overlay_on and method in ("harmonic", "quasiharmonic"):
         try:
             gv = free_energy(target_dir, T, "anharmonic")
             if gv.get("available"):

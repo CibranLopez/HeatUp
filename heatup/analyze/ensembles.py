@@ -6,8 +6,8 @@ the file contributes 0 (a competitor with no disorder is a legitimate case) - ``
 phases carry which term.  The physics lives in ``terms.py`` (pure functions, tested against analytic
 limits); this module only reads data and normalises per atom.
 
-SELECTION: ``cfg.terms.configurational`` ("off" | "ideal" | "enumerated" | "monte_carlo"), ``cfg.terms.orientational``
-("off" | "rotors") and ``cfg.terms.defects`` ("off" | "pairs"); declared with their files and rules in
+SELECTION: ``cfg.terms.configurational`` (False | "ideal" | "enumerated" | "monte_carlo"), ``cfg.terms.orientational``
+(False | "rotors") and ``cfg.terms.defects`` (False | "pairs"); declared with their files and rules in
 ``heatup.core.contributions`` (``cfg.terms.show()`` prints them).  ONE configurational model at a time: "ideal",
 "enumerated" and "monte_carlo" describe the SAME degrees of freedom.
 
@@ -58,7 +58,7 @@ def _disorder(phase: PhaseDir, name: str):
 def _base_free_energy(phase: PhaseDir, T: np.ndarray, method: str | None) -> np.ndarray:
     """H0 + F_vib[method] (eV/atom) of a phase, WITHOUT any other term (same vibrational model as the hull)."""
     from heatup.core import contributions as C
-    sel = {k: "off" for k in C.TERMS}
+    sel = {k: False for k in C.TERMS}
     sel["vibrational"] = C.resolve(phase, vibrational=method)["vibrational"]
     r = C.assemble(sel).compute(phase, T)
     if not r.get("available", False):
@@ -168,7 +168,7 @@ def f_orientational(phase: PhaseDir, T: np.ndarray) -> np.ndarray:
         neglects cation-cation correlations, vibrational differences between orientations ignored).  Jump model of
         MA+ (C3 x C4 reorientations): arXiv:2012.05115; four/eight-fold orientational disorder: Weller et al., Chem.
         Commun. 51, 4180 (2015) [both found in the search; check before quoting].  For correlated cation ordering use
-        ``configurations.json`` instead (and switch this term off).
+        ``configurations.json`` instead (and set this term to False).
     Normalisation: ``count_per_cell`` rotors per relaxed cell, divided by the atoms in that cell."""
     T = np.atleast_1d(np.asarray(T, float))
     d = _disorder(phase, "rotors.json")

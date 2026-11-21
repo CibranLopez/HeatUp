@@ -113,7 +113,7 @@ LEVEL_STEPS = {"harmonic": "harmonic", "quasiharmonic": "quasiharmonic", "anharm
 #: steps whose output the gates read (``vibrational`` follows ``cfg.vibrational.sources``; ``thermodynamic`` the selected terms)
 GATE_STEPS = {"mechanical": ("elastic",), "structural_transition": ("md",), "thermodynamic": ()}
 #: the hull's evidence per vibrational model (``cfg.terms.vibrational``), for the target AND every competing phase
-THERMO_STEPS = {"off": (), "zpe": ("harmonic",), "harmonic": ("harmonic",), "quasiharmonic": ("quasiharmonic",),
+THERMO_STEPS = {False: (), "zpe": ("harmonic",), "harmonic": ("harmonic",), "quasiharmonic": ("quasiharmonic",),
                 "anharmonic": ("md",)}
 
 
@@ -126,7 +126,7 @@ def vibrational_steps(sources=None) -> tuple:
     return tuple(dict.fromkeys(LEVEL_STEPS[x] for x in sources))
 
 
-def gate_steps(gate: str, model: str = "harmonic", phase=None) -> tuple:
+def gate_steps(gate: str, model: "str | bool" = "harmonic", phase=None) -> tuple:
     """Steps whose output *gate* reads.  The hull's are those of the selected terms (``heatup.core.contributions``):
     the vibrational *model* plus whatever the other selected terms need (resolved for *phase* as prepared)."""
     if gate == "vibrational":
@@ -136,10 +136,10 @@ def gate_steps(gate: str, model: str = "harmonic", phase=None) -> tuple:
         return base
     from heatup.core import contributions
     extra = contributions.required_steps(phase=phase, exclude=("vibrational",))
-    return base + tuple(dict.fromkeys(THERMO_STEPS[model.lower()] + extra))
+    return base + tuple(dict.fromkeys(THERMO_STEPS[contributions.model_key(model)] + extra))
 
 
-def steps_for(gates, model: str = "harmonic", role: str = "target") -> list[str]:
+def steps_for(gates, model: "str | bool" = "harmonic", role: str = "target") -> list[str]:
     """Compute steps needed to evaluate *gates* with vibrational *model* (registry order).  A competing phase only
     serves the hull, so it needs just the hull's evidence (``THERMO_STEPS``).  Used by notebook 1 and by the one-call
     facade ``heatup.screen``; ``cfg.plan.target_steps`` / ``competitor_steps`` override it."""
@@ -455,11 +455,11 @@ def resolve_gates(phase, explicit: list | None = None) -> list[str]:
     return [g for g in plan.gates if g in GATES] if plan and plan.gates else list(GATES)
 
 
-def vibrational_model(phase, explicit: str | None = None) -> str:
+def vibrational_model(phase, explicit: "str | bool | None" = None) -> "str | bool":
     """Vibrational model of the hull: *explicit* > ``cfg.terms.vibrational`` > what the phase was prepared with > the
-    default of the term (``heatup.core.contributions.resolve``).  One of ``off zpe harmonic quasiharmonic anharmonic``."""
+    default of the term (``heatup.core.contributions.resolve``).  One of ``False zpe harmonic quasiharmonic anharmonic``."""
     from heatup.core import contributions
-    return contributions.resolve(phase, vibrational=explicit)["vibrational"].lower()
+    return contributions.model_key(contributions.resolve(phase, vibrational=explicit)["vibrational"])
 
 
 phonon_method = vibrational_model                      # name of earlier versions (kept for callers not updated yet)

@@ -21,7 +21,7 @@ Any protocol is just a sequence of calls - nothing here is mandatory::
     run_plan()                                  # ... then everything else
     run_plan(targets=["database/BaTiO3/P4mm"])  # only some targets (and their competitors)
 
-The only optional intelligence is the 0 K pruning (``cfg.plan.prune_window_eV``, off by default): if you set a
+The only optional intelligence is the 0 K pruning (``cfg.plan.prune_window_eV``, ``None`` = no pruning by default): if you set a
 window, competitors far above the 0 K hull get no phonons/MD.
 
 Returns one row per considered task: ``{phase, step, T_K, action, detail}`` with ``action`` in

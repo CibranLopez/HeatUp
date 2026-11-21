@@ -35,6 +35,10 @@ notebook      sections                                                    stored
 Notebook 2 applies the options stored in each ``plan.json`` (``ledger.applied``), so the calculation
 settings are written down exactly once.
 
+The defaults below ARE the settings of the workflow.  The notebooks only set what changes from project to project
+(calculator model, requested checks, free-energy terms, cost of the MD); everything else is edited here, once.
+``cfg.show("md")`` prints a section.  ``False`` always means "not included" (never the string ``"off"``).
+
 Units: eV, Å, K, fs, GPa unless a field name says otherwise.
 """
 
@@ -105,7 +109,7 @@ class CalcCfg(Frozen):
     model_overrides: dict = dc.field(default_factory=dict)
     dispersion: bool = False
     dtype: str = "float64"
-    #: "auto" -> cuda if usable else cpu
+    #: "auto" -> cuda if usable else cpu ("cpu" / "cuda" to force)
     device: str = "auto"
 
     def model_for(self, material: str | None) -> str:
@@ -182,7 +186,7 @@ class PerturbativeCfg(Frozen):
     separate_fc2: bool = True
     #: q-mesh density for kappa: n_i = ceil(kappa_mesh_length_A / |a_i|)
     kappa_mesh_length_A: float = 30.0
-    temperatures: list = dc.field(default_factory=lambda: [100.0, 200.0, 300.0, 400.0, 600.0, 800.0, 1000.0])
+    temperatures: list = dc.field(default_factory=lambda: [200.0, 400.0, 600.0, 800.0, 1000.0])
     symprec: float = 1e-5
     #: modes below this frequency (THz) are excluded from the gamma/nu statistics
     min_freq_THz: float = 0.5
@@ -218,10 +222,10 @@ class MDCfg(Frozen):
     timestep_fs: float = 1.0
     n_steps: int = 30_000
     #: Write a frame every ``nblock`` steps.  The VDOS Nyquist limit is
-    #: ``h / (2 nblock dt)``: 10 fs -> 207 meV (covers oxides, sulfides, halides; not O-H/N-H stretches),
-    #: 5 fs -> 413 meV.  (v0.2: 20 fs -> 103 meV, which aliases every O/H/Li-containing material.)
+    #: ``h / (2 nblock dt)``: 5 fs -> 413 meV (default: covers O-containing oxides), 10 fs -> 207 meV (sulfides, halides;
+    #: not O-H/N-H stretches).  (v0.2: 20 fs -> 103 meV, which aliases every O/H/Li-containing material.)
     #: The same run is also the source of the diffusivity labels, which need 20 fs or finer.
-    nblock: int = 10
+    nblock: int = 5
     ttime_fs: float = 50.0
     ptime_fs: float = 100.0
     pressure_GPa: float = 0.0
@@ -276,7 +280,7 @@ def forced(step: str, explicit: bool | None = None) -> bool:
 class AnalysisCfg(Frozen):
     """How trajectories are read and reduced (notebook 3).  Changing these re-runs only the cheap analysis steps."""
     #: Equilibration discarded before analysis (ps)
-    equil_ps: float = 3.0
+    equil_ps: float = 5.0
     #: Read stride when analysing trajectories
     stride: int = 1
     #: A species counts as mobile (diffusing) when its final mean-square displacement exceeds this (A^2).  Vibrations in
@@ -331,8 +335,8 @@ class HullCfg(Frozen):
     operating_T: float = 300.0
     temperatures: list = dc.field(default_factory=lambda: list(range(0, 1501, 50)))
     #: Extra anharmonic overlay computed for the target only (reported next to the consistent hull): ``"anharmonic"``
-    #: (needs MD of the target) | ``"off"``.  It is an ESTIMATE, never the verdict.
-    target_overlay: str = "anharmonic"
+    #: (needs MD of the target) | ``False``.  It is an ESTIMATE, never the verdict.
+    target_overlay: "str | bool" = "anharmonic"
     #: O2/N2/F2... gas-phase corrections are NOT applied; see docs/AUDIT.md.
     reference_energy_shift: dict = dc.field(default_factory=dict)
 
@@ -347,23 +351,26 @@ class TermsCfg(Frozen):
     ``plan.json``), and if nothing was prepared, the default of the term (``contributions.TERMS``).  ONE model per term,
     the SAME for every phase of a hull.
 
-    ``vibrational``: ``"off"`` static 0 K hull | ``"ZPE"`` zero-point energy only | ``"harmonic"`` | ``"quasiharmonic"``
-    | ``"anharmonic"`` (effective-harmonic F from the MD spectra; experimental).  Old names ``HA`` / ``QHA`` / ``VDOS`` are
-    still read."""
-    vibrational: str | None = None
-    electronic: str | None = None        # "off" | "dos"
-    magnetic: str | None = None          # "off" | "ihj"
-    configurational: str | None = None   # "off" | "ideal" | "enumerated" | "monte_carlo"
-    orientational: str | None = None     # "off" | "rotors"
-    defects: str | None = None           # "off" | "pairs"
+    ``False`` = the term is not included (``vibrational = False`` is the static 0 K hull).  ``vibrational``: ``False`` |
+    ``"ZPE"`` zero-point energy only | ``"harmonic"`` | ``"quasiharmonic"`` | ``"anharmonic"`` (effective-harmonic F from the
+    MD spectra; experimental).  Old names ``HA`` / ``QHA`` / ``VDOS`` and the old string ``"off"`` are still read.
+
+    Terms other than ``vibrational`` are ``False`` unless chosen, and they need data files per phase (see
+    ``heatup.core.contributions``)."""
+    vibrational: "str | bool | None" = None
+    electronic: "str | bool | None" = None        # False | "dos"
+    magnetic: "str | bool | None" = None          # False | "ihj"
+    configurational: "str | bool | None" = None   # False | "ideal" | "enumerated" | "monte_carlo"
+    orientational: "str | bool | None" = None     # False | "rotors"
+    defects: "str | bool | None" = None           # False | "pairs"
 
     def only(self, **on: str) -> "TermsCfg":
-        """The listed terms on (with the given model), every other term off:  ``cfg.terms.only(configurational="ideal")``."""
+        """The listed terms on (with the given model), every other term False:  ``cfg.terms.only(configurational="ideal")``."""
         bad = [k for k in on if k not in TERM_KEYS]
         if bad:
             raise ValueError(f"unknown term(s) {bad}; terms: {list(TERM_KEYS)}")
         for k in TERM_KEYS:
-            setattr(self, k, on.get(k, "off"))
+            setattr(self, k, on.get(k, False))
         return self
 
     def show(self) -> None:
@@ -381,8 +388,8 @@ class VibrationalCfg(Frozen):
     instability is not a failure if the finite-temperature evidence is clean)."""
     sources: list = dc.field(default_factory=lambda: ["harmonic", "anharmonic"])
     #: Save the figures of the vibrational analysis as PNG next to the data: ``phonons/anharmonic/<T>K/vdos.png`` (every VDOS), the figure of each level in its phonons folder and
-    #: ``stability/vibrational.png`` (bands / volumes / VDOS of the selected sources, imaginary parts in red).  Switch off to
-    #: analyse without matplotlib.  Display-only: never makes a result stale.
+    #: ``stability/vibrational.png`` (bands / volumes / VDOS of the selected sources, imaginary parts in red).  Set to
+    #: False to analyse without matplotlib.  Display-only: never makes a result stale.
     save_figures: bool = True
 
 
@@ -424,7 +431,7 @@ class PhasesCfg(Frozen):
     database_root: str = "database"
     #: STRUCTURES only: your own inputs, Materials Project downloads, generated candidates.  Nothing is ever
     #: computed here and existing structures are never modified.
-    candidates_root: str = "input/candidates"
+    candidates_root: str = "candidates"
 
 
 @dc.dataclass

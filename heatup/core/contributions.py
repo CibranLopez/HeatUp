@@ -4,13 +4,15 @@
 
 Every term is a row of ``TERMS`` with a handful of selectable MODELS.  The selection is one string per term::
 
-    cfg.terms.vibrational     = "quasiharmonic"  # "off" | "ZPE" | "harmonic" | "quasiharmonic" | "anharmonic"
-    cfg.terms.electronic      = "off"            # "off" | "dos"
-    cfg.terms.magnetic        = "off"            # "off" | "ihj"
-    cfg.terms.configurational = "ideal"          # "off" | "ideal" | "enumerated" | "monte_carlo"
-    cfg.terms.orientational   = "off"            # "off" | "rotors"
-    cfg.terms.defects         = "off"            # "off" | "pairs"
-    cfg.terms.only(configurational="ideal")      # ONE call: these on, everything else off  (a hull of configurational entropy only)
+    cfg.terms.vibrational     = "quasiharmonic"  # False | "ZPE" | "harmonic" | "quasiharmonic" | "anharmonic"
+    cfg.terms.electronic      = False            # False | "dos"
+    cfg.terms.magnetic        = False            # False | "ihj"
+    cfg.terms.configurational = "ideal"          # False | "ideal" | "enumerated" | "monte_carlo"
+    cfg.terms.orientational   = False            # False | "rotors"
+    cfg.terms.defects         = False            # False | "pairs"
+    cfg.terms.only(configurational="ideal")      # ONE call: these on, every other term False  (a hull of configurational entropy only)
+
+``False`` means "this term is not included".  (The string ``"off"`` of earlier versions is still read, e.g. from old ``plan.json``.)
 
 ``None`` (the default of every field) means *as prepared in notebook 1* (stored in each phase's ``plan.json``), and if
 nothing was prepared, the term's default.  So notebook 1 chooses, notebook 3 follows - or overrides any single term.
@@ -25,7 +27,7 @@ What a selection drives (all from this table, so no term is special):
 Static energy and "finite-T energy": H0 is always the base.  The thermal part of the *energy* belongs to the nuclear
 model, not to a separate switch: harmonic keeps the 0 K cell, quasi-harmonic contains E0(V_T), the effective-harmonic
 (anharmonic) route would contain U0(T).
-``vibrational = "off"`` is the static (0 K) hull; ``"ZPE"`` adds only the zero-point energy; at T = 0 every other term
+``vibrational = False`` is the static (0 K) hull; ``"ZPE"`` adds only the zero-point energy; at T = 0 every other term
 vanishes.
 
 Adding a term = adding one ``Term`` below (function, steps, files, settings, rules).  Nothing else needs to change.
@@ -51,8 +53,8 @@ log = logging.getLogger("heatup")
 
 @dc.dataclass(frozen=True)
 class Model:
-    name: str
-    func: str | None = None                     # "module:function"  ``fn(phase, T) -> eV/atom`` (None for "off")
+    name: "str | bool"                          # the model's name; ``False`` = the term is not included
+    func: str | None = None                     # "module:function"  ``fn(phase, T) -> eV/atom`` (None for ``False``)
     tag: str | None = None                      # name of the contribution in the results (default F_<term>)
     steps: tuple = ()                           # compute steps (``ledger.STEPS``) every phase needs for this model
     files: tuple = ()                           # data files (relative to the phase) the model reads; absent -> contributes 0
@@ -61,24 +63,37 @@ class Model:
     status: str = "ok"                          # "ok" | "experimental"
     doc: str = ""
 
+    @property
+    def label(self) -> str:
+        return "False" if self.name is False else str(self.name)
+
 
 @dc.dataclass(frozen=True)
 class Term:
     key: str
     label: str
-    default: str
+    default: "str | bool"
     models: tuple
     doc: str = ""
 
-    def model(self, name: str) -> Model:
-        name = ALIASES.get(str(name).lower(), name) if self.key == "vibrational" else name
+    def model(self, name) -> Model:
+        given, name = name, model_key(name)
+        if self.key == "vibrational" and name is not False:
+            name = ALIASES.get(name, name)
         for m in self.models:
-            if m.name.lower() == str(name).lower():
+            if model_key(m.name) == name:
                 return m
-        raise ValueError(f"cfg.terms.{self.key} = {name!r}: choose from {[m.name for m in self.models]}")
+        raise ValueError(f"cfg.terms.{self.key} = {given!r}: choose from {[m.label for m in self.models]}")
 
 
-_OFF = lambda why: Model("off", doc=why)
+def model_key(name) -> "str | bool":
+    """Canonical form of a model name for comparisons: ``False`` (also the old spelling ``"off"``) or the lower-case name."""
+    if name is False or (isinstance(name, str) and name.lower() == "off"):
+        return False
+    return str(name).lower()
+
+
+_OFF = lambda why: Model(False, doc=why)
 
 #: names of earlier versions, still read from old ``plan.json`` files and notebooks
 ALIASES = {"ha": "harmonic", "qha": "quasiharmonic", "vdos": "anharmonic"}
@@ -99,19 +114,19 @@ TERMS: dict[str, Term] = {t.key: t for t in [
                   "finite q-mesh, no explicit anharmonic term (see analyze.terms)"),
     ), "The nuclear free energy: ONE model per phase; they approximate the same quantity and replace each other."),
 
-    Term("electronic", "Electronic excitations (Mermin)", "dos", (
+    Term("electronic", "Electronic excitations (Mermin)", False, (
         _OFF("no electronic entropy"),
         Model("dos", "heatup.analyze.thermo:f_el", "F_el", files=("electronic/edos.json",),
               doc="F_el(T) - F_el(0) from the electronic DOS at fixed ions; metals only"),
     ), "Negligible for gapped materials; needs a DOS (DFT), an MLIP has none."),
 
-    Term("magnetic", "Magnetic entropy (Inden-Hillert-Jarl, thermal part)", "ihj", (
+    Term("magnetic", "Magnetic entropy (Inden-Hillert-Jarl, thermal part)", False, (
         _OFF("no magnetic term"),
         Model("ihj", "heatup.analyze.thermo:f_mag", "F_mag", files=("magnetic/moments.json",),
               doc="IHJ thermal magnetic free energy with S(0) = 0; needs Tc and beta per phase"),
     ), "Empirical (CALPHAD) model; competitors need their own Tc and beta."),
 
-    Term("configurational", "Configurational disorder", "ideal", (
+    Term("configurational", "Configurational disorder", False, (
         _OFF("ordered phases only"),
         Model("ideal", "heatup.analyze.thermo:f_conf", "F_conf", files=("disorder/site_occupancies.json",),
               doc="-T S of ideal mixing on the sites (upper bound)"),
@@ -123,13 +138,13 @@ TERMS: dict[str, Term] = {t.key: t for t in [
               doc="lattice-model Monte Carlo (cluster expansion) free energy by integration of <E> over beta"),
     ), "ONE model: they describe the same degrees of freedom."),
 
-    Term("orientational", "Orientational disorder / hindered rotors", "off", (
+    Term("orientational", "Orientational disorder / hindered rotors", False, (
         _OFF("molecular units are static"),
         Model("rotors", "heatup.analyze.ensembles:f_orientational", "F_orientational", files=("disorder/rotors.json",),
               doc="hindered rotors (quantum levels) and independent discrete orientations"),
     ), ""),
 
-    Term("defects", "Point defects (composition-conserving pairs)", "off", (
+    Term("defects", "Point defects (composition-conserving pairs)", False, (
         _OFF("perfect crystal"),
         Model("pairs", "heatup.analyze.ensembles:f_defects", "F_defects", files=("disorder/defects.json",),
               doc="Frenkel/Schottky/antisite pairs, dilute and non-interacting"),
@@ -141,7 +156,7 @@ TERMS: dict[str, Term] = {t.key: t for t in [
 # selection
 # =================================================================================================================
 
-def resolve(phase=None, **explicit) -> dict[str, str]:
+def resolve(phase=None, **explicit) -> dict:
     """The model chosen for every term:  explicit argument > ``cfg.terms.<term>`` > what *phase* was prepared with
     (``plan.json``) > the term's default."""
     opts: dict = {}
@@ -152,7 +167,7 @@ def resolve(phase=None, **explicit) -> dict[str, str]:
     unknown = [k for k in explicit if k not in TERMS]
     if unknown:
         raise ValueError(f"unknown term(s) {unknown}; terms: {list(TERMS)}")
-    sel: dict[str, str] = {}
+    sel: dict = {}
     for key, term in TERMS.items():
         v = explicit.get(key)
         if v is None:
@@ -170,7 +185,7 @@ def project_selection(phases=None) -> tuple[dict, dict]:
     from heatup.core.layout import PhaseDir, iter_phase_dirs
     ph = [PhaseDir.of(p) for p in phases] if phases is not None else list(iter_phase_dirs(cfg.phases.database_root))
     sels = [resolve(p) for p in ph] or [resolve()]
-    diff = {k: sorted({s[k] for s in sels}) for k in TERMS if len({s[k] for s in sels}) > 1}
+    diff = {k: sorted({s[k] for s in sels}, key=str) for k in TERMS if len({s[k] for s in sels}) > 1}
     return dict(sels[0]), diff
 
 
@@ -199,15 +214,15 @@ def check(sel: dict | None = None) -> list[tuple[str, str]]:
                 out.append(("error", f"{key}={name} requires {term} in {list(allowed)} (selected: {sel[term]})"))
         if m.status == "experimental":
             out.append(("warn", f"{key}={name} is experimental: {m.doc}"))
-    if sel["orientational"] != "off" and sel["configurational"] in ("enumerated", "monte_carlo"):
+    if sel["orientational"] and sel["configurational"] in ("enumerated", "monte_carlo"):
         out.append(("warn", "orientational + configurational: count each orientation ONCE (rotors.json "
                             "'orientational_entropy': false, or leave the orientations out of the configurations)"))
-    if sel["orientational"] != "off" and sel["vibrational"] == "off":
-        out.append(("warn", "orientational with vibrational=off: a rotor subtracts the harmonic libration that "
+    if sel["orientational"] and not sel["vibrational"]:
+        out.append(("warn", "orientational with vibrational=False: a rotor subtracts the harmonic libration that "
                             "F_vib would contain - set 'remove_libration': false in rotors.json"))
-    if sel["configurational"] == "ideal" and sel["defects"] != "off":
+    if sel["configurational"] == "ideal" and sel["defects"]:
         out.append(("warn", "ideal mixing + defects: vacancies/interstitials must not be both site occupancies and defects"))
-    if sel["electronic"] != "off" and sel["magnetic"] != "off":
+    if sel["electronic"] and sel["magnetic"]:
         out.append(("note", "electronic + magnetic: a DOS of the ordered state already contains Stoner-type "
                             "excitations; use one source for the longitudinal spin part"))
     return out
@@ -252,7 +267,7 @@ def assemble(sel: dict | None = None, phase=None, drop_invalid: bool = False):
             for term, allowed in model_of(key, name).requires:
                 if sel[term] not in allowed:
                     log.warning("terms: %s=%s dropped (requires %s in %s)", key, name, term, list(allowed))
-                    sel[key] = "off"
+                    sel[key] = False
     raise_on_errors(sel)
     asm = GibbsAssembler()
     for key, name in sel.items():
@@ -276,7 +291,7 @@ def describe(sel: dict | None = None, phase=None) -> list[dict]:
     rows = []
     for key, term in TERMS.items():
         m = model_of(key, sel[key])
-        rows.append({"term": key, "model": m.name, "options": " | ".join(x.name for x in term.models),
+        rows.append({"term": key, "model": m.name, "options": " | ".join(x.label for x in term.models),
                      "compute steps": ", ".join(m.steps) or "-", "data files": ", ".join(m.files) or "-",
                      "settings": ", ".join(f"cfg.{s}" for s in m.settings) or "-", "status": m.status,
                      "meaning": m.doc})
@@ -290,8 +305,8 @@ def show(sel: dict | None = None, phase=None, settings: bool = True) -> None:
         sel, diff = (resolve(phase), {}) if phase is not None else project_selection()
     print("selected terms (cfg.terms; None = as prepared in notebook 1, else the default)")
     for r in describe(sel):
-        on = "  " if r["model"] != "off" else "  "
-        print(f"{on}{r['term']:16s} = {r['model']:12s} [{r['options']}]")
+        on = "* " if r["model"] is not False else "  "
+        print(f"{on}{r['term']:16s} = {str(r['model']):12s} [{r['options']}]")
     print("compute steps for every phase:", ", ".join(("relax",) + required_steps(sel)))
     for term, models in diff.items():
         print(f"  WARN: phases were prepared with different {term} models {models}: they cannot share one hull")
@@ -313,7 +328,7 @@ def inventory(phases) -> list[dict]:
         ph = PhaseDir.of(p)
         for key, name in resolve(ph).items():                       # each phase as it was prepared
             m = model_of(key, name)
-            if name == "off":
+            if name is False:
                 continue
             steps_ok = True
             for s in m.steps:

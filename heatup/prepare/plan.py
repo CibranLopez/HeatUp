@@ -100,10 +100,10 @@ def _save(phase_dir, plan: ledger.Plan) -> None:
     make_task_folders(phase_dir, plan)
 
 
-def _method() -> str:
+def _method() -> "str | bool":
     """Vibrational model of the hull (``cfg.terms.vibrational``), validated."""
     from heatup.core import contributions
-    m = contributions.resolve()["vibrational"].lower()
+    m = contributions.model_key(contributions.resolve()["vibrational"])
     if m not in ledger.THERMO_STEPS:
         raise ValueError(f"cfg.terms.vibrational: {m!r}; choose from {list(ledger.THERMO_STEPS)}")
     return m

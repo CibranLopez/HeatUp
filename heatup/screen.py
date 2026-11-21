@@ -206,10 +206,10 @@ def decide(stage: str, gates: dict[str, GateResult], e_hull_0K: float | None, hu
     return "accept", reasons or ["all evaluated gates passed"]
 
 
-def _vib_model() -> str:
+def _vib_model() -> "str | bool":
     """Vibrational model of the hull for this call (``cfg.terms.vibrational``, else the term's default)."""
     from heatup.core import contributions
-    return contributions.resolve()["vibrational"].lower()
+    return contributions.model_key(contributions.resolve()["vibrational"])
 
 
 def _gate(name: str, r: dict | None) -> GateResult:
