@@ -6,4 +6,4 @@ __pycache__
 database*
 candidates*
 # Local archive, do not commit
-BaTiO3-database.zip
+BaTiO3-database*

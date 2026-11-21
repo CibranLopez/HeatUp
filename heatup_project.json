@@ -5,7 +5,7 @@
   },
   "calc": {
     "backend": "mace-mp",
-    "model": "medium-mpa-0",
+    "model": "BTO_MACE.model",
     "model_overrides": {},
     "dispersion": false,
     "dtype": "float64"
